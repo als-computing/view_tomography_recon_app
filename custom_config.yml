@@ -1,0 +1,10 @@
+authentication:
+  allow_anonymous_access: false
+
+trees:
+- path: /
+  tree: catalog
+  args:
+    uri: "sqlite+aiosqlite:////storage/catalog.db"
+    writable_storage: "/storage/data"
+    init_if_not_exists: true

@@ -16,33 +16,24 @@ import ItkVtkViewerComponent from './ItkVtkViewerComponent';
 import './App.css';
 
 function App() {
-  // Store the file URL in state so that it can be updated by Header.
-  const [fileUrl, setFileUrl] = useState(
-    'http://localhost:8000/zarr/v2/rec20240425_104614_nist-sand-30-100_27keV_z8mm_n2625'
-  );
+  const { protocol, hostname } = window.location;
+  const port = import.meta.env.VITE_TILED_PORT ?? '8787';
 
-  // Extract filename safely.
+  const defaultFileId = 'rec20240425_104614_nist-sand-30-100_27keV_z8mm_n2625';
+  const defaultFileUrl = `${protocol}//${hostname}:${port}/zarr/v2/${defaultFileId}`;
+
+  const [fileUrl, setFileUrl] = useState(defaultFileUrl);
   const fileName = fileUrl.split('/').pop() || '';
 
-  // Callback that receives the new file URL from Header/TiledWidget.
-  const handleSelect = (newFileUrl) => {
-    console.log("App received new fileUrl:", newFileUrl);
-    // Update state only if a new, non-empty URL is returned.
-    if (newFileUrl && newFileUrl !== fileUrl) {
-      setFileUrl(newFileUrl);
-    }
-  };
-
-  // Build the iframe source URL.
-  const iframeSrc = 'http://localhost:8082/?fileToLoad=' + fileUrl;
+  const iframeSrc = `${protocol}//${hostname}:${port}/viewer/?fileToLoad=${encodeURIComponent(fileUrl)}`;
 
   return (
     <div id="app">
-      <Header 
+      <Header
         logoUrl="/images/als_logo_wheel.png"
         title="Tomography Visualizer powered by itk-vtk-viewer"
         fileName={fileName}
-        onSelect={handleSelect}
+        onSelect={setFileUrl}
       />
       <ItkVtkViewerComponent
         src={iframeSrc}

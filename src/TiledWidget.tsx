@@ -22,6 +22,12 @@ export const TiledWidget = ({ onSelect }: TiledWidgetProps) => {
   const currentButtonRef = useRef<HTMLButtonElement | null>(null);
   const currentHandleRef = useRef<((event: Event) => void) | null>(null);
 
+  // Compute base‑URL at runtime
+  const { protocol, hostname } = window.location;
+  const port = import.meta.env.VITE_TILED_PORT ?? '8787';
+  const apiPath = '/api/v1';
+  const tiledBaseUrl = `${protocol}//${hostname}:${port}${apiPath}`;
+
   // Helper function to extract metadata from the DOM.
   const extractMetadata = (): any | null => {
     const container = containerRef.current;
@@ -80,7 +86,8 @@ export const TiledWidget = ({ onSelect }: TiledWidgetProps) => {
         let file_url = "";
         if (meta && meta.attributes?.ancestors && Array.isArray(meta.attributes.ancestors) && meta.attributes.ancestors.length > 0) {
           const fileId = meta.attributes.ancestors[0];
-          file_url = `http://localhost:8000/zarr/v2/${fileId}`;
+          file_url = `${protocol}//${hostname}:${port}/zarr/v2/${fileId}`;
+          // file_url = `http://localhost:8787/zarr/v2/${fileId}`;
           console.log("Extracted file_url:", file_url);
         } else {
           console.warn("extractMetadata: Metadata missing or ancestors array empty.");
@@ -141,7 +148,8 @@ export const TiledWidget = ({ onSelect }: TiledWidgetProps) => {
 
   return (
     <div ref={containerRef}>
-      <Tiled />
+      {/* <Tiled tiledBaseUrl="http://localhost:8787/api/v1"/> */}
+      <Tiled tiledBaseUrl={tiledBaseUrl}/>
     </div>
   );
 };

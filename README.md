@@ -2,72 +2,91 @@
 
 ## (Powered by itk-vtk-viewer)
 
-This web application allows users to load their reconstructed volumes using Tiled Browser (in development) into the itk-vtk-viewer widget, all within the same web page.
-
-TODO:
-
-*   Add a 'listener' mode that loads in the most recent tomographic reconstruction once processing is completed and the data is available.
+This web application allows users to load their reconstructed volumes using `Bluesky Tiled Browser` into the `itk-vtk-viewer` widget, all within the same `React` web application.
 
 ---
 
 # Installation via Docker (Recommended)
 
+## Install Docker
 Before you begin, make sure you have Docker installed on your machine.
 
-Then, clone this repository and then navigate to the `view_recon_app` directory.
+- [Download Docker Desktop](https://www.docker.com/)
 
-  
-`cd splash_flows_globus/orchestration/flows/bl832/view_recon_app`
+## Clone repository
+Next, clone this repository.
 
-Create a new file `.env` in that folder (or rename `.env.example` ) and add the following line (make sure to update the path to a real location):  
+`git clone https://github.com/als-computing/view_tomography_recon_app.git`
+
+Once it is downloaded, cd into it:
+
+`cd view_tomography_recon_app`
+
+## Add Tiled
+
+Now let's also add a version of `Bluesky Tiled` that supports the `Zarr` format. In the root of `view_tomography_recon_app/`, run the following command to clone Tiled:
+
+`git clone -b add-zarr-forked https://github.com/davramov/tiled.git`
+
+Confirm that Tiled is saved in the correct location: `view_tomography_recon_app/tiled/`
+
+## Set environment variables
+
+Create a new file `.env` in `view_tomography_recon_app/` (or rename `.env.example` ) and add the following lines (make sure to update the path to a real location):  
  
+```
+DATA_PATH=/absolute/path/to/your/reconstructions/wherever/they/are
+VITE_API_TILED_URL=http://localhost:8787/
+TILED_SINGLE_USER_API_KEY=<make a strong password>
+```
+For the `TILED_SINGLE_USER_API_KEY`, you can use a command like `openssl rand -hex 12` to generate a strong key.
 
-`DATA_PATH=/full/path/to/your/reconstructions/folder/no/trailing/slash`  
- 
+## Build and start the application
 
-Now we're ready to build the Docker container.
+Now we're ready to build the Docker container. This will build the container and start the application in the background.  
 
 `docker compose up -d`
 
-This will build the container and start the application in the background.  
+You can check the status of each service by running
+
+`docker compose ps`
+
+and you should see an output like this:
+
+```
+(base) you@your-computer view_tomography_recon_app % docker compose ps
+NAME                                 IMAGE                              COMMAND                   SERVICE   CREATED      STATUS      PORTS
+view_tomography_recon_app-nginx-1    nginx:stable                       "/docker-entrypoint.…"    nginx     5 days ago   Up 2 days   0.0.0.0:8787->80/tcp
+view_tomography_recon_app-react-1    view_tomography_recon_app-react    "npm run dev -- --ho…"    react     4 days ago   Up 2 days   5174/tcp
+view_tomography_recon_app-tiled-1    view_tomography_recon_app-tiled    "sh -c '\n  # 1) Laun…"   tiled     4 days ago   Up 2 days   8000/tcp
+view_tomography_recon_app-viewer-1   view_tomography_recon_app-viewer   "npx itk-vtk-viewer …"    viewer    2 days ago   Up 2 days   8082/tcp
+```
+
+## Authenticate
+
 Before we can use the app, we need to authenticate with Bluesky Tiled.
 
-In the same folder, run:
+In your browser, navigate to: http://localhost:8787/?api_key=TILED_SINGLE_USER_API_KEY (and make sure that you add your actual `TILED_SINGLE_USER_API_KEY`).
 
-`docker compose logs`
+## Start the viewer
 
-Look for this part of the logs:  
- 
+To use the visualization app in your browser, go to: http://localhost:8787/react/
 
-```
-tomography-visualizer-1  | Starting Tiled server with data from /data on port 8000...
-tomography-visualizer-1  | Waiting for Tiled server to start...
-tomography-visualizer-1  | Creating catalog database at /tmp/tmpsmzvu3_x/catalog.db
-tomography-visualizer-1  | 
-tomography-visualizer-1  |     Tiled server is running in "public" mode, permitting open, anonymous access
-tomography-visualizer-1  |     for reading. Any data that is not specifically controlled with an access
-tomography-visualizer-1  |     policy will be visible to anyone who can connect to this server.
-tomography-visualizer-1  | 
-tomography-visualizer-1  | 
-tomography-visualizer-1  |     Navigate a web browser or connect a Tiled client to:
-tomography-visualizer-1  | 
-tomography-visualizer-1  |     http://0.0.0.0:8000?api_key=4c138df71f1887db6b3a4f308888e41b074869dda04ca93fb40907b89b49134d
-tomography-visualizer-1  | 
-tomography-visualizer-1  | 
-tomography-visualizer-1  |     Because this server is public, the '?api_key=...' portion of
-tomography-visualizer-1  |     the URL is needed only for _writing_ data (if applicable).
-```
+Note: you can access tiled and the viewer application from other computers by noting your [WAN IP address](http://wanip.info/) and using that instead of `localhost`.
 
-Navigate to the url provided in your web browser: `http://0.0.0.0:8000?api_key=<thiskeyisunique>.`  
-Now we can start the View Recon App and have access to our data.  
-  
-In your browser, navigate to: http://localhost:5174  
-  
 Voila!
+
+## Debugging
+
+Since there are a few connected services, you may run into issues. To get a sense of what's wrong, you can diplay the logs for each service. In the root of the project, run `docker compose logs` to see all of the logs, or `docker compose logs tiled` to see the logs for a specific service.
+
+If you update the `.env` file, you can restart the whole application by running `docker compose up -d --force-recreate` to pick up your changes.
+  
+
 
 ---
 
-# Installation from Scratch
+# Installation from Scratch (Not recommended)
 
 ## `Bluesky Tiled`
 
