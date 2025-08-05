@@ -24,7 +24,7 @@ export const TiledWidget = ({ onSelect }: TiledWidgetProps) => {
 
   // Compute base‑URL at runtime
   const { protocol, hostname } = window.location;
-  const port = import.meta.env.VITE_TILED_PORT ?? '8787';
+  const port = import.meta.env.VITE_TILED_PORT ?? '443';
   const apiPath = '/api/v1';
   const tiledBaseUrl = `${protocol}//${hostname}:${port}${apiPath}`;
 

@@ -17,7 +17,7 @@ import './App.css';
 
 function App() {
   const { protocol, hostname } = window.location;
-  const port = import.meta.env.VITE_TILED_PORT ?? '8787';
+  const port = import.meta.env.VITE_TILED_PORT ?? '443';
 
   const defaultFileId = 'rec20240425_104614_nist-sand-30-100_27keV_z8mm_n2625';
   const defaultFileUrl = `${protocol}//${hostname}:${port}/zarr/v2/${defaultFileId}`;
