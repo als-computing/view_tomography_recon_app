@@ -1,6 +1,8 @@
 import React, { useRef, useEffect } from 'react';
-import { Tiled } from 'bluesky-web';
-import 'bluesky-web/style.css';
+//import { Tiled } from 'bluesky-web';
+//import 'bluesky-web/style.css';
+import { Tiled } from '@blueskyproject/tiled';
+import '@blueskyproject/tiled/style.css';
 
 export interface TiledWidgetProps {
   /**
