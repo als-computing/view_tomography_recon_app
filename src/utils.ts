@@ -86,17 +86,50 @@ export const getTiledBaseUrl = (): string => {
     if (import.meta.env.VITE_API_TILED_URL) {
         const apiUrl = import.meta.env.VITE_API_TILED_URL;
         if (!apiUrl.includes('/api/v1')) {
-            console.warn("getTiledBaseUrl: VITE_API_TILED_URL (" + apiUrl + ") does not contain expected /api/v1/, using defaults instead.");
+            console.warn("getTiledBaseUrl: VITE_API_TILED_URL (" + apiUrl + ") does not contain expected /api/v1, using defaults instead.");
             const defaultUrl = createDefaultTiledBaseUrl();
             console.log("using default tiled base url:", defaultUrl);
             return defaultUrl;
         }
-        return import.meta.env.VITE_API_TILED_URL;
+        const sanitizedUrl = sanitizeTiledBaseUrl(apiUrl);
+        return sanitizedUrl;
     } else {
         return createDefaultTiledBaseUrl();
     }
 };
 
+/**
+ * Creates the default Tiled base URL using the current window location and environment variables.
+ * 
+ * This function constructs a Tiled API URL by combining the current page's protocol and hostname
+ * with a port number from environment variables. It's used as a fallback when no explicit
+ * Tiled base URL is provided in the environment.
+ * 
+ * @returns The constructed default Tiled base URL including the '/api/v1' path
+ * 
+ * @example
+ * ```typescript
+ * // Assuming current page is at https://localhost:3000/my-app
+ * // and VITE_TILED_PORT is "8787"
+ * const defaultUrl = createDefaultTiledBaseUrl();
+ * // Returns: "https://localhost:8787/api/v1"
+ * ```
+ * 
+ * @example
+ * ```typescript
+ * // With no VITE_TILED_PORT set (uses default)
+ * // Assuming current page is at http://example.com/app
+ * const defaultUrl = createDefaultTiledBaseUrl();
+ * // Returns: "http://example.com:8787/api/v1"
+ * ```
+ * 
+ * @remarks
+ * The function uses:
+ * - Current window's protocol (http/https)
+ * - Current window's hostname
+ * - VITE_TILED_PORT environment variable (defaults to '8787' if not set)
+ * - Fixed API path '/api/v1'
+ */
 export const createDefaultTiledBaseUrl = (): string => {
     const { protocol, hostname } = window.location;
     const port = import.meta.env.VITE_TILED_PORT ?? '8787';
@@ -104,7 +137,88 @@ export const createDefaultTiledBaseUrl = (): string => {
     return `${protocol}//${hostname}:${port}${apiPath}`;
 };
 
+/**
+ * Sanitizes a Tiled base URL to ensure it has the correct format and API path.
+ * 
+ * This function normalizes a Tiled base URL by removing trailing slashes and ensuring
+ * it ends with the proper '/api/v1' path. It's used to clean up URLs that may have
+ * inconsistent formatting from environment variables or user input.
+ * 
+ * @param tiledBaseUrl - The Tiled base URL to sanitize
+ * @returns The sanitized URL with trailing slashes removed and '/api/v1' path ensured
+ * 
+ * @example
+ * ```typescript
+ * // Remove trailing slash
+ * const sanitized = sanitizeTiledBaseUrl("https://example.com/api/v1/");
+ * // Returns: "https://example.com/api/v1"
+ * ```
+ * 
+ * @example
+ * ```typescript
+ * // Add missing API path
+ * const sanitized = sanitizeTiledBaseUrl("https://example.com");
+ * // Returns: "https://example.com/api/v1"
+ * ```
+ * 
+ * @example
+ * ```typescript
+ * // Already properly formatted
+ * const sanitized = sanitizeTiledBaseUrl("https://example.com/api/v1");
+ * // Returns: "https://example.com/api/v1"
+ * ```
+ * 
+ * @remarks
+ * This function performs two main operations:
+ * 1. Removes any trailing slash from the URL
+ * 2. Ensures the URL ends with '/api/v1' (appends it if missing)
+ */
+export const sanitizeTiledBaseUrl = (tiledBaseUrl: string): string => {
+    let sanitizedUrl = tiledBaseUrl;
+    // Remove trailing slash if present
+    if (sanitizedUrl.endsWith('/')) {
+        sanitizedUrl = sanitizedUrl.slice(0, -1);
+    }
+    // Ensure it ends with /api/v1
+    if (!sanitizedUrl.endsWith('/api/v1')) {
+        sanitizedUrl += '/api/v1';
+    }
+    return sanitizedUrl;
+};
 
+/**
+ * Gets the default Zarr file URL from environment configuration.
+ * 
+ * This function constructs a default Zarr file URL using a file ID from environment variables.
+ * It converts the Tiled API base URL to a Zarr URL format and appends the default file ID.
+ * Returns null if no default file ID is configured.
+ * 
+ * @returns The constructed default Zarr file URL, or null if no default file ID is configured
+ * 
+ * @example
+ * ```typescript
+ * // With VITE_TILED_DEFAULT_FILE_ID set to "my-dataset"
+ * const defaultUrl = getDefaultZarrFileUrl();
+ * // Returns: "https://localhost:8787/zarr/v2/my-dataset"
+ * ```
+ * 
+ * @example
+ * ```typescript
+ * // With no VITE_TILED_DEFAULT_FILE_ID set
+ * const defaultUrl = getDefaultZarrFileUrl();
+ * // Returns: null
+ * ```
+ * 
+ * @remarks
+ * This function:
+ * 1. Reads the default file ID from VITE_TILED_DEFAULT_FILE_ID environment variable
+ * 2. Gets the current Tiled base URL using getTiledBaseUrl()
+ * 3. Converts the API URL format (/api/v1) to Zarr format (/zarr/v2)
+ * 4. Appends the file ID to create the complete Zarr URL
+ * 
+ * @todo Search Tiled for the most recent zarr file (metadata contains "ngff:Image" value)
+ * and use that file ID if no environment variable is set
+ */
 export const getDefaultZarrFileUrl = (): string | null => {
     // Get default file ID from env variable
     //TODO: search Tiled for the most recent zarr file (metadata contains "ngff:Image" value) and take that file ID if no env
