@@ -12,34 +12,27 @@
 
 import React, { useState } from 'react';
 import { Header } from './Header';
-import ItkVtkViewerComponent from './ItkVtkViewerComponent';
+import ItkVtkViewer from './ItkVtkViewer';
 import './App.css';
 
+
+import { getDefaultZarrFileUrl } from './utils';
+
+const defaultZarrFileUrl = getDefaultZarrFileUrl() || '';
+
 function App() {
-  const { protocol, hostname } = window.location;
-  const port = import.meta.env.VITE_TILED_PORT ?? '8787';
-
-  const defaultFileId = 'rec20240425_104614_nist-sand-30-100_27keV_z8mm_n2625';
-  const defaultFileUrl = `${protocol}//${hostname}:${port}/zarr/v2/${defaultFileId}`;
-
-  const [fileUrl, setFileUrl] = useState(defaultFileUrl);
+  const [fileUrl, setFileUrl] = useState(defaultZarrFileUrl);
   const fileName = fileUrl.split('/').pop() || '';
 
-  const iframeSrc = `${protocol}//${hostname}:${port}/viewer/?fileToLoad=${encodeURIComponent(fileUrl)}`;
-
   return (
-    <div id="app">
+    <div id="app" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
       <Header
-        logoUrl="/images/als_logo_wheel.png"
+        logoUrl="images/als_logo_wheel.png"
         title="Tomography Visualizer powered by itk-vtk-viewer"
         fileName={fileName}
         onSelect={setFileUrl}
       />
-      <ItkVtkViewerComponent
-        src={iframeSrc}
-        height="100%"
-        flex="1"
-      />
+      <ItkVtkViewer dataUrl={fileUrl} />
     </div>
   );
 }
