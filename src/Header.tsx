@@ -36,7 +36,7 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
           <div className="header-file-name">{fileName}</div>
         </div>
         <div>
-          <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} singleColumnMode={true} tiledBaseUrl={getTiledBaseUrl()}/>
+          <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()}/>
         </div>
       </div>
     </header>

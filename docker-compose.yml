@@ -11,19 +11,19 @@ services:
       - ./cors.conf:/etc/nginx/cors.conf:ro
     depends_on:
       - tiled
-      - viewer
       - react
     restart: unless-stopped
     networks:
       - webnet
 
   tiled:
-    build:
-      context: ./tiled
-      dockerfile: Dockerfile
+    # build:
+    #   context: ./tiled
+    #   dockerfile: Dockerfile
+    image: ghcr.io/bluesky/tiled:0.2.3
     environment:
       - DATA_DIR=/storage/data
-      - TILED_ALLOW_ORIGINS="http://localhost:8787 http://localhost:8082 http://localhost:5174 http://localhost:8000 http://host.docker.internal:8787 http://host.docker.internal:8082 http://host.docker.internal:5174"
+      #- TILED_ALLOW_ORIGINS='["http://localhost:8787", "http://localhost:8082", "http://localhost:5174", "http://localhost:8000", "http://host.docker.internal:8787", "http://host.docker.internal:8082", "http://host.docker.internal:5174"]'
       - TILED_SINGLE_USER_API_KEY=${TILED_SINGLE_USER_API_KEY}
       - TILED_CONFIG=/deploy/config/custom_config.yml  # Point to our custom config
     volumes:
@@ -33,34 +33,23 @@ services:
       - "8000"
     networks:
       - webnet
-    command: >
-          sh -c "
-            # 1) Launch the server in the background
-            exec tiled serve config --host 0.0.0.0 --port 8000 --scalable & 
-            TILED_PID=\$!
+    # command: >
+    #       sh -c "
+    #         # 1) Launch the server in the background
+    #         exec tiled serve config --host 0.0.0.0 --port 8000 --scalable & 
+    #         TILED_PID=\$!
 
-            # 2) Wait up to 30s for it to become healthy
-            sleep 30
+    #         # 2) Wait up to 30s for it to become healthy
+    #         sleep 30
 
-            # 3) Register your data once the server is accepting connections
-            tiled register http://localhost:8000/ /storage/data --api-key=${TILED_SINGLE_USER_API_KEY} --verbose
+    #         # 3) Register your data once the server is accepting connections
+    #         tiled register http://localhost:8000/ /storage/data --api-key=${TILED_SINGLE_USER_API_KEY} --verbose
 
-            # 4) Hand control back to the server process so docker logs still show it
-            wait \$TILED_PID
-          "
+    #         # 4) Hand control back to the server process so docker logs still show it
+    #         wait \$TILED_PID
+    #       "
+    command: sleep infinity
     restart: unless-stopped
-
-
-  viewer:
-    build:
-      context: ./viewer
-      dockerfile: Dockerfile
-    expose:
-      - "8082"
-    networks:
-      - webnet
-    restart: unless-stopped
-
 
   react:
     build:

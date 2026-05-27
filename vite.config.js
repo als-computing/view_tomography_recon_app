@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 5174,
-    allowedHosts: ['react', 'localhost'],
+    allowedHosts: ['react', 'localhost', 'tiled-test'],
     proxy: {
       '/viewer': {
         target: 'http://viewer:8082',
