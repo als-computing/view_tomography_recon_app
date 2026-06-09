@@ -232,3 +232,45 @@ export const getDefaultZarrFileUrl = (): string | null => {
         return zarr_file_url;
     }
 }
+
+/**
+ * Determines whether a JWT access token is expired (or close to expiring).
+ *
+ * Decodes the token's payload (the middle, base64url-encoded segment) and compares
+ * its `exp` claim against the current time. A skew is applied so tokens that are
+ * about to expire are treated as already expired, leaving time to refresh before use.
+ *
+ * @param token - The JWT access token to inspect
+ * @param skewSeconds - Seconds before the real expiry to start treating the token as expired (default 30)
+ * @returns `true` if the token is missing, malformed, or expires within `skewSeconds`; otherwise `false`
+ *
+ * @example
+ * ```typescript
+ * if (isTokenExpired(accessToken)) {
+ *   // refresh before using
+ * }
+ * ```
+ */
+export const isTokenExpired = (token: string | null | undefined, skewSeconds = 30): boolean => {
+    if (!token) {
+        return true;
+    }
+    const segments = token.split('.');
+    if (segments.length < 2) {
+        // Not a JWT we can read; treat as expired so the caller refreshes.
+        return true;
+    }
+    try {
+        // Convert base64url -> base64 before decoding.
+        const base64 = segments[1].replace(/-/g, '+').replace(/_/g, '/');
+        const payload = JSON.parse(atob(base64));
+        if (typeof payload.exp !== 'number') {
+            return true;
+        }
+        const expiresAtMs = payload.exp * 1000;
+        return Date.now() >= expiresAtMs - skewSeconds * 1000;
+    } catch (error) {
+        console.warn('isTokenExpired: failed to decode token, treating as expired:', error);
+        return true;
+    }
+};

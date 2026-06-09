@@ -10,19 +10,23 @@
  * @return {JSX.Element} A full-page layout with a header and auto-resizing iframe.
  */
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Header } from './Header';
 import ItkVtkViewer from './ItkVtkViewer';
 import './App.css';
 
 
 import { getDefaultZarrFileUrl } from './utils';
+import { installTiledTokenBridge } from './tiledTokenBridge';
 
 const defaultZarrFileUrl = getDefaultZarrFileUrl() || '';
 
 function App() {
   const [fileUrl, setFileUrl] = useState(defaultZarrFileUrl);
   const fileName = fileUrl.split('/').pop() || '';
+
+  // Answer token requests from the viewer iframe so its zarr requests can be authenticated.
+  useEffect(() => installTiledTokenBridge(), []);
 
   return (
     <div id="app" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>

@@ -18,6 +18,16 @@ export default function ItkVtkViewer({ dataUrl }: ItkVtkViewerProps) {
     
     if (!iframeDoc) return;
 
+    // The iframe is same-origin (no src), so the injected interceptor can postMessage the parent
+    // for a Tiled token. Only attach the Bearer token to requests bound for the data's origin.
+    const tiledOrigin = (() => {
+      try {
+        return new URL(dataUrl).origin;
+      } catch {
+        return '';
+      }
+    })();
+
     // Create iframe content
     iframeDoc.open();
     iframeDoc.write(`
@@ -43,6 +53,8 @@ export default function ItkVtkViewer({ dataUrl }: ItkVtkViewerProps) {
           data-viewport="100vwx100vh"
           style="width: 100vw; height: 100vh;"
         ></div>
+        <script>window.__TILED_ORIGIN__ = ${JSON.stringify(tiledOrigin)};</script>
+        <script src="/tiled-auth-interceptor.js"></script>
         <script src="${jsDelivrUrl}"></script>
       </body>
       </html>
