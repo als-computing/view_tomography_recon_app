@@ -6,7 +6,7 @@ type ItkVtkViewerProps = {
     dataUrl?: string;
 };
 
-export default function ItkVtkViewer({ dataUrl }: ItkVtkViewerProps) {
+export default function ItkVtkFrame({ dataUrl }: ItkVtkViewerProps) {
   const [size, setSize] = useState({ width: 400, height: 401 });
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
@@ -54,7 +54,7 @@ export default function ItkVtkViewer({ dataUrl }: ItkVtkViewerProps) {
           style="width: 100vw; height: 100vh;"
         ></div>
         <script>window.__TILED_ORIGIN__ = ${JSON.stringify(tiledOrigin)};</script>
-        <script src="/tiled-auth-interceptor.js"></script>
+        <script src="${window.location.origin}${import.meta.env.BASE_URL}tiled-auth-interceptor.js"></script>
         <script src="${jsDelivrUrl}"></script>
       </body>
       </html>

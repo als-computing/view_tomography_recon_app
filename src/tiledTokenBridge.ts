@@ -4,12 +4,13 @@
  * The ITK viewer runs inside a same-origin iframe (built via document.write) that loads a
  * remote CDN bundle. That bundle fires its own zarr fetch/XHR requests to the Tiled server,
  * which requires authentication, but it has no access to our tokens. The interceptor injected
- * into the iframe (public/tiled-auth-interceptor.js) asks the parent for a token over
- * postMessage; this module is the parent-side responder.
+ * into the iframe (public/tiled-auth-interceptor.js) needs a valid token to attach.
  *
- * It reads the access/refresh tokens that @blueskyproject/tiled stores in localStorage, refreshes
- * the access token when it is expired (or close to it), and replies with a valid token. The
- * refresh call mirrors what the tiled library does internally on a 401:
+ * Because a document.write iframe is same-origin with the parent, the interceptor can call the
+ * parent directly rather than using postMessage. This module exposes `window.getValidTiledToken`
+ * for it: a function that reads the access/refresh tokens @blueskyproject/tiled stores in
+ * localStorage, refreshes the access token when it is expired (or close to it), and returns a
+ * valid token. The refresh call mirrors what the tiled library does internally on a 401:
  * `POST {tiledBaseUrl}/auth/refresh` with `{ refresh_token }`.
  */
 
@@ -18,9 +19,6 @@ import { getTiledBaseUrl, isTokenExpired } from './utils';
 // localStorage keys used by @blueskyproject/tiled.
 const ACCESS_TOKEN_KEY = 'tiledAccessToken';
 const REFRESH_TOKEN_KEY = 'tiledRefreshToken';
-
-const REQUEST_TYPE = 'REQUEST_TILED_TOKEN';
-const RESPONSE_TYPE = 'TILED_TOKEN_RESPONSE';
 
 /**
  * Refreshes the Tiled access token using the stored refresh token and persists the new token(s)
@@ -68,31 +66,21 @@ const getValidAccessToken = async (): Promise<string | null> => {
     return refreshAccessToken();
 };
 
+declare global {
+    interface Window {
+        getValidTiledToken?: () => Promise<string | null>;
+    }
+}
+
 /**
- * Installs a message listener that answers token requests from the viewer iframe.
+ * Exposes `window.getValidTiledToken` so the same-origin viewer iframe can fetch a valid
+ * (refreshed-if-needed) Tiled access token by calling the parent directly.
  *
- * Only same-origin messages of type `REQUEST_TILED_TOKEN` are handled; the reply is targeted
- * back at the requesting window and origin.
- *
- * @returns A cleanup function that removes the listener.
+ * @returns A cleanup function that removes the exposed getter.
  */
 export const installTiledTokenBridge = (): (() => void) => {
-    const handleMessage = async (event: MessageEvent) => {
-        // The iframe is same-origin; ignore anything from another origin.
-        if (event.origin !== window.location.origin) {
-            return;
-        }
-        if (!event.data || event.data.type !== REQUEST_TYPE) {
-            return;
-        }
-
-        const { requestId } = event.data;
-        const token = await getValidAccessToken();
-
-        const source = event.source as WindowProxy | null;
-        source?.postMessage({ type: RESPONSE_TYPE, requestId, token }, event.origin);
+    window.getValidTiledToken = getValidAccessToken;
+    return () => {
+        delete window.getValidTiledToken;
     };
-
-    window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
 };

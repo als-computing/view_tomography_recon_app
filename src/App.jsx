@@ -12,12 +12,13 @@
 
 import React, { useEffect, useState } from 'react';
 import { Header } from './Header';
-import ItkVtkViewer from './ItkVtkViewer';
 import './App.css';
 
 
 import { getDefaultZarrFileUrl } from './utils';
 import { installTiledTokenBridge } from './tiledTokenBridge';
+import ItkVktNative from './ItkVtkNative/ItkVtkNative';
+// import ItkVtkFrame from './ItkVtkFrame/ItkVtkFrame';
 
 const defaultZarrFileUrl = getDefaultZarrFileUrl() || '';
 
@@ -36,7 +37,8 @@ function App() {
         fileName={fileName}
         onSelect={setFileUrl}
       />
-      <ItkVtkViewer dataUrl={fileUrl} />
+      <ItkVktNative dataUrl={fileUrl} />
+      {/* <ItkVtkFrame dataUrl={fileUrl} /> */}
     </div>
   );
 }

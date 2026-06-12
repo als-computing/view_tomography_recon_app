@@ -36,7 +36,10 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
           <div className="header-file-name">{fileName}</div>
         </div>
         <div>
-          <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()}/>
+                    <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} initialPath='beamlines/bl832/processed/example_samples' singleColumnMode={true} includeAuthTokensInSelectCallback={true}/>
+          {/* <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} initialPath='beamlines/bl832/processed/BLS-00761_clark' includeAuthTokensInSelectCallback={true} singleColumnMode={true}/> */}
+          {/* <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} includeAuthTokensInSelectCallback={true} singleColumnMode={true}/> */}
+
         </div>
       </div>
     </header>

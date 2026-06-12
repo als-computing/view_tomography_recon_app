@@ -2,11 +2,13 @@
 //
 // Injected into the (same-origin) viewer iframe before the itk-vtk-viewer CDN bundle. It
 // overrides fetch and XMLHttpRequest so that requests bound for the Tiled server carry an
-// `Authorization: Bearer <token>` header. The token comes from the parent window over
-// postMessage (see src/tiledTokenBridge.ts), which refreshes it when needed.
+// `Authorization: Bearer <token>` header. Because a document.write iframe is same-origin with
+// the parent, the token is fetched by calling the parent directly via
+// `window.parent.getValidTiledToken()` (exposed by src/tiledTokenBridge.ts), which refreshes it
+// when needed. No postMessage is used (it can't bridge the iframe's "null" about:blank origin).
 //
 // The token is cached locally and only re-requested when missing or near expiry, so loading a
-// volume (many zarr chunk requests) does not flood the parent with messages.
+// volume (many zarr chunk requests) does not refetch on every chunk.
 
 (function () {
   'use strict';
@@ -46,32 +48,19 @@
     }
   };
 
-  // Ask the parent window for a fresh token.
-  const requestTokenFromParent = () =>
-    new Promise((resolve) => {
-      const requestId = Date.now() + Math.random();
-
-      const handleMessage = (event) => {
-        if (
-          event.data &&
-          event.data.type === 'TILED_TOKEN_RESPONSE' &&
-          event.data.requestId === requestId
-        ) {
-          window.removeEventListener('message', handleMessage);
-          resolve(event.data.token);
-        }
-      };
-
-      window.addEventListener('message', handleMessage);
-      window.parent.postMessage({ type: 'REQUEST_TILED_TOKEN', requestId }, window.location.origin);
-
-      // Give the parent time to refresh the token over the network before giving up.
-      setTimeout(() => {
-        window.removeEventListener('message', handleMessage);
-        console.warn('Tiled token request timed out, proceeding without auth');
-        resolve(null);
-      }, 10000);
-    });
+  // Ask the parent window for a fresh token. The iframe is same-origin, so we can call the
+  // parent's exposed getter directly; fall back to reading its localStorage if it isn't present.
+  const requestTokenFromParent = async () => {
+    try {
+      if (typeof window.parent.getValidTiledToken === 'function') {
+        return await window.parent.getValidTiledToken();
+      }
+      return window.parent.localStorage.getItem('tiledAccessToken');
+    } catch (e) {
+      console.warn('Tiled interceptor: could not reach parent for token:', e);
+      return null;
+    }
+  };
 
   // Return a usable token, reusing the cached one until it is missing or near expiry.
   const getToken = async () => {
