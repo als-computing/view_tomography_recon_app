@@ -9,6 +9,7 @@ allow_origins:
   - http://localhost:5174
   - http://localhost:8082
   - http://localhost:8787
+  - https:///tiled-staging.computing.als.lbl.gov
   - http://host.docker.internal:5173
   - http://host.docker.internal:5174
   - http://host.docker.internal:8082

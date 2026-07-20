@@ -36,7 +36,9 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
           <div className="header-file-name">{fileName}</div>
         </div>
         <div>
-          <Tiled oidcRedirectUrl='http://tiled-test:5174/react/' isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} singleColumnMode={true} includeAuthTokensInSelectCallback={true}/>
+          {/* beamlines/bl832/scratch/dabramov */}
+          {/* beamlines/bl832/processed/example_samples */}
+          <Tiled oidcRedirectUrl='http://tiled-test:5174/react/' isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} singleColumnMode={true} includeAuthTokensInSelectCallback={true} initialPath='beamlines/bl832/processed/dabramov'/> 
           {/* <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} initialPath='beamlines/bl832/processed/BLS-00761_clark' includeAuthTokensInSelectCallback={true} singleColumnMode={true}/> */}
           {/* <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} includeAuthTokensInSelectCallback={true} singleColumnMode={true}/> */}
 
