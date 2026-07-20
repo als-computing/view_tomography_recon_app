@@ -1,4 +1,5 @@
 import { TiledItemLinks } from "@blueskyproject/tiled";
+import { getValidTiledToken } from "./tiledToken";
 
 
 /**
@@ -273,4 +274,72 @@ export const isTokenExpired = (token: string | null | undefined, skewSeconds = 3
         console.warn('isTokenExpired: failed to decode token, treating as expired:', error);
         return true;
     }
+};
+
+/**
+ * Parent catalog path whose immediate subfolders populate the folder dropdown in the header.
+ *
+ * Configurable via the `VITE_TILED_PROCESSED_PATH` env variable (matching the app's other
+ * `VITE_`-prefixed config), defaulting to the bl832 processed tree.
+ */
+export const TILED_PROCESSED_PATH: string =
+    import.meta.env.VITE_TILED_PROCESSED_PATH ?? 'beamlines/bl832/processed';
+
+/**
+ * Lists the container (folder) children directly under `parentPath` on the Tiled server.
+ *
+ * Queries Tiled's search endpoint (`GET {tiledBaseUrl}/search/{path}`), which returns the
+ * paginated JSON:API children of a node, follows `links.next` pagination, and returns the
+ * `id` (name) of every child whose `structure_family` is `container`.
+ *
+ * A Bearer token is attached when one is available (the production server has anonymous
+ * access disabled), but the request is still sent without it so a `--public` server works
+ * too — an auth-required server then answers 401, which surfaces as a thrown error.
+ *
+ * @param parentPath - Catalog path whose children to list, e.g. `beamlines/bl832/processed`.
+ *                     Its slashes are treated as path separators and are not URL-encoded.
+ * @param signal - Optional AbortSignal so callers can cancel the request (e.g. on unmount).
+ * @returns The sorted folder names. Rejects if a request fails (e.g. 401 or network error).
+ *
+ * @example
+ * ```typescript
+ * const folders = await fetchTiledContainerChildren('beamlines/bl832/processed');
+ * // Returns: ['BLS-00761_clark', 'dabramov', 'example_samples', ...]
+ * ```
+ */
+export const fetchTiledContainerChildren = async (
+    parentPath: string,
+    signal?: AbortSignal,
+): Promise<string[]> => {
+    const token = await getValidTiledToken();
+    const baseUrl = getTiledBaseUrl();
+    // Attach the token when we have one; a public server accepts the request without it.
+    const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+    const names: string[] = [];
+
+    // Slashes in parentPath are path separators, so build the URL by string concat rather than
+    // encodeURIComponent (which would escape them). Trim any leading/trailing slashes first.
+    const cleanedPath = parentPath.replace(/^\/+|\/+$/g, '');
+    let nextUrl: string | null = `${baseUrl}/search/${cleanedPath}`;
+
+    while (nextUrl) {
+        const response: Response = await fetch(nextUrl, { headers, signal });
+        if (!response.ok) {
+            throw new Error(
+                `fetchTiledContainerChildren: request to ${nextUrl} failed with status ${response.status}`,
+            );
+        }
+        const json = await response.json();
+        const data: any[] = Array.isArray(json?.data) ? json.data : [];
+        for (const entry of data) {
+            if (entry?.attributes?.structure_family === 'container' && entry?.id) {
+                names.push(entry.id);
+            }
+        }
+        // links.next may be absolute or relative; resolve it against the current URL.
+        const next = json?.links?.next;
+        nextUrl = next ? new URL(next, nextUrl).href : null;
+    }
+
+    return names.sort((a, b) => a.localeCompare(b));
 };

@@ -1,8 +1,13 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import './header.css';
 import { Tiled, TiledItemLinks } from '@blueskyproject/tiled';
 import '@blueskyproject/tiled/style.css';
-import { createZarrFileUrlFromTiledItem, getTiledBaseUrl } from './utils';
+import {
+  createZarrFileUrlFromTiledItem,
+  fetchTiledContainerChildren,
+  getTiledBaseUrl,
+  TILED_PROCESSED_PATH,
+} from './utils';
 
 export interface HeaderProps {
   logoUrl: string;
@@ -14,7 +19,37 @@ export interface HeaderProps {
   onSelect?: (file_url: string) => void;
 }
 
+type FolderStatus = 'loading' | 'ready' | 'error';
+
 export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
+  const [folders, setFolders] = useState<string[]>([]);
+  const [selectedFolder, setSelectedFolder] = useState<string>('');
+  const [status, setStatus] = useState<FolderStatus>('loading');
+
+  // Load the subfolders under the processed path once, to populate the folder dropdown.
+  useEffect(() => {
+    const controller = new AbortController();
+    setStatus('loading');
+    fetchTiledContainerChildren(TILED_PROCESSED_PATH, controller.signal)
+      .then((names) => {
+        setFolders(names);
+        // Preserve the app's previous default of opening into 'dabramov' when it exists.
+        setSelectedFolder(names.includes('dabramov') ? 'dabramov' : names[0] ?? '');
+        setStatus('ready');
+      })
+      .catch((error) => {
+        if (error?.name === 'AbortError') {
+          return;
+        }
+        console.error('Header: failed to load Tiled folders:', error);
+        setStatus('error');
+      });
+    return () => controller.abort();
+  }, []);
+
+  // Full catalog path passed to the Tiled browser as its starting location.
+  const selectedPath = selectedFolder ? `${TILED_PROCESSED_PATH}/${selectedFolder}` : '';
+
   const handleTiledWidgetSelect = (tiledSelectedItemData: TiledItemLinks) => {
     const file_url = createZarrFileUrlFromTiledItem(tiledSelectedItemData);
     if (!file_url) {
@@ -35,13 +70,39 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
           <h1>{title}</h1>
           <div className="header-file-name">{fileName}</div>
         </div>
-        <div>
-          {/* beamlines/bl832/scratch/dabramov */}
-          {/* beamlines/bl832/processed/example_samples */}
-          <Tiled oidcRedirectUrl='http://tiled-test:5174/react/' isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} singleColumnMode={true} includeAuthTokensInSelectCallback={true} initialPath='beamlines/bl832/processed/dabramov'/> 
-          {/* <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} initialPath='beamlines/bl832/processed/BLS-00761_clark' includeAuthTokensInSelectCallback={true} singleColumnMode={true}/> */}
-          {/* <Tiled isButtonMode={true} onSelectCallback={handleTiledWidgetSelect} tiledBaseUrl={getTiledBaseUrl()} includeAuthTokensInSelectCallback={true} singleColumnMode={true}/> */}
-
+        <div className="header-tiled-controls">
+          <label className="header-folder-picker">
+            Folder:{' '}
+            <select
+              value={selectedFolder}
+              onChange={(event) => setSelectedFolder(event.target.value)}
+              disabled={status !== 'ready' || folders.length === 0}
+            >
+              {status === 'loading' && <option value="">Loading folders…</option>}
+              {status === 'error' && <option value="">Failed to load folders</option>}
+              {status === 'ready' && folders.length === 0 && (
+                <option value="">No folders found</option>
+              )}
+              {status === 'ready' &&
+                folders.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+            </select>
+          </label>
+          {selectedPath && (
+            <Tiled
+              key={selectedPath}
+              oidcRedirectUrl="http://tiled-test:5174/react/"
+              isButtonMode={true}
+              onSelectCallback={handleTiledWidgetSelect}
+              tiledBaseUrl={getTiledBaseUrl()}
+              singleColumnMode={true}
+              includeAuthTokensInSelectCallback={true}
+              initialPath={selectedPath}
+            />
+          )}
         </div>
       </div>
     </header>
