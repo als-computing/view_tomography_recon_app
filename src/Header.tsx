@@ -47,8 +47,15 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
     return () => controller.abort();
   }, []);
 
-  // Full catalog path passed to the Tiled browser as its starting location.
-  const selectedPath = selectedFolder ? `${TILED_PROCESSED_PATH}/${selectedFolder}` : '';
+  // Full catalog path passed to the Tiled browser as its starting location. When no folder is
+  // selected yet (e.g. the folder list hasn't loaded, or failed because the user isn't logged in
+  // on an auth-required server), fall back to the base path so the widget still renders — the user
+  // needs it visible to open the browser and log in, which is what lets the dropdown load.
+  // Join parent + folder, dropping empty segments so a root parent ('') doesn't yield a leading '/'.
+  const selectedPath = selectedFolder
+    ? [TILED_PROCESSED_PATH, selectedFolder].filter(Boolean).join('/')
+    : '';
+  const tiledInitialPath = selectedPath || TILED_PROCESSED_PATH;
 
   const handleTiledWidgetSelect = (tiledSelectedItemData: TiledItemLinks) => {
     const file_url = createZarrFileUrlFromTiledItem(tiledSelectedItemData);
@@ -91,18 +98,16 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
                 ))}
             </select>
           </label>
-          {selectedPath && (
-            <Tiled
-              key={selectedPath}
-              oidcRedirectUrl="http://tiled-test:5174/react/"
-              isButtonMode={true}
-              onSelectCallback={handleTiledWidgetSelect}
-              tiledBaseUrl={getTiledBaseUrl()}
-              singleColumnMode={true}
-              includeAuthTokensInSelectCallback={true}
-              initialPath={selectedPath}
-            />
-          )}
+          <Tiled
+            key={tiledInitialPath}
+            oidcRedirectUrl="http://tiled-test:5174/react/"
+            isButtonMode={true}
+            onSelectCallback={handleTiledWidgetSelect}
+            tiledBaseUrl={getTiledBaseUrl()}
+            singleColumnMode={true}
+            includeAuthTokensInSelectCallback={true}
+            initialPath={tiledInitialPath}
+          />
         </div>
       </div>
     </header>

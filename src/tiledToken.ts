@@ -2,7 +2,7 @@
  * tiledToken.ts
  *
  * Shared helper for obtaining a valid (non-expired) Tiled access token. The same
- * read-from-localStorage / refresh-via-`POST {base}/auth/refresh` logic also lives in
+ * read-from-localStorage / refresh-via-`POST {base}/auth/session/refresh` logic also lives in
  * tiledTokenBridge.ts and ItkVtkNative/tiledAuth.ts, but those run inside fetch/XHR
  * interceptors and have their own constraints (a pre-patch `nativeFetch`, a `window`
  * getter). This standalone helper is for ordinary app code — e.g. listing catalog
@@ -30,7 +30,7 @@ const refreshAccessToken = async (): Promise<string | null> => {
     return null;
   }
   try {
-    const response = await fetch(`${getTiledBaseUrl()}/auth/refresh`, {
+    const response = await fetch(`${getTiledBaseUrl()}/auth/session/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: refreshToken }),
@@ -60,13 +60,18 @@ const refreshAccessToken = async (): Promise<string | null> => {
  */
 export const getValidTiledToken = async (): Promise<string | null> => {
   const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
-  if (!isTokenExpired(accessToken)) {
+  if (accessToken && !isTokenExpired(accessToken)) {
     return accessToken;
   }
+  // The token looks missing/expired. Try to refresh, but if that fails — e.g. the server has no
+  // /auth/refresh route (returns 404) — fall back to the stored token and let the server judge it.
+  // The tiled widget uses the stored token directly, so a valid-but-unrefreshable token still works;
+  // returning null here instead would send an unauthenticated request and 401.
   if (!inFlightRefresh) {
     inFlightRefresh = refreshAccessToken().finally(() => {
       inFlightRefresh = null;
     });
   }
-  return inFlightRefresh;
+  const refreshed = await inFlightRefresh;
+  return refreshed ?? accessToken ?? null;
 };

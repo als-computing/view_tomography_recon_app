@@ -9,7 +9,10 @@ WORKDIR /app
 # Copy package files first for better caching
 COPY package*.json ./
 
-# Install dependencies
+# Patches must be present before `npm ci` runs the postinstall (patch-package) step.
+COPY patches ./patches
+
+# Install dependencies (postinstall applies patches/ via patch-package)
 RUN npm ci
 
 # Copy the rest of the application

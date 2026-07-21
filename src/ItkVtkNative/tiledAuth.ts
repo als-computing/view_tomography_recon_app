@@ -6,7 +6,7 @@
  * from localStorage — no iframe, no postMessage bridge.
  *
  * Requests bound for the Tiled data origin get an `Authorization: Bearer <token>` header. The
- * access token is refreshed when expired via `POST {tiledBaseUrl}/auth/refresh` (the same call the
+ * access token is refreshed when expired via `POST {tiledBaseUrl}/auth/session/refresh` (the same call the
  * tiled library makes internally on a 401).
  */
 
@@ -29,7 +29,7 @@ const refreshAccessToken = async (): Promise<string | null> => {
     return null;
   }
   try {
-    const response = await nativeFetch(`${getTiledBaseUrl()}/auth/refresh`, {
+    const response = await nativeFetch(`${getTiledBaseUrl()}/auth/session/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: refreshToken }),
@@ -55,7 +55,7 @@ const refreshAccessToken = async (): Promise<string | null> => {
 /** Returns a valid (non-expired) access token, refreshing it first if necessary. */
 const getValidAccessToken = async (): Promise<string | null> => {
   const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
-  if (!isTokenExpired(accessToken)) {
+  if (accessToken && !isTokenExpired(accessToken)) {
     return accessToken;
   }
   // Collapse concurrent refreshes (many chunk requests) into one network call.
@@ -64,7 +64,10 @@ const getValidAccessToken = async (): Promise<string | null> => {
       inFlightRefresh = null;
     });
   }
-  return inFlightRefresh;
+  // If the refresh fails (e.g. the server has no /auth/refresh route → 404), fall back to the
+  // stored token rather than dropping the Authorization header and 401-ing every chunk request.
+  const refreshed = await inFlightRefresh;
+  return refreshed ?? accessToken ?? null;
 };
 
 /**

@@ -11,7 +11,7 @@
  * for it: a function that reads the access/refresh tokens @blueskyproject/tiled stores in
  * localStorage, refreshes the access token when it is expired (or close to it), and returns a
  * valid token. The refresh call mirrors what the tiled library does internally on a 401:
- * `POST {tiledBaseUrl}/auth/refresh` with `{ refresh_token }`.
+ * `POST {tiledBaseUrl}/auth/session/refresh` with `{ refresh_token }`.
  */
 
 import { getTiledBaseUrl, isTokenExpired } from './utils';
@@ -32,7 +32,7 @@ const refreshAccessToken = async (): Promise<string | null> => {
         return null;
     }
     try {
-        const response = await fetch(`${getTiledBaseUrl()}/auth/refresh`, {
+        const response = await fetch(`${getTiledBaseUrl()}/auth/session/refresh`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ refresh_token: refreshToken }),
@@ -60,10 +60,13 @@ const refreshAccessToken = async (): Promise<string | null> => {
  */
 const getValidAccessToken = async (): Promise<string | null> => {
     const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
-    if (!isTokenExpired(accessToken)) {
+    if (accessToken && !isTokenExpired(accessToken)) {
         return accessToken;
     }
-    return refreshAccessToken();
+    // If the refresh fails (e.g. the server has no /auth/refresh route → 404), fall back to the
+    // stored token rather than returning null and forcing an unauthenticated request.
+    const refreshed = await refreshAccessToken();
+    return refreshed ?? accessToken ?? null;
 };
 
 declare global {

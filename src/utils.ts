@@ -331,8 +331,17 @@ export const fetchTiledContainerChildren = async (
         }
         const json = await response.json();
         const data: any[] = Array.isArray(json?.data) ? json.data : [];
+        // Diagnostic: surface exactly what the server returned (id + structure_family per child).
+        console.debug(
+            `fetchTiledContainerChildren(${parentPath || '<root>'}): ${data.length} children`,
+            data.map((e) => ({ id: e?.id, structure_family: e?.attributes?.structure_family })),
+        );
         for (const entry of data) {
-            if (entry?.attributes?.structure_family === 'container' && entry?.id) {
+            const family = entry?.attributes?.structure_family;
+            // Keep containers (folders). Some tiled servers omit structure_family from search
+            // results, so also keep entries where it's absent rather than silently showing nothing;
+            // only skip explicit leaf datasets (array/table/sparse/awkward).
+            if (entry?.id && (family === 'container' || family == null)) {
                 names.push(entry.id);
             }
         }
