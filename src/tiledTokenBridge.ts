@@ -60,13 +60,10 @@ const refreshAccessToken = async (): Promise<string | null> => {
  */
 const getValidAccessToken = async (): Promise<string | null> => {
     const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
-    if (accessToken && !isTokenExpired(accessToken)) {
+    if (!isTokenExpired(accessToken)) {
         return accessToken;
     }
-    // If the refresh fails (e.g. the server has no /auth/refresh route → 404), fall back to the
-    // stored token rather than returning null and forcing an unauthenticated request.
-    const refreshed = await refreshAccessToken();
-    return refreshed ?? accessToken ?? null;
+    return refreshAccessToken();
 };
 
 declare global {

@@ -60,18 +60,13 @@ const refreshAccessToken = async (): Promise<string | null> => {
  */
 export const getValidTiledToken = async (): Promise<string | null> => {
   const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
-  if (accessToken && !isTokenExpired(accessToken)) {
+  if (!isTokenExpired(accessToken)) {
     return accessToken;
   }
-  // The token looks missing/expired. Try to refresh, but if that fails — e.g. the server has no
-  // /auth/refresh route (returns 404) — fall back to the stored token and let the server judge it.
-  // The tiled widget uses the stored token directly, so a valid-but-unrefreshable token still works;
-  // returning null here instead would send an unauthenticated request and 401.
   if (!inFlightRefresh) {
     inFlightRefresh = refreshAccessToken().finally(() => {
       inFlightRefresh = null;
     });
   }
-  const refreshed = await inFlightRefresh;
-  return refreshed ?? accessToken ?? null;
+  return inFlightRefresh;
 };

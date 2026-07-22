@@ -55,7 +55,7 @@ const refreshAccessToken = async (): Promise<string | null> => {
 /** Returns a valid (non-expired) access token, refreshing it first if necessary. */
 const getValidAccessToken = async (): Promise<string | null> => {
   const accessToken = localStorage.getItem(ACCESS_TOKEN_KEY);
-  if (accessToken && !isTokenExpired(accessToken)) {
+  if (!isTokenExpired(accessToken)) {
     return accessToken;
   }
   // Collapse concurrent refreshes (many chunk requests) into one network call.
@@ -64,10 +64,7 @@ const getValidAccessToken = async (): Promise<string | null> => {
       inFlightRefresh = null;
     });
   }
-  // If the refresh fails (e.g. the server has no /auth/refresh route → 404), fall back to the
-  // stored token rather than dropping the Authorization header and 401-ing every chunk request.
-  const refreshed = await inFlightRefresh;
-  return refreshed ?? accessToken ?? null;
+  return inFlightRefresh;
 };
 
 /**
