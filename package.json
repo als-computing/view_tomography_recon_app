@@ -11,7 +11,7 @@
     "postinstall": "patch-package"
   },
   "dependencies": {
-    "@blueskyproject/tiled": "^0.0.30",
+    "@blueskyproject/tiled": "^0.0.33",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tailwindcss": "^4.0.14"
