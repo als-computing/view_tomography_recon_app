@@ -180,17 +180,25 @@ export default function ItkVktNative({ dataUrl, onReady }: ItkVktProps) {
     viewer.style.height = '100%';
     container.appendChild(viewer);
 
-    // A viewer created while its tab was hidden (display:none → zero-sized) — or when the window
-    // resizes — needs an explicit resize when the container regains size, or the canvas renders
-    // black/stretched.
+    // itk-vtk-viewer already installs its OWN ResizeSensor that calls the same
+    // `getViewProxy().resize()` (store.itkVtkView.resize) on every container size change, so we must
+    // NOT resize on every change too: two resize handlers firing per change rebuild the render
+    // window repeatedly and thrash the cropping widget's hardware pick buffer, which makes hovering
+    // the handles (green→blue highlight) imprecise. We only need to cover the one case the library
+    // can miss — a pane created while hidden (display:none → 0×0) that later becomes visible — so we
+    // fire resize() exactly once on the hidden→visible (zero→non-zero) transition and let the
+    // library handle window/layout resizes.
+    let hadSize = container.offsetWidth > 0 && container.offsetHeight > 0;
     const resizeObserver = new ResizeObserver(() => {
-      if (instance && container.offsetWidth > 0 && container.offsetHeight > 0) {
+      const hasSize = container.offsetWidth > 0 && container.offsetHeight > 0;
+      if (instance && hasSize && !hadSize) {
         try {
           instance.getViewProxy().resize?.();
         } catch {
           /* ignore */
         }
       }
+      hadSize = hasSize;
     });
     resizeObserver.observe(container);
 

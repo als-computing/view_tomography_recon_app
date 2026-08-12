@@ -1,16 +1,23 @@
 /**
  * useTabsStore.ts
  *
- * Zustand store for the multi-tab reconstruction viewer (client state). Holds the open tabs, the
- * active tab, the optional split (right-pane) tab, the link toggles, and which tabs are "live"
- * (their `<ItkVtkNative>` is mounted / holding a WebGL context).
+ * Zustand store for the multi-tab reconstruction viewer (client state). Tabs are organized into two
+ * side-by-side panes: every tab is assigned to the `left` or `right` pane, and each pane shows its
+ * own active tab. This mirrors the on-screen layout — the left group of tabs sits above the left
+ * pane, the right group above the right pane — so it's obvious which reconstruction is where.
  *
- * Keep-alive: when a tab stops being shown (not active and not the split pane) it stays live for a
- * 45s grace window so switching back is instant; if untouched for 45s it drops from `liveIds`,
- * unmounting the viewer and freeing its GPU context.
+ * Split view is implicit: it's "on" whenever both panes have at least one tab. New reconstructions
+ * open in the left pane; a tab is moved to the other pane by dragging (onto the other tab group or
+ * onto that pane in the viewer).
+ *
+ * Keep-alive: a tab whose viewer is mounted but no longer shown (not the active tab of either pane)
+ * stays live for a 45s grace window so switching back is instant; if untouched for 45s it drops from
+ * `liveIds`, unmounting the viewer and freeing its GPU context.
  */
 
 import { create } from 'zustand';
+
+export type PaneSide = 'left' | 'right';
 
 export interface ReconTab {
   id: string;
@@ -18,14 +25,17 @@ export interface ReconTab {
   url: string;
   /** Display name shown on the tab (last path segment of the url). */
   name: string;
+  /** Which pane this tab belongs to. */
+  pane: PaneSide;
 }
 
 export interface TabsState {
   tabs: ReconTab[];
-  activeId: string | null;
-  /** Tab shown in the right (split) pane, or null for single-pane view. */
-  splitId: string | null;
-  /** Tabs whose viewer is currently mounted (active + split + those inside the 45s grace window). */
+  /** Active (shown) tab of the left pane. */
+  activeLeftId: string | null;
+  /** Active (shown) tab of the right pane. */
+  activeRightId: string | null;
+  /** Tabs whose viewer is currently mounted (the two pane actives + those inside the 45s grace window). */
   liveIds: Set<string>;
   /** Sync camera (rotation/pan/zoom) between the two split panes. */
   linkCamera: boolean;
@@ -34,16 +44,18 @@ export interface TabsState {
   /** Sync the cropping (ROI) planes between the two split panes. */
   linkCropping: boolean;
 
-  /** Open a url as a tab (focus it if already open) and activate it. */
+  /** Open a url as a tab in the left pane (focus it if already open) and activate it. */
   openTab: (url: string) => void;
-  /** Close a tab, disposing its viewer; activates a neighbor / clears split as needed. */
+  /** Close a tab, disposing its viewer; activates a neighbor in the same pane as needed. */
   closeTab: (id: string) => void;
-  /** Make a tab active. If it's currently the split pane, swap the two panes. */
+  /** Make a tab the active (shown) tab of its own pane. */
   setActive: (id: string) => void;
-  /** Set (or clear, with null) the right split pane. Ignores the active tab. */
-  setSplit: (id: string | null) => void;
-  /** Move a tab from one index to another. */
-  reorderTabs: (fromIndex: number, toIndex: number) => void;
+  /** Move a tab into a pane (activating it there), optionally positioned before `beforeId`. */
+  moveTabToPane: (id: string, pane: PaneSide, beforeId?: string | null) => void;
+  /** Reorder a tab within its pane, placing it before `beforeId` (or at the end when null). */
+  reorderTab: (draggedId: string, beforeId: string | null) => void;
+  /** Collapse the split: move every right-pane tab back into the left pane. */
+  exitSplit: () => void;
   setLinkCamera: (value: boolean) => void;
   setLinkRendering: (value: boolean) => void;
   setLinkCropping: (value: boolean) => void;
@@ -63,6 +75,16 @@ const makeId = (): string =>
     ? crypto.randomUUID()
     : `tab-${++idCounter}`;
 
+/** Reposition `moving` within `list`: remove it, then insert before `beforeId` (or append). */
+const reposition = (list: ReconTab[], moving: ReconTab, beforeId: string | null): ReconTab[] => {
+  const without = list.filter((t) => t.id !== moving.id);
+  if (beforeId && beforeId !== moving.id) {
+    const idx = without.findIndex((t) => t.id === beforeId);
+    if (idx !== -1) return [...without.slice(0, idx), moving, ...without.slice(idx)];
+  }
+  return [...without, moving];
+};
+
 export const useTabsStore = create<TabsState>()((set, get) => {
   const clearGrace = (id: string) => {
     const timer = graceTimers.get(id);
@@ -75,24 +97,35 @@ export const useTabsStore = create<TabsState>()((set, get) => {
   const dropFromLive = (id: string) => {
     graceTimers.delete(id);
     set((s) => {
-      // Never drop a tab that's currently shown (active or split pane).
-      if (!s.liveIds.has(id) || s.activeId === id || s.splitId === id) return s;
+      // Never drop a tab that's currently shown (active in either pane).
+      if (!s.liveIds.has(id) || s.activeLeftId === id || s.activeRightId === id) return s;
       const liveIds = new Set(s.liveIds);
       liveIds.delete(id);
       return { liveIds };
     });
   };
 
-  const startGrace = (id: string | null) => {
-    if (!id) return;
+  const startGrace = (id: string) => {
     clearGrace(id);
     graceTimers.set(id, setTimeout(() => dropFromLive(id), TAB_GRACE_MS));
   };
 
+  // Idempotently align grace timers with the current state: shown tabs keep their viewer (no timer),
+  // every other live tab is on the 45s countdown. Call after any action that changes which tabs are
+  // shown or live.
+  const reconcileGrace = () => {
+    const { liveIds, activeLeftId, activeRightId } = get();
+    liveIds.forEach((id) => {
+      const shown = id === activeLeftId || id === activeRightId;
+      if (shown) clearGrace(id);
+      else if (!graceTimers.has(id)) startGrace(id);
+    });
+  };
+
   return {
     tabs: [],
-    activeId: null,
-    splitId: null,
+    activeLeftId: null,
+    activeRightId: null,
     liveIds: new Set<string>(),
     linkCamera: true,
     linkRendering: true,
@@ -104,80 +137,104 @@ export const useTabsStore = create<TabsState>()((set, get) => {
         get().setActive(existing.id);
         return;
       }
-      const tab: ReconTab = { id: makeId(), url, name: nameFromUrl(url) };
-      const prev = get().activeId;
-      // The previous active tab keeps showing if it's the split pane; otherwise it starts its grace.
-      if (prev && prev !== get().splitId) startGrace(prev);
-      set((s) => ({
-        tabs: [...s.tabs, tab],
-        activeId: tab.id,
-        liveIds: new Set(s.liveIds).add(tab.id),
-      }));
+      const tab: ReconTab = { id: makeId(), url, name: nameFromUrl(url), pane: 'left' };
+      set((s) => {
+        const liveIds = new Set(s.liveIds);
+        liveIds.add(tab.id);
+        return { tabs: [...s.tabs, tab], activeLeftId: tab.id, liveIds };
+      });
+      reconcileGrace();
     },
 
     setActive: (id) => {
-      const { activeId: prev, splitId } = get();
-      if (prev === id) return;
+      const tab = get().tabs.find((t) => t.id === id);
+      if (!tab) return;
       clearGrace(id);
-      if (splitId === id) {
-        // Clicking the split-pane's tab swaps the two panes (both stay live).
-        set({ activeId: id, splitId: prev });
-        return;
-      }
-      if (prev && prev !== splitId) startGrace(prev);
-      set((s) => ({ activeId: id, liveIds: new Set(s.liveIds).add(id) }));
-    },
-
-    setSplit: (id) => {
-      const { activeId, splitId: prev } = get();
-      if (id === activeId) return; // can't compare a tab with itself
-      if (id === prev) return;
-      if (id) clearGrace(id);
-      // The old split tab starts its grace unless it's the active one.
-      if (prev && prev !== activeId) startGrace(prev);
       set((s) => {
         const liveIds = new Set(s.liveIds);
-        if (id) liveIds.add(id);
-        return { splitId: id, liveIds };
+        liveIds.add(id);
+        return tab.pane === 'left' ? { activeLeftId: id, liveIds } : { activeRightId: id, liveIds };
+      });
+      reconcileGrace();
+    },
+
+    moveTabToPane: (id, pane, beforeId = null) => {
+      const tab = get().tabs.find((t) => t.id === id);
+      if (!tab) return;
+      clearGrace(id);
+      set((s) => {
+        const tabs = reposition(
+          s.tabs.map((t) => (t.id === id ? { ...t, pane } : t)),
+          { ...tab, pane },
+          beforeId,
+        );
+        let activeLeftId = s.activeLeftId;
+        let activeRightId = s.activeRightId;
+        // Activate the moved tab in its destination pane.
+        if (pane === 'left') activeLeftId = id;
+        else activeRightId = id;
+        // If it was the active tab of the pane it just left, promote a neighbor there.
+        if (tab.pane !== pane) {
+          if (tab.pane === 'left' && s.activeLeftId === id) {
+            activeLeftId = tabs.find((t) => t.pane === 'left')?.id ?? null;
+          } else if (tab.pane === 'right' && s.activeRightId === id) {
+            activeRightId = tabs.find((t) => t.pane === 'right')?.id ?? null;
+          }
+        }
+        const liveIds = new Set(s.liveIds);
+        liveIds.add(id);
+        if (activeLeftId) liveIds.add(activeLeftId);
+        if (activeRightId) liveIds.add(activeRightId);
+        return { tabs, activeLeftId, activeRightId, liveIds };
+      });
+      reconcileGrace();
+    },
+
+    reorderTab: (draggedId, beforeId) => {
+      set((s) => {
+        const moving = s.tabs.find((t) => t.id === draggedId);
+        if (!moving) return s;
+        return { tabs: reposition(s.tabs, moving, beforeId) };
       });
     },
 
     closeTab: (id) => {
       clearGrace(id);
       set((s) => {
-        const idx = s.tabs.findIndex((t) => t.id === id);
-        if (idx === -1) return s;
+        const tab = s.tabs.find((t) => t.id === id);
+        if (!tab) return s;
+        const idxInPane = s.tabs.filter((t) => t.pane === tab.pane).findIndex((t) => t.id === id);
         const tabs = s.tabs.filter((t) => t.id !== id);
         const liveIds = new Set(s.liveIds);
         liveIds.delete(id);
-        let activeId = s.activeId;
-        let splitId = s.splitId;
-        if (splitId === id) splitId = null; // closing the split pane exits split view
-        if (activeId === id) {
-          const neighbor = tabs[idx] ?? tabs[idx - 1] ?? null;
-          activeId = neighbor ? neighbor.id : null;
-          if (activeId) {
-            clearGrace(activeId);
-            liveIds.add(activeId);
-          }
-          // If the neighbor we picked is the split pane, clear split to avoid same-tab-in-both.
-          if (activeId && activeId === splitId) splitId = null;
+        let activeLeftId = s.activeLeftId;
+        let activeRightId = s.activeRightId;
+        if (tab.pane === 'left' && activeLeftId === id) {
+          const rem = tabs.filter((t) => t.pane === 'left');
+          const neighbor = rem[idxInPane] ?? rem[idxInPane - 1] ?? null;
+          activeLeftId = neighbor?.id ?? null;
+          if (activeLeftId) liveIds.add(activeLeftId);
         }
-        return { tabs, activeId, splitId, liveIds };
+        if (tab.pane === 'right' && activeRightId === id) {
+          const rem = tabs.filter((t) => t.pane === 'right');
+          const neighbor = rem[idxInPane] ?? rem[idxInPane - 1] ?? null;
+          activeRightId = neighbor?.id ?? null;
+          if (activeRightId) liveIds.add(activeRightId);
+        }
+        return { tabs, activeLeftId, activeRightId, liveIds };
       });
+      reconcileGrace();
     },
 
-    reorderTabs: (fromIndex, toIndex) => {
+    exitSplit: () => {
       set((s) => {
-        const n = s.tabs.length;
-        if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0 || fromIndex >= n || toIndex >= n) {
-          return s;
-        }
-        const tabs = [...s.tabs];
-        const [moved] = tabs.splice(fromIndex, 1);
-        tabs.splice(toIndex, 0, moved);
-        return { tabs };
+        const tabs = s.tabs.map((t) => (t.pane === 'right' ? { ...t, pane: 'left' as PaneSide } : t));
+        const activeLeftId = s.activeLeftId ?? s.activeRightId ?? tabs[0]?.id ?? null;
+        const liveIds = new Set(s.liveIds);
+        if (activeLeftId) liveIds.add(activeLeftId);
+        return { tabs, activeLeftId, activeRightId: null, liveIds };
       });
+      reconcileGrace();
     },
 
     setLinkCamera: (value) => set({ linkCamera: value }),

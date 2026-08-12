@@ -39,75 +39,57 @@
   z-index: 2;
 }
 
-/* Floating camera/colormap link toggles shown while in split view. */
+/* Compact "linked" chip centered on the divider while in split view: what's synced + exit. */
 .viewer-link-controls {
   position: absolute;
   top: 8px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 3;
+  z-index: 5;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 6px 12px;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(0, 0, 0, 0.12);
-  border-radius: 8px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  gap: 10px;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 999px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
   font-family: 'Nunito Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
-  font-size: 13px;
-  color: #222;
+  font-size: 12px;
+  color: #1f2933;
+  user-select: none;
 }
 
 .viewer-link-controls__label {
-  font-weight: 600;
-  color: #444;
+  font-weight: 700;
+  color: #52606d;
 }
 
 .viewer-link-controls label {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   cursor: pointer;
-  user-select: none;
 }
 
-.viewer-link-controls button {
-  border: 1px solid rgba(0, 0, 0, 0.15);
-  background: #fff;
-  color: #333;
-  font-size: 12px;
+.viewer-link-controls input {
+  cursor: pointer;
+  margin: 0;
+}
+
+.viewer-link-controls__exit {
+  margin-left: 2px;
   padding: 3px 10px;
-  border-radius: 5px;
+  background: transparent;
+  border: 1px solid rgba(185, 28, 28, 0.35);
+  border-radius: 999px;
+  font: inherit;
+  font-weight: 600;
+  color: #b91c1c;
   cursor: pointer;
 }
 
-.viewer-link-controls button:hover {
-  background: #f1f1f1;
-}
-
-/* Drop target (right half) revealed while dragging a tab, to open/replace the split pane. */
-.viewer-drop-overlay {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  width: 50%;
-  z-index: 4;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(30, 167, 253, 0.12);
-  border: 2px dashed #1ea7fd;
-  box-sizing: border-box;
-}
-
-.viewer-drop-hint {
-  padding: 8px 14px;
-  background: rgba(255, 255, 255, 0.92);
-  border-radius: 8px;
-  font-family: 'Nunito Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
-  font-size: 14px;
-  color: #0b5f91;
-  pointer-events: none;
+.viewer-link-controls__exit:hover {
+  background: rgba(185, 28, 28, 0.08);
+  border-color: rgba(185, 28, 28, 0.6);
 }

@@ -1,13 +1,13 @@
 /**
  * App.jsx
  *
- * The main application component: a header, a tab strip, and a viewer stack that shows the active
- * reconstruction. Multiple reconstructions can be open at once as tabs; only live tabs (active +
- * split pane + those still inside the 45s keep-alive window) are mounted, so idle WebGL contexts
- * are released.
+ * The main application component: a header, a tab strip, and a viewer stack. Multiple reconstructions
+ * can be open at once as tabs, split across a left and right pane. Only live tabs (each pane's active
+ * tab + those still inside the 45s keep-alive window) are mounted, so idle WebGL contexts are freed.
  *
- * Split view: dragging a tab onto the viewer stack opens a second (right) pane. The two panes can
- * have their camera and/or colormap linked via the toggles (see useLinkedViewers).
+ * Split view: every tab belongs to the left or right pane; split is "on" when both panes have a tab.
+ * Drag a tab onto a pane (or onto the other tab group) to move it there. The two panes can have their
+ * camera / rendering / cropping linked via the toggles (see useLinkedViewers).
  *
  * @return {JSX.Element}
  */
@@ -21,7 +21,7 @@ import { installTiledTokenBridge } from './tiledTokenBridge';
 import { installTiledFetchInterceptor } from './ItkVtkNative/tiledAuth';
 import ItkVktNative from './ItkVtkNative/ItkVtkNative';
 import { TiledNotifications } from './TiledNotifications';
-import { TabBar, TAB_DND_MIME } from './TabBar';
+import { TabBar } from './TabBar';
 import { useTabsStore } from './stores/useTabsStore';
 import { useLinkedViewers } from './hooks/useLinkedViewers';
 
@@ -29,8 +29,8 @@ const defaultZarrFileUrl = getDefaultZarrFileUrl() || '';
 
 function App() {
   const tabs = useTabsStore((s) => s.tabs);
-  const activeId = useTabsStore((s) => s.activeId);
-  const splitId = useTabsStore((s) => s.splitId);
+  const activeLeftId = useTabsStore((s) => s.activeLeftId);
+  const activeRightId = useTabsStore((s) => s.activeRightId);
   const liveIds = useTabsStore((s) => s.liveIds);
   const linkCamera = useTabsStore((s) => s.linkCamera);
   const linkRendering = useTabsStore((s) => s.linkRendering);
@@ -38,15 +38,22 @@ function App() {
   const openTab = useTabsStore((s) => s.openTab);
   const closeTab = useTabsStore((s) => s.closeTab);
   const setActive = useTabsStore((s) => s.setActive);
-  const setSplit = useTabsStore((s) => s.setSplit);
-  const reorderTabs = useTabsStore((s) => s.reorderTabs);
+  const moveTabToPane = useTabsStore((s) => s.moveTabToPane);
+  const reorderTab = useTabsStore((s) => s.reorderTab);
+  const exitSplit = useTabsStore((s) => s.exitSplit);
   const setLinkCamera = useTabsStore((s) => s.setLinkCamera);
   const setLinkRendering = useTabsStore((s) => s.setLinkRendering);
   const setLinkCropping = useTabsStore((s) => s.setLinkCropping);
 
+  const hasLeft = useMemo(() => tabs.some((t) => t.pane === 'left'), [tabs]);
+  const hasRight = useMemo(() => tabs.some((t) => t.pane === 'right'), [tabs]);
+  const isSplit = hasLeft && hasRight;
+  // The single tab shown when not split (whichever pane holds the tabs).
+  const soloId = hasRight && !hasLeft ? activeRightId : activeLeftId;
+
   // Captured viewer instances keyed by tab id (populated via each pane's onReady). Kept in a ref so
   // capturing an instance doesn't itself trigger a render; `instanceVersion` bumps to recompute the
-  // active/split instances passed to useLinkedViewers.
+  // pane instances passed to useLinkedViewers.
   const instancesRef = useRef(new Map());
   const [instanceVersion, setInstanceVersion] = useState(0);
   const handleReady = useCallback((id, instance) => {
@@ -55,18 +62,16 @@ function App() {
     setInstanceVersion((v) => v + 1);
   }, []);
 
-  // Whether a tab is currently being dragged (drives the split drop overlay on the viewer stack).
-  const [isTabDragging, setIsTabDragging] = useState(false);
-
-  const activeInstance = useMemo(
-    () => (activeId ? instancesRef.current.get(activeId) ?? null : null),
-    [activeId, instanceVersion],
+  // Link the two panes only in split view (each side's active viewer).
+  const leftInstance = useMemo(
+    () => (isSplit && activeLeftId ? instancesRef.current.get(activeLeftId) ?? null : null),
+    [isSplit, activeLeftId, instanceVersion],
   );
-  const splitInstance = useMemo(
-    () => (splitId ? instancesRef.current.get(splitId) ?? null : null),
-    [splitId, instanceVersion],
+  const rightInstance = useMemo(
+    () => (isSplit && activeRightId ? instancesRef.current.get(activeRightId) ?? null : null),
+    [isSplit, activeRightId, instanceVersion],
   );
-  useLinkedViewers(activeInstance, splitInstance, {
+  useLinkedViewers(leftInstance, rightInstance, {
     camera: linkCamera,
     rendering: linkRendering,
     cropping: linkCropping,
@@ -85,20 +90,23 @@ function App() {
     if (defaultZarrFileUrl) openTab(defaultZarrFileUrl);
   }, [openTab]);
 
+  // Press Escape to leave split view.
+  useEffect(() => {
+    if (!isSplit) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape') exitSplit();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isSplit, exitSplit]);
+
   const paneStyle = (id) => {
-    if (splitId) {
-      if (id === activeId) return { left: 0, width: '50%' };
-      if (id === splitId) return { left: '50%', width: '50%' };
+    if (isSplit) {
+      if (id === activeLeftId) return { left: 0, width: '50%' };
+      if (id === activeRightId) return { left: '50%', width: '50%' };
       return { inset: 0, display: 'none' };
     }
-    return { inset: 0, display: id === activeId ? 'flex' : 'none' };
-  };
-
-  const handleSplitDrop = (e) => {
-    e.preventDefault();
-    const id = e.dataTransfer.getData(TAB_DND_MIME);
-    setIsTabDragging(false);
-    if (id) setSplit(id);
+    return { inset: 0, display: id === soloId ? 'flex' : 'none' };
   };
 
   return (
@@ -110,12 +118,12 @@ function App() {
       />
       <TabBar
         tabs={tabs}
-        activeId={activeId}
+        activeLeftId={activeLeftId}
+        activeRightId={activeRightId}
         onActivate={setActive}
         onClose={closeTab}
-        onReorder={reorderTabs}
-        onTabDragStart={() => setIsTabDragging(true)}
-        onTabDragEnd={() => setIsTabDragging(false)}
+        onReorder={reorderTab}
+        onMoveToPane={moveTabToPane}
       />
       <div className="viewer-stack">
         {tabs
@@ -129,8 +137,8 @@ function App() {
               <ItkVktNative dataUrl={t.url} onReady={(instance) => handleReady(t.id, instance)} />
             </div>
           ))}
-        {splitId && <div className="viewer-divider" />}
-        {splitId && (
+        {isSplit && <div className="viewer-divider" />}
+        {isSplit && (
           <div className="viewer-link-controls">
             <span className="viewer-link-controls__label">Link:</span>
             <label>
@@ -157,22 +165,9 @@ function App() {
               />
               Cropping
             </label>
-            <button type="button" onClick={() => setSplit(null)}>
-              Exit split
+            <button type="button" className="viewer-link-controls__exit" onClick={() => exitSplit()}>
+              ✕ Exit split
             </button>
-          </div>
-        )}
-        {/* Drop zone shown only while a tab is being dragged; dropping opens/updates the split pane. */}
-        {isTabDragging && (
-          <div
-            className="viewer-drop-overlay"
-            onDragOver={(e) => {
-              e.preventDefault();
-              e.dataTransfer.dropEffect = 'move';
-            }}
-            onDrop={handleSplitDrop}
-          >
-            <span className="viewer-drop-hint">Drop here to open a split view</span>
           </div>
         )}
         {tabs.length === 0 && (

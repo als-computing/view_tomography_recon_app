@@ -1,20 +1,46 @@
 .tabbar {
   display: flex;
   align-items: stretch;
-  gap: 2px;
   flex-shrink: 0;
-  padding: 4px 8px 0;
+  padding: 4px 0 0;
   background: #f3f4f6;
   border-bottom: 1px solid rgba(0, 0, 0, 0.1);
-  overflow-x: auto;
+  overflow: hidden;
+  min-width: 0;
   font-family: 'Nunito Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+}
+
+/* Each pane's tabs live in their own left-aligned, independently-scrolling group. In split view the
+   two groups are exactly 50% wide so they sit directly above their panes (the right group's left
+   border lines up with the viewer divider). */
+.tabbar__group {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0 8px;
+  /* Horizontal overflow scrolls; pin vertical to hidden (only setting overflow-x makes the browser
+     compute overflow-y to `auto`, which showed a spurious vertical scrollbar). */
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.tabbar--split .tabbar__group {
+  flex: 0 0 50%;
+  width: 50%;
+}
+
+.tabbar--split .tabbar__group--right {
+  border-left: 1px solid rgba(0, 0, 0, 0.2);
 }
 
 .tabbar__tab {
   display: flex;
   align-items: center;
-  gap: 8px;
-  max-width: 220px;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 240px;
   padding: 8px 8px 8px 14px;
   cursor: pointer;
   user-select: none;
@@ -31,13 +57,43 @@
   background: rgba(0, 0, 0, 0.04);
 }
 
-.tabbar__tab--active {
+/* The active (shown) tab of a pane reads as "connected" to the content and stretches to reveal its
+   whole file name instead of truncating. */
+.tabbar__tab--shown {
   background: #fff;
   color: #111;
   border-color: rgba(0, 0, 0, 0.12);
-  /* Sit on top of the strip's bottom border so the tab reads as connected to the content. */
   margin-bottom: -1px;
   padding-bottom: 9px;
+  max-width: none;
+}
+
+.tabbar__tab--shown .tabbar__name {
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+/* Pane side accents in split view: left pane = blue, right pane = amber. */
+.tabbar__tab--pane-left {
+  border-top: 2px solid #1ea7fd;
+}
+
+.tabbar__tab--pane-right {
+  border-top: 2px solid #f59e0b;
+}
+
+.tabbar__pane-badge {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.tabbar__tab--pane-left .tabbar__pane-badge {
+  color: #1ea7fd;
+}
+
+.tabbar__tab--pane-right .tabbar__pane-badge {
+  color: #f59e0b;
 }
 
 /* Drop indicator while dragging another tab over this one. */
@@ -51,6 +107,24 @@
   max-width: 180px;
 }
 
+/* Send this tab to the other pane (this is how side-by-side is opened). */
+.tabbar__move {
+  border: 0;
+  background: transparent;
+  color: #8a94a6;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 1px 4px;
+  border-radius: 3px;
+  flex: 0 0 auto;
+}
+
+.tabbar__move:hover {
+  background: rgba(30, 167, 253, 0.14);
+  color: #1583c7;
+}
+
 .tabbar__close {
   border: 0;
   background: transparent;
@@ -60,6 +134,7 @@
   line-height: 1;
   padding: 0 3px;
   border-radius: 3px;
+  flex: 0 0 auto;
 }
 
 .tabbar__close:hover {
