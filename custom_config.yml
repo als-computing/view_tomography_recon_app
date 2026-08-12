@@ -1,10 +1,27 @@
 authentication:
   allow_anonymous_access: false
-
+  single_user_api_key: ${TILED_SINGLE_USER_API_KEY}
+uvicorn:
+  host: 0.0.0.0
+  port: 8000
+allow_origins:
+  - http://localhost:5173
+  - http://localhost:5174
+  - http://localhost:8082
+  - http://localhost:8787
+  - https:///tiled-staging.computing.als.lbl.gov
+  - http://host.docker.internal:5173
+  - http://host.docker.internal:5174
+  - http://host.docker.internal:8082
+  - http://host.docker.internal:8787
 trees:
 - path: /
   tree: catalog
   args:
-    uri: "sqlite+aiosqlite:////storage/catalog.db"
-    writable_storage: "/storage/data"
+    uri: "sqlite:////storage/catalog.db"
+    writable_storage: 
+      - "/storage/data"
+      - "sqlite:////storage/tabular.db"
+    readable_storage:
+      - "/storage/data"
     init_if_not_exists: true

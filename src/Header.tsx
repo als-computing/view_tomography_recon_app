@@ -1,8 +1,13 @@
-import React, { useState } from 'react';
-import { Button } from './Button';
-import 'bluesky-web/style.css';
+import { useEffect, useState } from 'react';
 import './header.css';
-import { TiledWidget } from './TiledWidget';
+import { Tiled, TiledItemLinks } from '@blueskyproject/tiled';
+import '@blueskyproject/tiled/style.css';
+import {
+  createZarrFileUrlFromTiledItem,
+  fetchTiledContainerChildren,
+  getTiledBaseUrl,
+  TILED_PROCESSED_PATH,
+} from './utils';
 
 export interface HeaderProps {
   logoUrl: string;
@@ -14,59 +19,97 @@ export interface HeaderProps {
   onSelect?: (file_url: string) => void;
 }
 
+type FolderStatus = 'loading' | 'ready' | 'error';
+
 export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
-  const [showTiledWidget, setShowTiledWidget] = useState(false);
+  const [folders, setFolders] = useState<string[]>([]);
+  const [selectedFolder, setSelectedFolder] = useState<string>('');
+  const [status, setStatus] = useState<FolderStatus>('loading');
 
-  // Open the modal when "Select Dataset" is clicked.
-  const handleSelectClick = () => {
-    setShowTiledWidget(true);
-  };
+  // Load the subfolders under the processed path once, to populate the folder dropdown.
+  useEffect(() => {
+    const controller = new AbortController();
+    setStatus('loading');
+    fetchTiledContainerChildren(TILED_PROCESSED_PATH, controller.signal)
+      .then((names) => {
+        setFolders(names);
+        // Preserve the app's previous default of opening into 'dabramov' when it exists.
+        setSelectedFolder(names.includes('dabramov') ? 'dabramov' : names[0] ?? '');
+        setStatus('ready');
+      })
+      .catch((error) => {
+        if (error?.name === 'AbortError') {
+          return;
+        }
+        console.error('Header: failed to load Tiled folders:', error);
+        setStatus('error');
+      });
+    return () => controller.abort();
+  }, []);
 
-  // Close the modal.
-  const handleCloseModal = () => {
-    setShowTiledWidget(false);
-  };
+  // Full catalog path passed to the Tiled browser as its starting location. When no folder is
+  // selected yet (e.g. the folder list hasn't loaded, or failed because the user isn't logged in
+  // on an auth-required server), fall back to the base path so the widget still renders — the user
+  // needs it visible to open the browser and log in, which is what lets the dropdown load.
+  // Join parent + folder, dropping empty segments so a root parent ('') doesn't yield a leading '/'.
+  const selectedPath = selectedFolder
+    ? [TILED_PROCESSED_PATH, selectedFolder].filter(Boolean).join('/')
+    : '';
+  const tiledInitialPath = selectedPath || TILED_PROCESSED_PATH;
 
-  // Callback from TiledWidget receives the file_url.
-  const handleTiledWidgetSelect = (file_url: string) => {
-    console.log("Header received file_url:", file_url);
+  const handleTiledWidgetSelect = (tiledSelectedItemData: TiledItemLinks) => {
+    const file_url = createZarrFileUrlFromTiledItem(tiledSelectedItemData);
+    if (!file_url) {
+      console.error("Valid file url not found");
+      return;
+    }
+    console.log("User selected file:", file_url);
     if (onSelect) {
       onSelect(file_url);
     }
-    setShowTiledWidget(false);
   };
 
   return (
-    <header>
+    <header style={{flexShrink: 0}}>
       <div className="storybook-header">
         <div>
           <img src={logoUrl} className="header-logo" alt="Logo" />
           <h1>{title}</h1>
           <div className="header-file-name">{fileName}</div>
         </div>
-        <div>
-          <Button size="small" label="Select Dataset" onClick={handleSelectClick} />
+        <div className="header-tiled-controls">
+          <label className="header-folder-picker">
+            Folder:{' '}
+            <select
+              value={selectedFolder}
+              onChange={(event) => setSelectedFolder(event.target.value)}
+              disabled={status !== 'ready' || folders.length === 0}
+            >
+              {status === 'loading' && <option value="">Loading folders…</option>}
+              {status === 'error' && <option value="">Failed to load folders</option>}
+              {status === 'ready' && folders.length === 0 && (
+                <option value="">No folders found</option>
+              )}
+              {status === 'ready' &&
+                folders.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <Tiled
+            key={tiledInitialPath}
+            oidcRedirectUrl="http://tiled-test:5174/react/"
+            isButtonMode={true}
+            onSelectCallback={handleTiledWidgetSelect}
+            tiledBaseUrl={getTiledBaseUrl()}
+            singleColumnMode={true}
+            includeAuthTokensInSelectCallback={true}
+            initialPath={tiledInitialPath}
+          />
         </div>
       </div>
-
-      {/* Modal for TiledWidget */}
-      {showTiledWidget && (
-        <div className="modal-overlay">
-          <div className="modal-content">
-            <div className="modal-header">
-              <h3>Select a Dataset</h3>
-              <button className="close-button" onClick={handleCloseModal}>
-                ×
-              </button>
-            </div>
-            <div className="modal-body">
-              <div className="tiled-container">
-                <TiledWidget onSelect={handleTiledWidgetSelect} />
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </header>
   );
 };

@@ -10,36 +10,35 @@
  * @return {JSX.Element} A full-page layout with a header and auto-resizing iframe.
  */
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Header } from './Header';
-import ItkVtkViewerComponent from './ItkVtkViewerComponent';
 import './App.css';
 
+
+import { getDefaultZarrFileUrl } from './utils';
+import { installTiledTokenBridge } from './tiledTokenBridge';
+import ItkVktNative from './ItkVtkNative/ItkVtkNative';
+// import ItkVtkFrame from './ItkVtkFrame/ItkVtkFrame';
+
+const defaultZarrFileUrl = getDefaultZarrFileUrl() || '';
+
 function App() {
-  const { protocol, hostname } = window.location;
-  const port = import.meta.env.VITE_TILED_PORT ?? '8787';
-
-  const defaultFileId = 'rec20240425_104614_nist-sand-30-100_27keV_z8mm_n2625';
-  const defaultFileUrl = `${protocol}//${hostname}:${port}/zarr/v2/${defaultFileId}`;
-
-  const [fileUrl, setFileUrl] = useState(defaultFileUrl);
+  const [fileUrl, setFileUrl] = useState(defaultZarrFileUrl);
   const fileName = fileUrl.split('/').pop() || '';
 
-  const iframeSrc = `${protocol}//${hostname}:${port}/viewer/?fileToLoad=${encodeURIComponent(fileUrl)}`;
+  // Answer token requests from the viewer iframe so its zarr requests can be authenticated.
+  useEffect(() => installTiledTokenBridge(), []);
 
   return (
-    <div id="app">
+    <div id="app" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
       <Header
-        logoUrl="/images/als_logo_wheel.png"
+        logoUrl="images/als_logo_wheel.png"
         title="Tomography Visualizer powered by itk-vtk-viewer"
         fileName={fileName}
         onSelect={setFileUrl}
       />
-      <ItkVtkViewerComponent
-        src={iframeSrc}
-        height="100%"
-        flex="1"
-      />
+      <ItkVktNative dataUrl={fileUrl} />
+      {/* <ItkVtkFrame dataUrl={fileUrl} /> */}
     </div>
   );
 }
