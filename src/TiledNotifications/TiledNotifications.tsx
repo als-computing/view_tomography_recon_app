@@ -13,7 +13,8 @@
  * overridden per project.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { fetchTiledContainerChildren, getTiledBaseUrl, TILED_PROCESSED_PATH } from '../utils';
 import { buildZarrUrlForChild } from './buildTiledStreamUrl';
 import { ensureNotificationPermission, showOsNotification } from './osNotifications';
@@ -25,6 +26,9 @@ import type {
   TiledStreamConfig,
   TiledStructureFamily,
 } from './types';
+
+// Stable empty default so the query's loading state doesn't hand a fresh [] to the render each time.
+const EMPTY_PATHS: string[] = [];
 
 export interface TiledNotificationsProps {
   /** Parent catalog path whose (accessible) child containers are watched. Default TILED_PROCESSED_PATH. */
@@ -78,7 +82,22 @@ const TiledNotificationsInner = ({
   enabled = true,
 }: TiledNotificationsProps) => {
   const { pushToast, dismissToast } = useToasts();
-  const [watchPaths, setWatchPaths] = useState<string[]>([]);
+
+  // Server state: the container paths to watch (the signed-in user's accessible ESAFs under
+  // parentPath). TanStack Query re-resolves on an interval + window focus, so login-after-mount and
+  // newly-granted ESAFs are picked up automatically; structural sharing keeps the array reference
+  // stable when unchanged, so the per-ESAF streams don't needlessly remount.
+  const { data: watchPaths = EMPTY_PATHS } = useQuery({
+    queryKey: ['tiled-esafs', parentPath, Boolean(resolveWatchPaths)],
+    queryFn: async ({ signal }): Promise<string[]> => {
+      if (resolveWatchPaths) return resolveWatchPaths();
+      const names = await fetchTiledContainerChildren(parentPath, signal);
+      return names.map((name) => [parentPath, name].filter(Boolean).join('/'));
+    },
+    enabled,
+    refetchInterval: resolveIntervalMs,
+    refetchOnWindowFocus: true,
+  });
 
   // Latest-value refs so the stream callback stays stable but reads current props.
   const onViewRef = useRef(onView);
@@ -97,45 +116,6 @@ const TiledNotificationsInner = ({
       void ensureNotificationPermission();
     }
   }, [enableOsNotifications]);
-
-  // Resolve (and periodically re-resolve) the watched container paths.
-  useEffect(() => {
-    if (!enabled) {
-      setWatchPaths([]);
-      return;
-    }
-    let cancelled = false;
-
-    const resolve = async () => {
-      try {
-        const paths = resolveWatchPaths
-          ? await resolveWatchPaths()
-          : (await fetchTiledContainerChildren(parentPath)).map((name) =>
-              [parentPath, name].filter(Boolean).join('/'),
-            );
-        if (cancelled) return;
-        // Only update state when the set actually changes, to avoid remounting streams needlessly.
-        setWatchPaths((prev) => {
-          const a = [...prev].sort();
-          const b = [...paths].sort();
-          const same = a.length === b.length && a.every((v, i) => v === b[i]);
-          return same ? prev : b;
-        });
-      } catch (error) {
-        // Not-yet-logged-in (401) etc. — keep trying on the interval; existing streams stay up.
-        if (!cancelled) {
-          console.debug('TiledNotifications: could not resolve watch paths yet:', error);
-        }
-      }
-    };
-
-    void resolve();
-    const interval = setInterval(resolve, resolveIntervalMs);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [enabled, parentPath, resolveWatchPaths, resolveIntervalMs]);
 
   const handleChildCreated = (watchPath: string, event: TiledContainerChildCreatedEvent) => {
     if (!notifyStructureFamilies.includes(event.structure_family)) return;

@@ -11,21 +11,37 @@
  * first time the script runs — which meant a second volume could never load. Driving the loader
  * directly (it empties the container first) makes every subsequent load work.
  *
- * Auth: since everything runs in the main window, fetch/XHR are patched in-place (see ./tiledAuth)
- * to attach the Tiled Bearer token — no iframe, no postMessage.
+ * Auth: the Tiled Bearer token is attached by a single app-level fetch/XHR interceptor installed
+ * in App.jsx (see ./tiledAuth) — one interceptor covers every viewer, so it survives the brief
+ * overlap of two live viewers during a tab switch.
+ *
+ * Resource management: this component captures the viewer instance and, on unmount, calls
+ * `getViewProxy().delete()` to free its WebGL context (interactor + renderer + openGLRenderWindow +
+ * renderWindow). The itk-vtk-viewer library never does this itself — its own container-empty only
+ * removes DOM nodes — so without this each mount would leak a GPU context.
  */
 
 import { useEffect, useRef } from 'react';
-import { installTiledFetchInterceptor } from './tiledAuth';
 
 const jsDelivrUrl = 'https://cdn.jsdelivr.net/gh/als-computing/itk-vtk-viewer@publish-dist/dist/itkVtkViewer.js';
+
+// The vtk.js ViewProxy handle returned by the viewer instance. `delete()` frees the WebGL context.
+type ItkVtkViewProxy = {
+  delete: () => void;
+  resize?: () => void;
+};
+
+// The viewer instance returned by createViewerFromUrl (a facade over the vtk view/store/machine).
+type ItkVtkViewerInstance = {
+  getViewProxy: () => ItkVtkViewProxy;
+};
 
 // The subset of the itk-vtk-viewer global API we use.
 type ItkVtkViewerApi = {
   createViewerFromUrl: (
     el: HTMLElement,
     options: { files: string[]; rotate?: boolean; use2D?: boolean },
-  ) => Promise<unknown>;
+  ) => Promise<ItkVtkViewerInstance>;
 };
 
 declare global {
@@ -75,10 +91,17 @@ export default function ItkVktNative({ dataUrl }: ItkVktProps) {
 
     const container = containerRef.current;
     let cancelled = false;
+    let instance: ItkVtkViewerInstance | null = null;
 
-    // Keep the token attached for the whole lifetime of this volume: zarr chunks load lazily as
-    // the user pans/zooms, not just during the initial load.
-    const removeInterceptor = installTiledFetchInterceptor(dataUrl);
+    const disposeInstance = () => {
+      if (!instance) return;
+      try {
+        instance.getViewProxy().delete(); // frees the WebGL/VTK render context
+      } catch (error) {
+        console.warn('ItkVktNative: viewer dispose failed:', error);
+      }
+      instance = null;
+    };
 
     // Render into a fresh inner element sized to fill the container (mirrors the sizing the
     // bundle's auto-scan applied for data-viewport='100%x100%'). It deliberately has no
@@ -91,11 +114,30 @@ export default function ItkVktNative({ dataUrl }: ItkVktProps) {
     viewer.style.height = '100%';
     container.appendChild(viewer);
 
+    // A viewer created while its tab was hidden (display:none → zero-sized) — or when the window
+    // resizes — needs an explicit resize when the container regains size, or the canvas renders
+    // black/stretched.
+    const resizeObserver = new ResizeObserver(() => {
+      if (instance && container.offsetWidth > 0 && container.offsetHeight > 0) {
+        try {
+          instance.getViewProxy().resize?.();
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+    resizeObserver.observe(container);
+
     loadItkVtkViewer()
       .then((api) => {
-        if (cancelled) return;
+        if (cancelled) return undefined;
         // createViewerFromUrl empties `viewer` and renders the new volume into it.
         return api.createViewerFromUrl(viewer, { files: [dataUrl], rotate: false });
+      })
+      .then((created) => {
+        instance = created ?? null;
+        // Unmounted while still loading — dispose immediately so we never leak the context.
+        if (cancelled) disposeInstance();
       })
       .catch((error) => {
         if (!cancelled) {
@@ -105,7 +147,8 @@ export default function ItkVktNative({ dataUrl }: ItkVktProps) {
 
     return () => {
       cancelled = true;
-      removeInterceptor();
+      resizeObserver.disconnect();
+      disposeInstance();
       container.innerHTML = '';
     };
   }, [dataUrl]);

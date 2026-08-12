@@ -1,0 +1,68 @@
+.tabbar {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  flex-shrink: 0;
+  padding: 4px 8px 0;
+  background: #f3f4f6;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+  overflow-x: auto;
+  font-family: 'Nunito Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+}
+
+.tabbar__tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 220px;
+  padding: 8px 8px 8px 14px;
+  cursor: pointer;
+  user-select: none;
+  color: #555;
+  font-size: 13px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+}
+
+.tabbar__tab:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.tabbar__tab--active {
+  background: #fff;
+  color: #111;
+  border-color: rgba(0, 0, 0, 0.12);
+  /* Sit on top of the strip's bottom border so the tab reads as connected to the content. */
+  margin-bottom: -1px;
+  padding-bottom: 9px;
+}
+
+/* Drop indicator while dragging another tab over this one. */
+.tabbar__tab--drop {
+  box-shadow: inset 2px 0 0 #1ea7fd;
+}
+
+.tabbar__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
+
+.tabbar__close {
+  border: 0;
+  background: transparent;
+  color: #999;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 3px;
+  border-radius: 3px;
+}
+
+.tabbar__close:hover {
+  background: rgba(0, 0, 0, 0.12);
+  color: #333;
+}

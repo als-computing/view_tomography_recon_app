@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import './header.css';
 import { Tiled, TiledItemLinks } from '@blueskyproject/tiled';
 import '@blueskyproject/tiled/style.css';
@@ -12,40 +13,30 @@ import {
 export interface HeaderProps {
   logoUrl: string;
   title: string;
-  fileName: string;
   /**
    * Callback that receives the selected file URL.
    */
   onSelect?: (file_url: string) => void;
 }
 
-type FolderStatus = 'loading' | 'ready' | 'error';
-
-export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
-  const [folders, setFolders] = useState<string[]>([]);
+export const Header = ({ logoUrl, title, onSelect }: HeaderProps) => {
   const [selectedFolder, setSelectedFolder] = useState<string>('');
-  const [status, setStatus] = useState<FolderStatus>('loading');
 
-  // Load the subfolders under the processed path once, to populate the folder dropdown.
+  // Server state: the subfolders under the processed path that populate the folder dropdown.
+  // TanStack Query handles caching, retries, and refetch-on-focus (so it recovers once the user
+  // logs in on an auth-required server).
+  const { data: folders = [], isLoading, isError } = useQuery({
+    queryKey: ['tiled-children', TILED_PROCESSED_PATH],
+    queryFn: ({ signal }) => fetchTiledContainerChildren(TILED_PROCESSED_PATH, signal),
+  });
+  const status: 'loading' | 'ready' | 'error' = isLoading ? 'loading' : isError ? 'error' : 'ready';
+
+  // Default the selection once folders load (preserve the app's previous default of 'dabramov').
   useEffect(() => {
-    const controller = new AbortController();
-    setStatus('loading');
-    fetchTiledContainerChildren(TILED_PROCESSED_PATH, controller.signal)
-      .then((names) => {
-        setFolders(names);
-        // Preserve the app's previous default of opening into 'dabramov' when it exists.
-        setSelectedFolder(names.includes('dabramov') ? 'dabramov' : names[0] ?? '');
-        setStatus('ready');
-      })
-      .catch((error) => {
-        if (error?.name === 'AbortError') {
-          return;
-        }
-        console.error('Header: failed to load Tiled folders:', error);
-        setStatus('error');
-      });
-    return () => controller.abort();
-  }, []);
+    if (!selectedFolder && folders.length > 0) {
+      setSelectedFolder(folders.includes('dabramov') ? 'dabramov' : folders[0]);
+    }
+  }, [folders, selectedFolder]);
 
   // Full catalog path passed to the Tiled browser as its starting location. When no folder is
   // selected yet (e.g. the folder list hasn't loaded, or failed because the user isn't logged in
@@ -75,7 +66,6 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
         <div>
           <img src={logoUrl} className="header-logo" alt="Logo" />
           <h1>{title}</h1>
-          <div className="header-file-name">{fileName}</div>
         </div>
         <div className="header-tiled-controls">
           <label className="header-folder-picker">

@@ -4,3 +4,21 @@
   height: 100vh;
   margin: 0;
 }
+
+/* Viewer area under the tab strip. Live tabs are absolutely-positioned panes stacked here; only
+   the active one is displayed. */
+.viewer-stack {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.viewer-pane {
+  position: absolute;
+  inset: 0;
+}
+
+.viewer-empty {
+  text-align: center;
+  margin-top: 3rem;
+}
