@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   // This should match how your Vite server is running
-  base: '/react/',
+  base: '/tomo_viewer/',
   server: {
     host: '0.0.0.0',
     port: 5174,

@@ -100,7 +100,7 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
           </label>
           <Tiled
             key={tiledInitialPath}
-            oidcRedirectUrl="http://tiled-test:5174/react/"
+            oidcRedirectUrl="http://tiled-test:5174/tomo_viewer/"
             isButtonMode={true}
             onSelectCallback={handleTiledWidgetSelect}
             tiledBaseUrl={getTiledBaseUrl()}
