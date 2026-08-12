@@ -13,12 +13,101 @@
   position: relative;
 }
 
+/* A single live viewer. Left/right + width are set inline (single pane fills the stack; in split
+   view the active pane takes the left half and the split pane the right half). */
 .viewer-pane {
   position: absolute;
-  inset: 0;
+  top: 0;
+  bottom: 0;
 }
 
 .viewer-empty {
   text-align: center;
   margin-top: 3rem;
+}
+
+/* Vertical seam between the two split panes. */
+.viewer-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-1px);
+  background: rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Floating camera/colormap link toggles shown while in split view. */
+.viewer-link-controls {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  font-family: 'Nunito Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  color: #222;
+}
+
+.viewer-link-controls__label {
+  font-weight: 600;
+  color: #444;
+}
+
+.viewer-link-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.viewer-link-controls button {
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  background: #fff;
+  color: #333;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.viewer-link-controls button:hover {
+  background: #f1f1f1;
+}
+
+/* Drop target (right half) revealed while dragging a tab, to open/replace the split pane. */
+.viewer-drop-overlay {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 50%;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(30, 167, 253, 0.12);
+  border: 2px dashed #1ea7fd;
+  box-sizing: border-box;
+}
+
+.viewer-drop-hint {
+  padding: 8px 14px;
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: 8px;
+  font-family: 'Nunito Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  color: #0b5f91;
+  pointer-events: none;
 }

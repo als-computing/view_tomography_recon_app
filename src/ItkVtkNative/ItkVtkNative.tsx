@@ -25,16 +25,73 @@ import { useEffect, useRef } from 'react';
 
 const jsDelivrUrl = 'https://cdn.jsdelivr.net/gh/als-computing/itk-vtk-viewer@publish-dist/dist/itkVtkViewer.js';
 
-// The vtk.js ViewProxy handle returned by the viewer instance. `delete()` frees the WebGL context.
-type ItkVtkViewProxy = {
+/** vtk.js camera on the view proxy — enough of its surface to copy pose between linked views. */
+export interface ItkVtkCamera {
+  getPosition: () => number[];
+  getFocalPoint: () => number[];
+  getViewUp: () => number[];
+  getParallelScale: () => number;
+  getViewAngle?: () => number;
+  set: (state: Record<string, unknown>) => void;
+  onModified: (cb: () => void) => { unsubscribe: () => void };
+}
+
+/** The vtk.js ViewProxy handle. `delete()` frees the WebGL context. */
+export interface ItkVtkViewProxy {
   delete: () => void;
   resize?: () => void;
-};
+  getCamera: () => ItkVtkCamera;
+  getRenderer: () => { updateLightsGeometryToFollowCamera: () => void };
+  renderLater: () => void;
+}
 
-// The viewer instance returned by createViewerFromUrl (a facade over the vtk view/store/machine).
-type ItkVtkViewerInstance = {
+/**
+ * The viewer instance returned by createViewerFromUrl (a facade over the vtk view/store/machine).
+ *
+ * Getters/setters for the volume mirror itk-vtk-viewer's `publicAPI`: each accepts an optional
+ * `component` / `name` that default to component 0 of the currently-selected image, so calling them
+ * with no args is correct for our one-volume-per-viewer usage. Changes are announced through the
+ * event emitter (`on`/`off`); we mirror them across split panes in useLinkedViewers.
+ */
+export interface ItkVtkViewerInstance {
   getViewProxy: () => ItkVtkViewProxy;
-};
+  on: (eventName: string, cb: (...args: unknown[]) => void) => void;
+  off: (eventName: string, cb: (...args: unknown[]) => void) => void;
+
+  // Color mapping.
+  getImageColorMap: () => unknown;
+  setImageColorMap: (colorMap: unknown) => void;
+  getImageColorRange: () => number[];
+  setImageColorRange: (range: number[]) => void;
+  getImageColorRangeBounds: () => number[];
+  setImageColorRangeBounds: (range: number[]) => void;
+
+  // Transfer function (opacity) — the reference UI edits either "points" or "gaussians".
+  getImagePiecewiseFunctionPoints: () => unknown;
+  setImagePiecewiseFunctionPoints: (points: unknown) => void;
+  getImagePiecewiseFunctionGaussians: () => unknown;
+  setImagePiecewiseFunctionGaussians: (gaussians: unknown) => void;
+
+  // Volume density / rendering controls.
+  getImageGradientOpacity: () => unknown;
+  setImageGradientOpacity: (opacity: unknown) => void;
+  getImageGradientOpacityScale: () => unknown;
+  setImageGradientOpacityScale: (scale: unknown) => void;
+  getImageVolumeSampleDistance: () => unknown;
+  setImageVolumeSampleDistance: (distance: unknown) => void;
+  getImageBlendMode: () => unknown;
+  setImageBlendMode: (mode: unknown) => void;
+  getImageShadowEnabled: () => boolean;
+  setImageShadowEnabled: (enabled: boolean) => void;
+  getImageInterpolationEnabled: () => boolean;
+  setImageInterpolationEnabled: (enabled: boolean) => void;
+
+  // Cropping (ROI) planes.
+  getCroppingPlanes: () => unknown;
+  setCroppingPlanes: (planes: unknown) => void;
+  getCroppingPlanesEnabled: () => boolean;
+  setCroppingPlanesEnabled: (enabled: boolean) => void;
+}
 
 // The subset of the itk-vtk-viewer global API we use.
 type ItkVtkViewerApi = {
@@ -81,10 +138,18 @@ const loadItkVtkViewer = (): Promise<ItkVtkViewerApi> => {
 
 type ItkVktProps = {
   dataUrl?: string;
+  /**
+   * Fires with the viewer instance once it has loaded, and with `null` when it is disposed
+   * (grace-window expiry / unmount). Used by the split view to wire up linked camera + colormap.
+   */
+  onReady?: (instance: ItkVtkViewerInstance | null) => void;
 };
 
-export default function ItkVktNative({ dataUrl }: ItkVktProps) {
+export default function ItkVktNative({ dataUrl, onReady }: ItkVktProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // Hold the latest onReady in a ref so changing the callback identity doesn't re-run the loader.
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
 
   useEffect(() => {
     if (!containerRef.current || !dataUrl) return;
@@ -101,6 +166,7 @@ export default function ItkVktNative({ dataUrl }: ItkVktProps) {
         console.warn('ItkVktNative: viewer dispose failed:', error);
       }
       instance = null;
+      onReadyRef.current?.(null);
     };
 
     // Render into a fresh inner element sized to fill the container (mirrors the sizing the
@@ -137,7 +203,11 @@ export default function ItkVktNative({ dataUrl }: ItkVktProps) {
       .then((created) => {
         instance = created ?? null;
         // Unmounted while still loading — dispose immediately so we never leak the context.
-        if (cancelled) disposeInstance();
+        if (cancelled) {
+          disposeInstance();
+          return;
+        }
+        if (instance) onReadyRef.current?.(instance);
       })
       .catch((error) => {
         if (!cancelled) {
