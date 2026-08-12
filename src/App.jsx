@@ -15,9 +15,10 @@ import { Header } from './Header';
 import './App.css';
 
 
-import { getDefaultZarrFileUrl } from './utils';
+import { getDefaultZarrFileUrl, TILED_PROCESSED_PATH } from './utils';
 import { installTiledTokenBridge } from './tiledTokenBridge';
 import ItkVktNative from './ItkVtkNative/ItkVtkNative';
+import { TiledNotifications } from './TiledNotifications';
 // import ItkVtkFrame from './ItkVtkFrame/ItkVtkFrame';
 
 const defaultZarrFileUrl = getDefaultZarrFileUrl() || '';
@@ -39,6 +40,8 @@ function App() {
       />
       <ItkVktNative dataUrl={fileUrl} />
       {/* <ItkVtkFrame dataUrl={fileUrl} /> */}
+      {/* Live "new reconstruction ready" toasts (+ OS notification) for the signed-in user's ESAFs. */}
+      <TiledNotifications parentPath={TILED_PROCESSED_PATH} onView={setFileUrl} />
     </div>
   );
 }
