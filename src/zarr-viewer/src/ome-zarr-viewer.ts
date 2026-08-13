@@ -312,6 +312,7 @@ export async function run(
   const sim = units.UNIT_PRESETS.microscopy;
   const sizeSim = new Vec3();
   let volumeTex: Awaited<ReturnType<typeof uploadVolume>> | undefined;
+  let histogram: Float32Array | undefined;
   let curveEditor: OpacityCurveEditor | undefined;
 
   ensureHudStyles();
@@ -382,6 +383,7 @@ export async function run(
     volumeRenderer.setTransferFunction(tf, 512);
     curveEditor?.setColorMap(colorMap);
     curveEditor?.setPoints(opacityPoints);
+    curveEditor?.setColorRange([colorLo, colorHi]);
   };
 
   const applyRender = (): void => {
@@ -476,9 +478,11 @@ export async function run(
     renderUi();
     try {
       level = next;
-      volumeTex?.dispose();
+      volumeTex?.texture.dispose();
       volumeTex = await uploadVolume(ctx.device, source, { level });
-      volumeRenderer.setVolume(volumeTex);
+      volumeRenderer.setVolume(volumeTex.texture);
+      histogram = volumeTex.histogram;
+      curveEditor?.setHistogram(histogram);
       physicalSizeSim(sizeSim, source, sim, level);
       volumeRenderer.setBoxHalfSize(sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5);
       const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z);
@@ -644,11 +648,16 @@ export async function run(
       .join("");
     const tfBody = [
       `<label class="whud__row" style="font-size:11px">Colormap <select id="cmap" class="whud__select">${maps}</select></label>`,
-      slider("colorLo", "Color low", colorLo, 0, 1, 0.01),
-      slider("colorHi", "Color high", colorHi, 0, 1, 0.01),
       slider("opacityScale", "Opacity ×", opacityScale, 0.05, 2, 0.01),
-      `<div class="whud__hint">Opacity curve (drag · dbl-click add)</div>`,
-      `<canvas id="opacity-curve" style="width:100%;height:72px;display:block;touch-action:none;cursor:crosshair"></canvas>`,
+      `<div class="whud__hint">Opacity curve (drag · dbl-click add) · volume histogram behind</div>`,
+      `<canvas id="opacity-curve" style="width:100%;height:84px;display:block;touch-action:none;cursor:crosshair"></canvas>`,
+      // Dual-thumb color-range slider under the graph — both heads set [colorLo, colorHi] together.
+      `<div class="whud__range">` +
+        `<div class="whud__range-track"><div class="whud__range-fill" data-range-fill style="left:${colorLo * 100}%;width:${(colorHi - colorLo) * 100}%"></div></div>` +
+        `<input class="whud__range-input" type="range" min="0" max="1" step="0.005" value="${colorLo}" data-range="colorLo" aria-label="Color low"/>` +
+        `<input class="whud__range-input" type="range" min="0" max="1" step="0.005" value="${colorHi}" data-range="colorHi" aria-label="Color high"/>` +
+      `</div>`,
+      `<div class="whud__range-labels"><span>Color range</span><span data-range-vals>${fmt(colorLo)} – ${fmt(colorHi)}</span></div>`,
     ].join("");
 
     // Render section
@@ -779,6 +788,7 @@ export async function run(
             emitRendering();
           },
         });
+        if (histogram) curveEditor.setHistogram(histogram);
       }
     }
 
@@ -848,8 +858,6 @@ export async function run(
   });
 
   const RENDERING_SLIDERS = new Set([
-    "colorLo",
-    "colorHi",
     "opacityScale",
     "sampleDist",
     "density",
@@ -889,20 +897,40 @@ export async function run(
       emitCropping();
       return;
     }
+    if (t.dataset.range) {
+      // Dual-thumb color range: two overlaid range inputs. Keep lo <= hi (a thumb dragged past the
+      // other pushes it), reflect the filled band + label, and recolor the graph live.
+      const loEl = ui.querySelector<HTMLInputElement>('[data-range="colorLo"]');
+      const hiEl = ui.querySelector<HTMLInputElement>('[data-range="colorHi"]');
+      if (!loEl || !hiEl) return;
+      let lo = Number(loEl.value);
+      let hi = Number(hiEl.value);
+      if (lo > hi) {
+        if (t.dataset.range === "colorLo") hi = lo;
+        else lo = hi;
+        loEl.value = String(lo);
+        hiEl.value = String(hi);
+      }
+      colorLo = lo;
+      colorHi = hi;
+      const fill = ui.querySelector<HTMLElement>("[data-range-fill]");
+      if (fill) {
+        fill.style.left = `${lo * 100}%`;
+        fill.style.width = `${(hi - lo) * 100}%`;
+      }
+      const vals = ui.querySelector("[data-range-vals]");
+      if (vals) vals.textContent = `${fmt(lo)} – ${fmt(hi)}`;
+      applyTf();
+      curveEditor?.setColorRange([colorLo, colorHi]);
+      emitRendering();
+      return;
+    }
     if (!t.dataset.slider) return;
     const id = t.dataset.slider;
     const v = Number(t.value);
     const lab = ui.querySelector(`[data-val="${id}"]`);
     if (lab) lab.textContent = fmt(v);
     switch (id) {
-      case "colorLo":
-        colorLo = v;
-        applyTf();
-        break;
-      case "colorHi":
-        colorHi = v;
-        applyTf();
-        break;
       case "opacityScale":
         opacityScale = v;
         applyTf();
@@ -1145,20 +1173,30 @@ export async function run(
       }
     }
     const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
-    // Near/far are derived from the eye's distance to the VOLUME CENTER (the box is centered at the
-    // world origin) plus the volume's bounding-sphere radius — NOT from the orbit distance-to-target.
-    // The orbit target drifts under zoom-to-cursor, so a distance-to-target frustum let the volume
-    // fall outside the near/far range (and pushed the inv(viewProj) ray reconstruction into an
-    // ill-conditioned float32 regime) when zoomed out, which blanked the DVR. Bracketing the frustum
-    // tightly around the actual volume keeps the whole box inside it across the entire zoom range and
-    // keeps the near/far ratio bounded so ray reconstruction stays stable.
+    // Near/far bracket the volume CENTER's depth ALONG THE VIEW AXIS (the box is centered at the world
+    // origin), plus the bounding-sphere radius. We project the center onto the actual view direction
+    // rather than use the straight-line eye→origin distance: under zoom-to-cursor the orbit target
+    // drifts off the origin, so the camera's forward stops pointing at the box center. Using the
+    // straight-line distance then overestimates the center's depth, pushing the near plane in front of
+    // the box and clipping its front — which read as the volume "inverting" when zoomed far out.
+    // Projecting onto the view axis brackets the box correctly at any zoom/drift and keeps the near/far
+    // ratio bounded so the inv(viewProj) DVR ray reconstruction stays float32-stable.
     const boundR = 0.5 * Math.hypot(sizeSim.x, sizeSim.y, sizeSim.z) || extent * 0.5;
-    const eyeToCenter = Math.hypot(camera.position.x, camera.position.y, camera.position.z);
+    const wm = camera.worldMatrix().elements;
+    // Camera looks down its local -Z; world forward = -(worldZ axis) = -(column 2).
+    let fx = -wm[8]!;
+    let fy = -wm[9]!;
+    let fz = -wm[10]!;
+    const flen = Math.hypot(fx, fy, fz) || 1;
+    fx /= flen;
+    fy /= flen;
+    fz /= flen;
+    const centerDepth = -(camera.position.x * fx + camera.position.y * fy + camera.position.z * fz);
     const margin = boundR * 1.5 + extent * 0.05;
-    const far = eyeToCenter + margin;
-    // Clamp near above a small fraction of far so the ratio stays float32-friendly even when the eye
-    // is inside (or very close to) the volume; never let it collapse to ~0.
-    const near = Math.max(eyeToCenter - margin, far * 0.002);
+    const far = Math.max(centerDepth + margin, margin * 2);
+    // Clamp near above a small fraction of far so the ratio stays float32-friendly even when the eye is
+    // inside (or very close to) the volume; never let it collapse to ~0.
+    const near = Math.max(centerDepth - margin, far * 0.002);
     proj.perspective(
       (42 * Math.PI) / 180,
       canvas.width / Math.max(1, canvas.height),
@@ -1172,7 +1210,7 @@ export async function run(
   });
 
   session.onDispose(() => {
-    volumeTex?.dispose();
+    volumeTex?.texture.dispose();
     volumeRenderer.dispose();
   });
 

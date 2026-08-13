@@ -16,6 +16,16 @@ export interface UploadVolumeOptions {
   level?: number;
 }
 
+/** Number of bins in the intensity histogram returned by {@link uploadVolume}. */
+export const HISTOGRAM_BINS = 256;
+
+/** Result of {@link uploadVolume}: the GPU texture plus a normalized intensity histogram. */
+export interface UploadVolumeResult {
+  texture: ManagedTexture;
+  /** `HISTOGRAM_BINS` counts over the normalized `[0,1]` density range (for the TF editor). */
+  histogram: Float32Array;
+}
+
 /**
  * Stream a {@link VolumeSource} into a 3D `r8unorm` texture.
  *
@@ -28,7 +38,7 @@ export async function uploadVolume(
   device: GPUDevice,
   source: VolumeSource,
   options: UploadVolumeOptions = {},
-): Promise<ManagedTexture> {
+): Promise<UploadVolumeResult> {
   const level = options.level ?? 0;
   const [dx, dy, dz] = source.dimensionsAt(level);
   const width = dx;
@@ -66,6 +76,18 @@ export async function uploadVolume(
     }
   }
 
+  // Intensity histogram over the normalized [0,1] densities (for the TF editor). Subsampled so huge
+  // volumes stay fast — this runs once per level load, off the render loop.
+  const histogram = new Float32Array(HISTOGRAM_BINS);
+  const totalVoxels = dens.length;
+  const stride = Math.max(1, Math.floor(totalVoxels / 2_000_000));
+  for (let i = 0; i < totalVoxels; i += stride) {
+    let b = (dens[i]! * HISTOGRAM_BINS) | 0;
+    if (b < 0) b = 0;
+    else if (b >= HISTOGRAM_BINS) b = HISTOGRAM_BINS - 1;
+    histogram[b]++;
+  }
+
   // WebGPU requires bytesPerRow to be a multiple of 256 for writeTexture.
   const bytesPerRow = Math.ceil(width / 256) * 256;
   const packed = new Uint8Array(bytesPerRow * height * depth);
@@ -93,7 +115,7 @@ export async function uploadVolume(
     { width, height, depthOrArrayLayers: depth },
   );
 
-  return texture;
+  return { texture, histogram };
 }
 
 function clamp01(v: number): number {

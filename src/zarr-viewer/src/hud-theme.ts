@@ -232,6 +232,34 @@ const HUD_CSS = `
 .whud label { color: var(--whud-text); }
 .whud b { color: var(--whud-text); }
 .whud canvas { border: 1px solid var(--whud-border); border-radius: var(--radius); }
+
+/* Dual-thumb color-range slider (two overlaid range inputs; only the thumbs are grabbable). Sits
+   directly under the opacity-curve canvas so its handles line up with the graph's intensity axis. */
+.whud__range { position: relative; height: 26px; margin: 8px 0 2px; }
+.whud__range-track {
+  position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+  height: 4px; border-radius: 999px; background: var(--whud-border); pointer-events: none;
+}
+.whud__range-fill { position: absolute; top: 0; bottom: 0; background: var(--whud-active); border-radius: 999px; }
+.whud__range-input {
+  position: absolute; left: 0; right: 0; top: 0; width: 100%; height: 100%; margin: 0;
+  background: transparent; pointer-events: none; -webkit-appearance: none; appearance: none;
+}
+.whud__range-input::-webkit-slider-runnable-track { background: transparent; height: 100%; }
+.whud__range-input::-moz-range-track { background: transparent; height: 100%; }
+.whud__range-input::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; pointer-events: auto;
+  width: 14px; height: 14px; border-radius: 50%; background: #fff;
+  border: 2px solid var(--whud-active-border); cursor: pointer;
+}
+.whud__range-input::-moz-range-thumb {
+  pointer-events: auto; width: 14px; height: 14px; border-radius: 50%; background: #fff;
+  border: 2px solid var(--whud-active-border); cursor: pointer;
+}
+.whud__range-labels {
+  display: flex; justify-content: space-between;
+  font-size: 10px; color: var(--whud-muted); font-variant-numeric: tabular-nums;
+}
 `;
 
 /** Inject the HUD stylesheet once per document (idempotent). */

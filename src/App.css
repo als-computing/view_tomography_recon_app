@@ -39,12 +39,12 @@
   z-index: 2;
 }
 
-/* Compact "linked" chip centered on the divider while in split view: what's synced + exit. */
+/* Compact "linked" chip while in split view: what's synced + exit. Anchored top-left over the left
+   pane's canvas so it clears both panes' right-docked HUD sidebars (which the WebGPU renderer adds). */
 .viewer-link-controls {
   position: absolute;
   top: 8px;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 12px;
   z-index: 5;
   display: flex;
   align-items: center;

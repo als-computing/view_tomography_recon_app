@@ -23,6 +23,8 @@ export class OpacityCurveEditor {
   public points: OpacityPoint[];
   public colorMap: ColorMapName;
   public colorRange: readonly [number, number];
+  /** Normalized-intensity histogram of the volume (counts per bin over [0,1]); drawn behind the curve. */
+  private histogram?: Float32Array;
   private dragIndex = -1;
   private readonly onChange?: (points: readonly OpacityPoint[]) => void;
   private readonly cleanups: Array<() => void> = [];
@@ -47,6 +49,18 @@ export class OpacityCurveEditor {
 
   public setColorMap(name: ColorMapName): void {
     this.colorMap = name;
+    this.redraw();
+  }
+
+  /** Update the color low/high range; recolors the colormap strip + histogram live (drag the slider). */
+  public setColorRange(range: readonly [number, number]): void {
+    this.colorRange = range;
+    this.redraw();
+  }
+
+  /** Set the volume intensity histogram (counts per bin over normalized [0,1]) drawn behind the curve. */
+  public setHistogram(bins: Float32Array): void {
+    this.histogram = bins;
     this.redraw();
   }
 
@@ -81,6 +95,36 @@ export class OpacityCurveEditor {
     }
     ctx.fillStyle = "rgba(0,0,0,0.45)";
     ctx.fillRect(0, 0, w, h);
+
+    const [cLo, cHi] = this.colorRange;
+
+    // Volume histogram: bars tinted by the colormap at each bin's *remapped* position, so the
+    // distribution recolors live as the color range changes. sqrt scale so peaky tomography
+    // histograms still show structure. Drawn over the darkened strip, behind the opacity curve.
+    if (this.histogram && this.histogram.length > 0) {
+      const bins = this.histogram;
+      const n = bins.length;
+      let maxCount = 0;
+      for (let i = 0; i < n; i++) if (bins[i]! > maxCount) maxCount = bins[i]!;
+      if (maxCount > 0) {
+        const bw = w / n;
+        for (let i = 0; i < n; i++) {
+          const t = i / Math.max(1, n - 1);
+          const bh = Math.sqrt(bins[i]! / maxCount) * h;
+          const ct = Math.min(1, Math.max(0, (t - cLo) / Math.max(1e-6, cHi - cLo)));
+          const [r, g, b] = sampleColorMap(this.colorMap, ct);
+          ctx.fillStyle = `rgba(${Math.round(r * 255)},${Math.round(g * 255)},${Math.round(b * 255)},0.6)`;
+          ctx.fillRect(i * bw, h - bh, Math.ceil(bw), bh);
+        }
+      }
+    }
+
+    // Color-range guides: thin verticals marking low/high so the graph aligns with the range slider.
+    for (const cx of [cLo, cHi]) {
+      const x = cx * w;
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.fillRect(Math.round(x) - 0.5 * dpr, 0, Math.max(1, dpr), h);
+    }
 
     // Opacity area fill
     ctx.beginPath();
