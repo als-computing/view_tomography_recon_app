@@ -25,6 +25,19 @@ export interface Controller {
 export type OrbitMode = "trackball" | "turntable";
 
 /**
+ * Full, trackball-accurate snapshot of an {@link OrbitControls} pose. Unlike the derived
+ * azimuth/elevation readouts, this captures the raw orbit offset and tumbling gaze-up so a pose can
+ * be copied between controllers (e.g. linked split panes) without losing roll. All vectors are plain
+ * `[x, y, z]` triples so the state is JSON-safe.
+ */
+export interface OrbitState {
+  target: [number, number, number];
+  offset: [number, number, number];
+  gazeUp: [number, number, number];
+  distance: number;
+}
+
+/**
  * Orbit controls: rotate/zoom/pan around a target point. Ideal for inspecting datasets.
  *
  * Default {@link OrbitControls.mode} is `"trackball"` (screen-space tumble of the camera offset),
@@ -296,6 +309,37 @@ export class OrbitControls implements Controller {
       this._desiredGazeUp.set(0, 1, 0);
     }
     this._hasZoomPivot = false;
+  }
+
+  /**
+   * Snapshot the full trackball pose (target + raw offset + tumbling gaze-up + distance). Suitable
+   * for copying the exact view between controllers; see {@link setState}.
+   */
+  public getState(): OrbitState {
+    return {
+      target: [this.target.x, this.target.y, this.target.z],
+      offset: [this._offset.x, this._offset.y, this._offset.z],
+      gazeUp: [this._gazeUp.x, this._gazeUp.y, this._gazeUp.z],
+      distance: this.distance,
+    };
+  }
+
+  /**
+   * Apply a pose captured by {@link getState}. Snaps both the current and desired pose (no damping
+   * catch-up) and writes it straight onto the node, so linked panes stay in lock-step. Clears any
+   * pending zoom-to-cursor pivot.
+   */
+  public setState(state: OrbitState): void {
+    this.target.set(state.target[0], state.target[1], state.target[2]);
+    this._offset.set(state.offset[0], state.offset[1], state.offset[2]);
+    this._desiredOffset.copy(this._offset);
+    this._gazeUp.set(state.gazeUp[0], state.gazeUp[1], state.gazeUp[2]);
+    this._desiredGazeUp.copy(this._gazeUp);
+    this.distance = this._desiredDistance = state.distance;
+    this._hasZoomPivot = false;
+    this.syncSphericalFromOffset(this._offset);
+    this._eye.copy(this.target).add(this._offset);
+    this.applyEyeLookAt(this._eye, this.target, this._gazeUp);
   }
 
   /** True while a pointer drag (orbit/pan) is active. */
@@ -625,15 +669,22 @@ export class OrbitControls implements Controller {
       Number.isFinite(clientX) &&
       Number.isFinite(clientY)
     ) {
-      this.cursorPointOnTargetPlane(clientX, clientY, this._zoomPivot);
-      this._hasZoomPivot = true;
+      const pivot = this.cursorPointOnTargetPlane(clientX, clientY, this._zoomPivot);
+      // Bail out of zoom-to-cursor when the rect was zero-size (hidden/transitioning pane):
+      // cursorPointOnTargetPlane() returns null and we leave the pivot disabled for this event.
+      this._hasZoomPivot = pivot !== null;
     } else {
       this._hasZoomPivot = false;
     }
   }
 
-  /** World point under the cursor on the plane through {@link target} facing the camera. */
-  private cursorPointOnTargetPlane(clientX: number, clientY: number, out: Vec3): Vec3 {
+  /**
+   * World point under the cursor on the plane through {@link target} facing the camera.
+   * Returns `null` (and does not write `out`) when the element's live rect is zero-size, so the
+   * caller can skip enabling the zoom pivot for that event.
+   */
+  private cursorPointOnTargetPlane(clientX: number, clientY: number, out: Vec3): Vec3 | null {
+    // Measure fresh at event time — never cache, so an offset/resized pane maps correctly.
     const rect =
       typeof this.element.getBoundingClientRect === "function"
         ? this.element.getBoundingClientRect()
@@ -646,7 +697,16 @@ export class OrbitControls implements Controller {
     const w = Math.max(1, rect.width);
     const h = Math.max(1, rect.height);
     const ndcX = ((clientX - rect.left) / w) * 2 - 1;
-    const ndcY = -(((clientY - rect.top) / h) * 2 - 1);
+    // Y is intentionally NOT the standard screen->NDC sign here. The volume ray-march shader
+    // reconstructs its rays from a vertically-flipped NDC (`ndc.y = (1.0 - uv.y) * 2 - 1` in
+    // volume-raymarch.ts), so on the displayed image camera +up appears at the BOTTOM. This
+    // target-plane pivot is built from the camera `up` basis directly, so its Y must match that
+    // flipped display convention — otherwise zoom-to-cursor tracks the vertically-mirrored point
+    // (X was already correct; only Y was inverted). Keep this sign aligned with the shader.
+    const ndcY = ((clientY - rect.top) / h) * 2 - 1;
+
+    // Zero-size / hidden pane: coordinates are meaningless — skip zoom-to-cursor for this event.
+    if (rect.width === 0 || rect.height === 0) return null;
 
     // Use the on-screen pose (damped offset), not the desired pose.
     this.basisFromGaze(this._offset, this._gazeUp, this._right, this._panUp, this._forward);

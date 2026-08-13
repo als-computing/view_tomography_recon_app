@@ -42,10 +42,73 @@ import {
   type DemoHandle,
   resizeDemoCanvas,
 } from "./demo-session.js";
+import { ensureHudStyles } from "./hud-theme.js";
 
 const DEFAULT_ZARR = "/datasets/petiole.zarr";
 
 type PanelId = "data" | "tf" | "render" | "slices" | "crop" | "measure";
+
+/** Change events emitted by a {@link WebGpuViewerInstance}. */
+export type WebGpuViewerEvent = "cameraChange" | "renderingChange" | "croppingChange";
+
+/**
+ * Full, trackball-accurate camera pose (target + raw orbit offset + tumbling gaze-up + distance).
+ * Mirrors the OrbitControls state so a pose copies between linked panes without losing roll.
+ */
+export interface WebGpuCameraState {
+  target: [number, number, number];
+  offset: [number, number, number];
+  gazeUp: [number, number, number];
+  distance: number;
+}
+
+/** Everything that shapes the volume's appearance (transfer function + render params + view mode). */
+export interface WebGpuRenderingState {
+  colorMap: ColorMapName;
+  colorLo: number;
+  colorHi: number;
+  opacityScale: number;
+  opacityPoints: OpacityPoint[];
+  densityScale: number;
+  exposure: number;
+  sampleDist: number;
+  blendMode: VolumeBlendMode;
+  gradOpacity: number;
+  gradScale: number;
+  lighting: number;
+  viewMode: VolumeViewMode;
+}
+
+/** The ROI crop box plus the slice planes (positions, per-axis enables, overlay visibility). */
+export interface WebGpuCroppingState {
+  cropMin: [number, number, number];
+  cropMax: [number, number, number];
+  sliceX: number;
+  sliceY: number;
+  sliceZ: number;
+  enX: boolean;
+  enY: boolean;
+  enZ: boolean;
+  showPlanes: boolean;
+}
+
+/**
+ * Imperative handle over a running WebGPU OME-Zarr viewer. Mirrors the shape of ItkVtkViewerInstance
+ * so the split view can link two panes: get/set for camera, rendering and cropping, plus change
+ * events that fire when the *user* drives those groups (never when a value is applied via a setter,
+ * so a linked peer can apply a value without looping). `dispose()` tears the viewer down.
+ */
+export interface WebGpuViewerInstance {
+  getCamera: () => WebGpuCameraState;
+  setCamera: (state: WebGpuCameraState) => void;
+  getRendering: () => WebGpuRenderingState;
+  setRendering: (state: WebGpuRenderingState) => void;
+  getCropping: () => WebGpuCroppingState;
+  setCropping: (state: WebGpuCroppingState) => void;
+  on: (event: WebGpuViewerEvent, cb: () => void) => void;
+  off: (event: WebGpuViewerEvent, cb: () => void) => void;
+  dispose: () => void;
+}
 
 function mulMat4Vec4(
   m: Mat4,
@@ -78,8 +141,8 @@ async function pickZarrStore(): Promise<Store | undefined> {
 
 export async function run(
   canvas: HTMLCanvasElement,
-  options?: { zarrUrl?: string },
-): Promise<DemoHandle> {
+  options?: { zarrUrl?: string; hudMount?: HTMLElement },
+): Promise<WebGpuViewerInstance> {
   const session = createDemoSession(canvas);
   resizeDemoCanvas(canvas);
 
@@ -113,7 +176,7 @@ export async function run(
   let showPlanes = false;
   let cropMin: [number, number, number] = [0, 0, 0];
   let cropMax: [number, number, number] = [1, 1, 1];
-  let panel: PanelId = "tf";
+  const openSections = new Set<PanelId>(["tf", "render"]);
   let loading = false;
   let baseStep = 1 / 220;
   let pickMode = false;
@@ -122,6 +185,49 @@ export async function run(
   let pickStatus = "";
   const invViewProj = new Mat4();
   const lastViewProj = new Mat4();
+
+  // Snapshot the rendering / cropping groups from the live closure state. Defined up here so the
+  // early error-path instances (below) can expose them too.
+  const readRendering = (): WebGpuRenderingState => ({
+    colorMap,
+    colorLo,
+    colorHi,
+    opacityScale,
+    opacityPoints: opacityPoints.map((p) => [p[0], p[1]] as const),
+    densityScale,
+    exposure,
+    sampleDist,
+    blendMode,
+    gradOpacity,
+    gradScale,
+    lighting,
+    viewMode,
+  });
+  const readCropping = (): WebGpuCroppingState => ({
+    cropMin: [cropMin[0], cropMin[1], cropMin[2]],
+    cropMax: [cropMax[0], cropMax[1], cropMax[2]],
+    sliceX,
+    sliceY,
+    sliceZ,
+    enX,
+    enY,
+    enZ,
+    showPlanes,
+  });
+
+  // Minimal instance for the failure paths (bad store / no uploadable LOD) — real get/set exist only
+  // once the volume + controls are live. Keeps the return type uniform so callers always get a handle.
+  const errorInstance = (handle: DemoHandle): WebGpuViewerInstance => ({
+    getCamera: () => ({ target: [0, 0, 0], offset: [0, 0, 5], gazeUp: [0, 1, 0], distance: 5 }),
+    setCamera: () => {},
+    getRendering: readRendering,
+    setRendering: () => {},
+    getCropping: readCropping,
+    setCropping: () => {},
+    on: () => {},
+    off: () => {},
+    dispose: () => handle.dispose(),
+  });
 
   let store: Store = httpStore(options?.zarrUrl ?? zarrUrlFromQuery());
   let source: VolumeSource;
@@ -133,7 +239,7 @@ export async function run(
     hud.innerHTML = `<strong>26 · OME-Zarr</strong><div style="margin-top:8px">${
       err instanceof Error ? err.message : String(err)
     }</div><div>Press O to open a folder.</div>`;
-    return session.handle();
+    return errorInstance(session.handle());
   }
 
   const allowedLevels = (): number[] =>
@@ -144,7 +250,7 @@ export async function run(
     const hud = createDemoHud({ position: "bottom-left" });
     session.mountHud(hud);
     hud.textContent = `No uploadable LOD (GPU max 3D texture ${maxTex}).`;
-    return session.handle();
+    return errorInstance(session.handle());
   }
   let level = levels[levels.length - 1]!;
 
@@ -201,18 +307,64 @@ export async function run(
   };
   session.onDispose(() => controls.dispose());
 
+  const readCamera = (): WebGpuCameraState => controls.getState();
+
   const sim = units.UNIT_PRESETS.microscopy;
   const sizeSim = new Vec3();
   let volumeTex: Awaited<ReturnType<typeof uploadVolume>> | undefined;
   let curveEditor: OpacityCurveEditor | undefined;
 
-  const ui = createDemoHud({ position: "bottom-left", pointerEvents: true });
-  ui.style.maxWidth = "min(420px, 96%)";
-  ui.style.maxHeight = "min(78vh, 720px)";
-  ui.style.overflow = "auto";
-  ui.style.whiteSpace = "normal";
-  session.mountHud(ui);
+  ensureHudStyles();
+  const docked = options?.hudMount != null;
+  const ui = document.createElement("div");
+  ui.className = docked ? "whud whud--docked" : "whud whud--floating";
+  if (docked) {
+    options!.hudMount!.appendChild(ui);
+    session.onDispose(() => ui.remove());
+  } else {
+    session.mountHud(ui);
+  }
   session.onDispose(() => curveEditor?.dispose());
+
+  // --- Change-event fan-out (for linking two split panes) -----------------------------------------
+  // Listeners fire only from genuine user actions (HUD handlers + the camera poll in the render
+  // loop), never from the set* methods below — so a linked peer can apply a value without looping.
+  const viewerListeners: Record<WebGpuViewerEvent, Set<() => void>> = {
+    cameraChange: new Set(),
+    renderingChange: new Set(),
+    croppingChange: new Set(),
+  };
+  const emit = (event: WebGpuViewerEvent): void => {
+    for (const cb of viewerListeners[event]) {
+      try {
+        cb();
+      } catch (err) {
+        console.warn(`webgpu viewer ${event} listener failed:`, err);
+      }
+    }
+  };
+  const emitRendering = (): void => emit("renderingChange");
+  const emitCropping = (): void => emit("croppingChange");
+  // Baseline for the render-loop camera poll: last pose we announced (or applied from a peer), so the
+  // poll only emits on a real delta and never echoes a value pushed in via setCamera().
+  let lastCam: WebGpuCameraState | null = null;
+
+  // --- Whole-panel collapse ----------------------------------------------------------------------
+  // Collapses the entire docked sidebar to a thin strip (or the floating panel to just its header),
+  // leaving a chevron to re-expand. The canvas backing store re-fits to its widened CSS box on the
+  // next render-loop frame (resizeDemoCanvas runs every frame); we also nudge it immediately.
+  let collapsed = false;
+  const expandedWidth = docked ? options!.hudMount!.style.width || "320px" : "";
+  const applyCollapsed = (): void => {
+    ui.classList.toggle("whud--collapsed", collapsed);
+    if (docked) {
+      const host = options!.hudMount!;
+      host.style.width = collapsed ? "30px" : expandedWidth;
+      host.style.overflow = collapsed ? "hidden" : "auto";
+    }
+    // Reading clientWidth below forces a synchronous reflow, so the canvas picks up its new box now.
+    resizeDemoCanvas(canvas);
+  };
 
   const lengthUnit = (): units.Unit =>
     units.resolveLengthUnit(source.spacingUnitName) ?? units.micrometer;
@@ -331,7 +483,9 @@ export async function run(
       volumeRenderer.setBoxHalfSize(sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5);
       const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z);
       controls.minDistance = Math.max(extent * 0.02, 0.05);
-      controls.maxDistance = extent * 80;
+      // Cap zoom-out so the volume can't recede to a sub-pixel speck (and so eye-space magnitudes
+      // stay float32-stable). ~20× the largest extent still frames the whole volume comfortably.
+      controls.maxDistance = extent * 20;
       const [sx, sy, sz] = source.spacingAt(level);
       baseStep = Math.max(
         Math.max(
@@ -413,7 +567,7 @@ export async function run(
       applyRender();
       const u3 = um3();
       pickStatus = `Selected ${feature.voxelCount.toLocaleString()} voxels · ${feature.volume.to(u3).toExponential(3)} ${u3.symbol}`;
-      panel = "measure";
+      openSections.add("measure");
     } catch (err) {
       lastPick = undefined;
       pickStatus = err instanceof Error ? err.message : String(err);
@@ -423,10 +577,16 @@ export async function run(
     }
   };
 
-  const tabBtn = (id: PanelId, label: string): string =>
-    `<button type="button" data-panel="${id}" style="cursor:pointer;padding:3px 7px;${
-      panel === id ? "outline:1px solid #8cf;background:#243048;" : ""
-    }">${label}</button>`;
+  const section = (id: PanelId, title: string, body: string): string =>
+    `<details class="whud__section" data-section="${id}" ${openSections.has(id) ? "open" : ""}>` +
+    `<summary>${title}</summary>` +
+    `<div class="whud__section-body">${body}</div>` +
+    `</details>`;
+
+  const segBtn = (attr: string, val: string, label: string, active: boolean, disabled = false): string =>
+    `<button type="button" ${attr}="${val}" class="whud__seg-btn${active ? " whud__seg-btn--active" : ""}"${
+      disabled ? " disabled" : ""
+    }>${label}</button>`;
 
   const slider = (
     id: string,
@@ -436,10 +596,10 @@ export async function run(
     max: number,
     step: number,
   ): string =>
-    `<label style="display:grid;grid-template-columns:92px 1fr 44px;gap:5px;align-items:center;margin:3px 0;font-size:11px">` +
-    `<span style="opacity:0.8">${label}</span>` +
-    `<input data-slider="${id}" type="range" min="${min}" max="${max}" step="${step}" value="${value}" style="width:100%"/>` +
-    `<span data-val="${id}" style="text-align:right;font-variant-numeric:tabular-nums">${fmt(value)}</span></label>`;
+    `<label class="whud__slider">` +
+    `<span>${label}</span>` +
+    `<input data-slider="${id}" type="range" min="${min}" max="${max}" step="${step}" value="${value}"/>` +
+    `<span data-val="${id}" class="whud__value">${fmt(value)}</span></label>`;
 
   function fmt(v: number): string {
     return Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
@@ -457,137 +617,11 @@ export async function run(
     const lodBtns = levels
       .map((lv) => {
         const [lx, ly, lz] = source.dimensionsAt(lv);
-        return `<button type="button" data-level="${lv}" style="cursor:pointer;${
-          lv === level ? "outline:1px solid #8cf;background:#243048;" : ""
-        }" ${loading ? "disabled" : ""}>L${lv} ${lx}×${ly}×${lz}</button>`;
+        return segBtn("data-level", String(lv), `L${lv} ${lx}×${ly}×${lz}`, lv === level, loading);
       })
       .join("");
 
-    let body = "";
-    if (panel === "data") {
-      body = [
-        `<div style="font-size:11px;opacity:0.7;margin:4px 0">Resolution (GPU max ${maxTex}³)</div>`,
-        `<div style="display:flex;flex-wrap:wrap;gap:4px">${lodBtns}</div>`,
-        `<div style="opacity:0.75;margin-top:8px;font-size:11px">voxel ${vx.toFixed(3)} ${unit.symbol} · ${qx.to(unit).toFixed(0)}×${qy.to(unit).toFixed(0)}×${qz.to(unit).toFixed(0)} ${unit.symbol}</div>`,
-      ].join("");
-    } else if (panel === "tf") {
-      const maps = colorMapNames()
-        .map(
-          (m) =>
-            `<option value="${m}" ${m === colorMap ? "selected" : ""}>${m}</option>`,
-        )
-        .join("");
-      body = [
-        `<label style="font-size:11px;display:flex;gap:8px;align-items:center;margin:4px 0">Colormap <select id="cmap" style="flex:1">${maps}</select></label>`,
-        slider("colorLo", "Color low", colorLo, 0, 1, 0.01),
-        slider("colorHi", "Color high", colorHi, 0, 1, 0.01),
-        slider("opacityScale", "Opacity ×", opacityScale, 0.05, 2, 0.01),
-        `<div style="font-size:11px;opacity:0.7;margin:6px 0 2px">Opacity curve (drag · dbl-click add)</div>`,
-        `<canvas id="opacity-curve" style="width:100%;height:72px;display:block;border-radius:4px;touch-action:none;cursor:crosshair"></canvas>`,
-      ].join("");
-    } else if (panel === "render") {
-      const blends: VolumeBlendMode[] = ["composite", "mip", "minip", "average"];
-      const blendBtns = blends
-        .map(
-          (b) =>
-            `<button type="button" data-blend="${b}" style="cursor:pointer;${
-              blendMode === b ? "outline:1px solid #8cf;background:#243048;" : ""
-            }">${b}</button>`,
-        )
-        .join("");
-      body = [
-        `<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px">${blendBtns}</div>`,
-        slider("sampleDist", "Sample dist", sampleDist, 0.35, 3, 0.05),
-        slider("density", "Density", densityScale, 0.2, 4, 0.05),
-        slider("exposure", "Exposure", exposure, 0.2, 4, 0.05),
-        slider("gradOp", "Grad opacity", gradOpacity, 0, 1, 0.01),
-        slider("gradScale", "Grad scale", gradScale, 0.02, 0.5, 0.01),
-        slider("lighting", "Lighting", lighting, 0, 1, 0.01),
-      ].join("");
-    } else if (panel === "slices") {
-      const modes: [VolumeViewMode, string][] = [
-        ["volume", "3D"],
-        ["xPlane", "X (sagittal)"],
-        ["yPlane", "Y (coronal)"],
-        ["zPlane", "Z (axial)"],
-      ];
-      const modeBtns = modes
-        .map(
-          ([m, lab]) =>
-            `<button type="button" data-view="${m}" style="cursor:pointer;padding:4px 8px;${
-              viewMode === m ? "outline:1px solid #8cf;background:#243048;" : ""
-            }">${lab}</button>`,
-        )
-        .join("");
-      const active = activeSlice();
-      const [nx, ny, nz] = source.dimensionsAt(level);
-      let primary = "";
-      if (active) {
-        const n = active.axis === "x" ? nx : active.axis === "y" ? ny : nz;
-        const idx = Math.min(n - 1, Math.floor(active.value * n));
-        primary = [
-          `<div style="font-size:12px;margin:8px 0 4px;font-weight:600">Slice along ${active.axis.toUpperCase()}</div>`,
-          `<div style="font-size:11px;opacity:0.75;margin-bottom:4px">${sliceWorldLabel(active.axis, active.value)} · index ${idx}/${n - 1}</div>`,
-          slider("activeSlice", "Position", active.value, 0, 1, 1 / Math.max(n, 2)),
-          `<div style="font-size:10px;opacity:0.55;margin:6px 0">Scroll wheel = scrub slice · Ctrl+wheel = zoom · middle/Alt-drag = pan · F = reframe</div>`,
-        ].join("");
-      } else {
-        primary = `<div style="font-size:11px;opacity:0.7;margin:8px 0">Pick an axis view, then scrub with the slider or mouse wheel.</div>`;
-      }
-      body = [
-        `<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px">${modeBtns}</div>`,
-        primary,
-        `<details style="margin-top:8px;font-size:11px"><summary style="cursor:pointer;opacity:0.8">Overlays &amp; all axes</summary>`,
-        `<label style="display:block;margin:6px 0"><input type="checkbox" data-chk="showPlanes" ${showPlanes ? "checked" : ""}/> Show plane overlays in 3D</label>`,
-        `<label style="margin-right:8px"><input type="checkbox" data-chk="enX" ${enX ? "checked" : ""}/> X</label>`,
-        `<label style="margin-right:8px"><input type="checkbox" data-chk="enY" ${enY ? "checked" : ""}/> Y</label>`,
-        `<label><input type="checkbox" data-chk="enZ" ${enZ ? "checked" : ""}/> Z</label>`,
-        slider("sliceX", "X", sliceX, 0, 1, 0.005),
-        slider("sliceY", "Y", sliceY, 0, 1, 0.005),
-        slider("sliceZ", "Z", sliceZ, 0, 1, 0.005),
-        `<button type="button" data-act="frameSlice" style="cursor:pointer;margin-top:6px">Reframe to slice</button>`,
-        `</details>`,
-      ].join("");
-    } else if (panel === "crop") {
-      body = [
-        `<div style="font-size:11px;opacity:0.7;margin:4px 0">ROI crop (UVW 0–1)</div>`,
-        slider("cminX", "Min X", cropMin[0], 0, 1, 0.01),
-        slider("cminY", "Min Y", cropMin[1], 0, 1, 0.01),
-        slider("cminZ", "Min Z", cropMin[2], 0, 1, 0.01),
-        slider("cmaxX", "Max X", cropMax[0], 0, 1, 0.01),
-        slider("cmaxY", "Max Y", cropMax[1], 0, 1, 0.01),
-        slider("cmaxZ", "Max Z", cropMax[2], 0, 1, 0.01),
-        `<button type="button" data-act="resetCrop" style="cursor:pointer;margin-top:6px">Reset crop</button>`,
-      ].join("");
-    } else {
-      const u3 = um3();
-      const detail = lastPick
-        ? [
-            `<div style="margin-top:8px;font-size:11px;line-height:1.45">`,
-            `<div>Seed voxel <b>${lastPick.seedVoxel.join(", ")}</b> · density ${lastPick.seedDensity.toFixed(2)}</div>`,
-            `<div>Threshold ≥ <b>${lastPick.threshold.toFixed(2)}</b> · <b>${lastPick.voxelCount.toLocaleString()}</b> voxels</div>`,
-            `<div>Volume <b>${lastPick.volume.to(u3).toExponential(3)}</b> ${u3.symbol}</div>`,
-            `<div style="opacity:0.75">${lastPick.volume.to(units.milliliter).toExponential(3)} mL · mean ${lastPick.meanDensity.toFixed(2)}</div>`,
-            `</div>`,
-          ].join("")
-        : "";
-      body = [
-        `<div style="font-size:11px;opacity:0.8;margin:4px 0 8px">Click a structure to grow a connected component and measure its physical volume (current LOD).</div>`,
-        `<label style="font-size:11px;display:flex;gap:8px;align-items:center;margin:6px 0">`,
-        `<input type="checkbox" data-chk="pickMode" ${pickMode ? "checked" : ""}/> Pick mode (or Ctrl+click)`,
-        `</label>`,
-        `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">`,
-        `<button type="button" data-act="clearPick" style="cursor:pointer">Clear selection</button>`,
-        `</div>`,
-        pickStatus
-          ? `<div style="margin-top:8px;font-size:11px;opacity:0.85">${pickStatus}${measuring ? "" : ""}</div>`
-          : "",
-        detail,
-        `<div style="font-size:10px;opacity:0.5;margin-top:8px">Uses ray pick through the volume + 6-connected flood fill. Crop snaps to the feature. Prefer L2+ for speed on huge volumes.</div>`,
-      ].join("");
-    }
-
-    const blocked = [];
+    const blocked: string[] = [];
     for (let lv = 0; lv < source.levelCount; lv++) {
       if (levels.includes(lv)) continue;
       const [lx, ly, lz] = source.dimensionsAt(lv);
@@ -596,18 +630,144 @@ export async function run(
       }
     }
 
-    ui.innerHTML = [
-      `<strong>26 · OME-Zarr viewer</strong>`,
-      `<div style="opacity:0.8;margin:3px 0 6px;font-size:11px">L${level} · ${dx}×${dy}×${dz}${loading ? " · loading…" : ""}${pickMode ? " · PICK" : ""}</div>`,
-      `<div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:8px">${tabBtn("data", "Data")}${tabBtn("tf", "TF")}${tabBtn("render", "Render")}${tabBtn("slices", "Slices")}${tabBtn("crop", "Crop")}${tabBtn("measure", "Measure")}</div>`,
-      body,
-      blocked.length && panel === "data"
-        ? `<div style="font-size:10px;opacity:0.55;margin-top:6px">${blocked.join(" · ")}</div>`
-        : "",
-      `<div style="opacity:0.55;margin-top:8px;font-size:10px">Pan: Space+drag / Shift / middle / right · wheel zooms to cursor · P / Ctrl+click pick · [ ] LOD · O open</div>`,
+    // Data section
+    const dataBody = [
+      `<div class="whud__hint">Resolution (GPU max ${maxTex}³)</div>`,
+      `<div class="whud__seg">${lodBtns}</div>`,
+      `<div class="whud__hint">voxel ${vx.toFixed(3)} ${unit.symbol} · ${qx.to(unit).toFixed(0)}×${qy.to(unit).toFixed(0)}×${qz.to(unit).toFixed(0)} ${unit.symbol}</div>`,
+      blocked.length ? `<div class="whud__hint">${blocked.join(" · ")}</div>` : "",
     ].join("");
 
-    if (panel === "tf") {
+    // TF section
+    const maps = colorMapNames()
+      .map((m) => `<option value="${m}" ${m === colorMap ? "selected" : ""}>${m}</option>`)
+      .join("");
+    const tfBody = [
+      `<label class="whud__row" style="font-size:11px">Colormap <select id="cmap" class="whud__select">${maps}</select></label>`,
+      slider("colorLo", "Color low", colorLo, 0, 1, 0.01),
+      slider("colorHi", "Color high", colorHi, 0, 1, 0.01),
+      slider("opacityScale", "Opacity ×", opacityScale, 0.05, 2, 0.01),
+      `<div class="whud__hint">Opacity curve (drag · dbl-click add)</div>`,
+      `<canvas id="opacity-curve" style="width:100%;height:72px;display:block;touch-action:none;cursor:crosshair"></canvas>`,
+    ].join("");
+
+    // Render section
+    const blends: VolumeBlendMode[] = ["composite", "mip", "minip", "average"];
+    const blendBtns = blends
+      .map((b) => segBtn("data-blend", b, b, blendMode === b))
+      .join("");
+    const renderBody = [
+      `<div class="whud__seg">${blendBtns}</div>`,
+      slider("sampleDist", "Sample dist", sampleDist, 0.35, 3, 0.05),
+      slider("density", "Density", densityScale, 0.2, 4, 0.05),
+      slider("exposure", "Exposure", exposure, 0.2, 4, 0.05),
+      slider("gradOp", "Grad opacity", gradOpacity, 0, 1, 0.01),
+      slider("gradScale", "Grad scale", gradScale, 0.02, 0.5, 0.01),
+      slider("lighting", "Lighting", lighting, 0, 1, 0.01),
+    ].join("");
+
+    // Slices section
+    const modes: [VolumeViewMode, string][] = [
+      ["volume", "3D"],
+      ["xPlane", "X (sagittal)"],
+      ["yPlane", "Y (coronal)"],
+      ["zPlane", "Z (axial)"],
+    ];
+    const modeBtns = modes
+      .map(([m, lab]) => segBtn("data-view", m, lab, viewMode === m))
+      .join("");
+    const active = activeSlice();
+    const [nx, ny, nz] = source.dimensionsAt(level);
+    let primary = "";
+    if (active) {
+      const n = active.axis === "x" ? nx : active.axis === "y" ? ny : nz;
+      const idx = Math.min(n - 1, Math.floor(active.value * n));
+      primary = [
+        `<div style="font-size:12px;margin:8px 0 4px;font-weight:600">Slice along ${active.axis.toUpperCase()}</div>`,
+        `<div class="whud__hint" data-slice-info>${sliceWorldLabel(active.axis, active.value)} · index ${idx}/${n - 1}</div>`,
+        slider("activeSlice", "Position", active.value, 0, 1, 1 / Math.max(n, 2)),
+        `<div class="whud__hint">Scroll wheel = scrub slice · Ctrl+wheel = zoom · middle/Alt-drag = pan · F = reframe</div>`,
+      ].join("");
+    } else {
+      primary = `<div class="whud__hint">Pick an axis view, then scrub with the slider or mouse wheel.</div>`;
+    }
+    const slicesBody = [
+      `<div class="whud__seg">${modeBtns}</div>`,
+      primary,
+      `<details style="margin-top:8px"><summary style="cursor:pointer;color:var(--whud-muted);font-size:11px">Overlays &amp; all axes</summary>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="showPlanes" ${showPlanes ? "checked" : ""}/> Show plane overlays in 3D</label>`,
+      `<div class="whud__row">`,
+      `<label class="whud__check"><input type="checkbox" data-chk="enX" ${enX ? "checked" : ""}/> X</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="enY" ${enY ? "checked" : ""}/> Y</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="enZ" ${enZ ? "checked" : ""}/> Z</label>`,
+      `</div>`,
+      slider("sliceX", "X", sliceX, 0, 1, 0.005),
+      slider("sliceY", "Y", sliceY, 0, 1, 0.005),
+      slider("sliceZ", "Z", sliceZ, 0, 1, 0.005),
+      `<button type="button" data-act="frameSlice" class="whud__seg-btn" style="margin-top:6px">Reframe to slice</button>`,
+      `</details>`,
+    ].join("");
+
+    // Crop section
+    const cropBody = [
+      `<div class="whud__hint">ROI crop (UVW 0–1)</div>`,
+      slider("cminX", "Min X", cropMin[0], 0, 1, 0.01),
+      slider("cminY", "Min Y", cropMin[1], 0, 1, 0.01),
+      slider("cminZ", "Min Z", cropMin[2], 0, 1, 0.01),
+      slider("cmaxX", "Max X", cropMax[0], 0, 1, 0.01),
+      slider("cmaxY", "Max Y", cropMax[1], 0, 1, 0.01),
+      slider("cmaxZ", "Max Z", cropMax[2], 0, 1, 0.01),
+      `<button type="button" data-act="resetCrop" class="whud__seg-btn" style="margin-top:6px">Reset crop</button>`,
+    ].join("");
+
+    // Measure section
+    const u3 = um3();
+    const detail = lastPick
+      ? [
+          `<div style="margin-top:8px;font-size:11px;line-height:1.45">`,
+          `<div>Seed voxel <b>${lastPick.seedVoxel.join(", ")}</b> · density ${lastPick.seedDensity.toFixed(2)}</div>`,
+          `<div>Threshold ≥ <b>${lastPick.threshold.toFixed(2)}</b> · <b>${lastPick.voxelCount.toLocaleString()}</b> voxels</div>`,
+          `<div>Volume <b>${lastPick.volume.to(u3).toExponential(3)}</b> ${u3.symbol}</div>`,
+          `<div style="color:var(--whud-muted)">${lastPick.volume.to(units.milliliter).toExponential(3)} mL · mean ${lastPick.meanDensity.toFixed(2)}</div>`,
+          `</div>`,
+        ].join("")
+      : "";
+    const measureBody = [
+      `<div class="whud__hint">Click a structure to grow a connected component and measure its physical volume (current LOD).</div>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="pickMode" ${pickMode ? "checked" : ""}/> Pick mode (or Ctrl+click)</label>`,
+      `<div class="whud__row"><button type="button" data-act="clearPick" class="whud__seg-btn">Clear selection</button></div>`,
+      pickStatus ? `<div style="margin-top:8px;font-size:11px">${pickStatus}</div>` : "",
+      detail,
+      `<div class="whud__hint">Uses ray pick through the volume + 6-connected flood fill. Crop snaps to the feature. Prefer L2+ for speed on huge volumes.</div>`,
+    ].join("");
+
+    ui.innerHTML = [
+      `<div class="whud__header">` +
+        `<span class="whud__title">OME-Zarr viewer</span>` +
+        `<button type="button" class="whud__collapse-btn" data-act="toggleCollapse" ` +
+        `title="${collapsed ? "Expand panel" : "Collapse panel"}" ` +
+        `aria-label="${collapsed ? "Expand panel" : "Collapse panel"}">${collapsed ? "\u2039" : "\u203A"}</button>` +
+        `</div>`,
+      `<div class="whud__status">L${level} · ${dx}×${dy}×${dz}${loading ? " · loading…" : ""}${pickMode ? " · PICK" : ""}</div>`,
+      section("data", "Data", dataBody),
+      section("tf", "Transfer Function", tfBody),
+      section("render", "Render", renderBody),
+      section("slices", "Slices", slicesBody),
+      section("crop", "Crop", cropBody),
+      section("measure", "Measure", measureBody),
+      `<div class="whud__hint">Pan: Space+drag / Shift / middle / right · wheel zooms to cursor · P / Ctrl+click pick · [ ] LOD · O open</div>`,
+    ].join("");
+
+    for (const el of ui.querySelectorAll<HTMLDetailsElement>("details.whud__section")) {
+      const id = el.dataset.section as PanelId | undefined;
+      if (!id) continue;
+      el.addEventListener("toggle", () => {
+        if (el.open) openSections.add(id);
+        else openSections.delete(id);
+      });
+    }
+
+    if (!collapsed && openSections.has("tf")) {
       const c = ui.querySelector<HTMLCanvasElement>("#opacity-curve");
       if (c) {
         curveEditor = new OpacityCurveEditor(c, opacityPoints, {
@@ -616,17 +776,21 @@ export async function run(
           onChange: (pts) => {
             opacityPoints = pts.map((p) => [p[0], p[1]] as const);
             applyTf();
+            emitRendering();
           },
         });
       }
     }
+
+    // Re-assert collapsed styling after the innerHTML rebuild (class + sidebar width).
+    applyCollapsed();
   };
 
   ui.addEventListener("click", (e) => {
     const btn = (e.target as HTMLElement).closest("button") as HTMLButtonElement | null;
     if (!btn) return;
-    if (btn.dataset.panel) {
-      panel = btn.dataset.panel as PanelId;
+    if (btn.dataset.act === "toggleCollapse") {
+      collapsed = !collapsed;
       renderUi();
       return;
     }
@@ -638,12 +802,16 @@ export async function run(
       blendMode = btn.dataset.blend as VolumeBlendMode;
       applyRender();
       renderUi();
+      emitRendering();
       return;
     }
     if (btn.dataset.view) {
       enterViewMode(btn.dataset.view as VolumeViewMode, true);
-      panel = "slices";
+      openSections.add("slices");
       renderUi();
+      // View mode carries both a render mode and slice enables/overlays.
+      emitRendering();
+      emitCropping();
       return;
     }
     if (btn.dataset.act === "resetCrop") {
@@ -651,6 +819,7 @@ export async function run(
       cropMax = [1, 1, 1];
       applyRender();
       renderUi();
+      emitCropping();
       return;
     }
     if (btn.dataset.act === "frameSlice") {
@@ -664,6 +833,7 @@ export async function run(
       cropMax = [1, 1, 1];
       applyRender();
       renderUi();
+      emitCropping();
     }
   });
 
@@ -673,8 +843,33 @@ export async function run(
       colorMap = t.value as ColorMapName;
       applyTf();
       curveEditor?.setColorMap(colorMap);
+      emitRendering();
     }
   });
+
+  const RENDERING_SLIDERS = new Set([
+    "colorLo",
+    "colorHi",
+    "opacityScale",
+    "sampleDist",
+    "density",
+    "exposure",
+    "gradOp",
+    "gradScale",
+    "lighting",
+  ]);
+  const CROPPING_SLIDERS = new Set([
+    "activeSlice",
+    "sliceX",
+    "sliceY",
+    "sliceZ",
+    "cminX",
+    "cminY",
+    "cminZ",
+    "cmaxX",
+    "cmaxY",
+    "cmaxZ",
+  ]);
 
   ui.addEventListener("input", (e) => {
     const t = e.target as HTMLInputElement;
@@ -691,6 +886,7 @@ export async function run(
         return;
       }
       applyRender();
+      emitCropping();
       return;
     }
     if (!t.dataset.slider) return;
@@ -737,7 +933,7 @@ export async function run(
         break;
       case "activeSlice":
         setActiveSlice(v);
-        if (panel === "slices") {
+        if (openSections.has("slices")) {
           // Refresh µm / index labels without rebuilding the whole panel (keeps focus).
           const active = activeSlice();
           if (active) {
@@ -748,7 +944,7 @@ export async function run(
                   ? source.dimensionsAt(level)[1]!
                   : source.dimensionsAt(level)[2]!;
             const idx = Math.min(n - 1, Math.floor(active.value * n));
-            const info = ui.querySelector("div[style*='font-weight:600'] + div");
+            const info = ui.querySelector("[data-slice-info]");
             if (info) {
               info.textContent = `${sliceWorldLabel(active.axis, active.value)} · index ${idx}/${n - 1}`;
             }
@@ -794,6 +990,8 @@ export async function run(
       default:
         break;
     }
+    if (RENDERING_SLIDERS.has(id)) emitRendering();
+    else if (CROPPING_SLIDERS.has(id)) emitCropping();
   });
 
   // Ctrl/Meta+click or pick-mode click → feature pick (Shift left free for pan).
@@ -831,7 +1029,7 @@ export async function run(
     const step = 1 / Math.max(n, 2);
     const dir = e.deltaY > 0 ? 1 : -1;
     setActiveSlice((activeSlice()?.value ?? 0.5) + dir * step);
-    if (panel === "slices") renderUi();
+    if (openSections.has("slices")) renderUi();
   };
   canvas.addEventListener("wheel", onSliceWheel, { passive: false });
   session.onDispose(() => canvas.removeEventListener("wheel", onSliceWheel));
@@ -848,26 +1046,34 @@ export async function run(
       else if (e.code === "BracketRight" && idx > 0) await applyLevel(levels[idx - 1]!);
       else if (e.code === "Digit1") {
         enterViewMode("xPlane", true);
-        panel = "slices";
+        openSections.add("slices");
         renderUi();
+        emitRendering();
+        emitCropping();
       } else if (e.code === "Digit2") {
         enterViewMode("yPlane", true);
-        panel = "slices";
+        openSections.add("slices");
         renderUi();
+        emitRendering();
+        emitCropping();
       } else if (e.code === "Digit3") {
         enterViewMode("zPlane", true);
-        panel = "slices";
+        openSections.add("slices");
         renderUi();
+        emitRendering();
+        emitCropping();
       } else if (e.code === "Digit4") {
         enterViewMode("volume", true);
-        panel = "slices";
+        openSections.add("slices");
         renderUi();
+        emitRendering();
+        emitCropping();
       } else if (e.code === "KeyF") {
         frameSliceCamera();
       } else if (e.code === "KeyP") {
         pickMode = !pickMode;
         canvas.style.cursor = pickMode ? "crosshair" : "";
-        panel = "measure";
+        openSections.add("measure");
         renderUi();
       } else if (e.code === "KeyS") {
         showPlanes = !showPlanes;
@@ -876,8 +1082,11 @@ export async function run(
         }
         applyRender();
         renderUi();
+        emitCropping();
       } else if (e.code === "KeyR") {
         enterViewMode("volume", true);
+        emitRendering();
+        emitCropping();
       } else if (e.code === "KeyO") {
         const next = await pickZarrStore();
         if (!next) return;
@@ -894,6 +1103,7 @@ export async function run(
         pickStatus = "";
         applyRender();
         renderUi();
+        emitCropping();
       }
     })();
   });
@@ -910,16 +1120,45 @@ export async function run(
     volumeMaxExtentMeters(source, level),
   );
 
+  const camsEqual = (a: WebGpuCameraState | null, b: WebGpuCameraState | null): boolean => {
+    if (!a || !b) return false;
+    const close = (x: number, y: number): boolean =>
+      Math.abs(x - y) <= 1e-4 * (1 + Math.abs(x) + Math.abs(y));
+    return (
+      close(a.distance, b.distance) &&
+      a.target.every((v, i) => close(v, b.target[i]!)) &&
+      a.offset.every((v, i) => close(v, b.offset[i]!)) &&
+      a.gazeUp.every((v, i) => close(v, b.gazeUp[i]!))
+    );
+  };
+
   session.loop((dt) => {
     resizeDemoCanvas(canvas);
     controls.update(dt);
+    // Announce orbit/pan/zoom to linked panes. Poll (rather than hook into the controls' input) so
+    // we also catch damped motion; guarded by the listener count so it's free when nothing's linked.
+    if (viewerListeners.cameraChange.size > 0) {
+      const cur = controls.getState();
+      if (!camsEqual(cur, lastCam)) {
+        lastCam = cur;
+        emit("cameraChange");
+      }
+    }
     const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
-    // Rays are unprojected via inv(viewProj); extreme near/far ratios destroy float32 precision
-    // and make DVR look broken. Tie the frustum to camera distance (closer in slice mode without
-    // a pathological depth range).
-    const dist = Math.max(controls.distance, extent * 0.15);
-    const near = Math.max(dist * 0.02, extent * 0.002);
-    const far = dist + extent * 5;
+    // Near/far are derived from the eye's distance to the VOLUME CENTER (the box is centered at the
+    // world origin) plus the volume's bounding-sphere radius — NOT from the orbit distance-to-target.
+    // The orbit target drifts under zoom-to-cursor, so a distance-to-target frustum let the volume
+    // fall outside the near/far range (and pushed the inv(viewProj) ray reconstruction into an
+    // ill-conditioned float32 regime) when zoomed out, which blanked the DVR. Bracketing the frustum
+    // tightly around the actual volume keeps the whole box inside it across the entire zoom range and
+    // keeps the near/far ratio bounded so ray reconstruction stays stable.
+    const boundR = 0.5 * Math.hypot(sizeSim.x, sizeSim.y, sizeSim.z) || extent * 0.5;
+    const eyeToCenter = Math.hypot(camera.position.x, camera.position.y, camera.position.z);
+    const margin = boundR * 1.5 + extent * 0.05;
+    const far = eyeToCenter + margin;
+    // Clamp near above a small fraction of far so the ratio stays float32-friendly even when the eye
+    // is inside (or very close to) the volume; never let it collapse to ~0.
+    const near = Math.max(eyeToCenter - margin, far * 0.002);
     proj.perspective(
       (42 * Math.PI) / 180,
       canvas.width / Math.max(1, canvas.height),
@@ -937,5 +1176,54 @@ export async function run(
     volumeRenderer.dispose();
   });
 
-  return session.handle();
+  const handle = session.handle();
+  const instance: WebGpuViewerInstance = {
+    getCamera: readCamera,
+    setCamera: (state) => {
+      controls.setState(state);
+      // Re-baseline so the loop's poll doesn't echo this peer-applied pose back out.
+      lastCam = controls.getState();
+    },
+    getRendering: readRendering,
+    setRendering: (state) => {
+      colorMap = state.colorMap;
+      colorLo = state.colorLo;
+      colorHi = state.colorHi;
+      opacityScale = state.opacityScale;
+      opacityPoints = state.opacityPoints.map((p) => [p[0], p[1]] as const);
+      densityScale = state.densityScale;
+      exposure = state.exposure;
+      sampleDist = state.sampleDist;
+      blendMode = state.blendMode;
+      gradOpacity = state.gradOpacity;
+      gradScale = state.gradScale;
+      lighting = state.lighting;
+      viewMode = state.viewMode;
+      applyTf();
+      applyRender();
+      renderUi();
+    },
+    getCropping: readCropping,
+    setCropping: (state) => {
+      cropMin = [state.cropMin[0], state.cropMin[1], state.cropMin[2]];
+      cropMax = [state.cropMax[0], state.cropMax[1], state.cropMax[2]];
+      sliceX = state.sliceX;
+      sliceY = state.sliceY;
+      sliceZ = state.sliceZ;
+      enX = state.enX;
+      enY = state.enY;
+      enZ = state.enZ;
+      showPlanes = state.showPlanes;
+      applyRender();
+      renderUi();
+    },
+    on: (event, cb) => {
+      viewerListeners[event].add(cb);
+    },
+    off: (event, cb) => {
+      viewerListeners[event].delete(cb);
+    },
+    dispose: () => handle.dispose(),
+  };
+  return instance;
 }

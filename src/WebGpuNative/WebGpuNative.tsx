@@ -16,7 +16,9 @@
  */
 
 import { useEffect, useRef } from 'react';
-import { run } from '../zarr-viewer/src/ome-zarr-viewer';
+import { run, type WebGpuViewerInstance } from '../zarr-viewer/src/ome-zarr-viewer';
+
+export type { WebGpuViewerInstance } from '../zarr-viewer/src/ome-zarr-viewer';
 
 /**
  * Whether the WebGPU renderer can run, with a human-readable reason when it can't. WebGPU is gated
@@ -38,33 +40,58 @@ export function webGpuAvailability(): { ok: boolean; reason: string } {
 
 type WebGpuNativeProps = {
   dataUrl?: string;
+  /**
+   * Fires with the viewer instance once `run()` returns its handle, and with `null` when it is
+   * disposed (unmount / dataUrl change). Used by the split view to link camera + rendering + cropping
+   * across two WebGPU panes (mirrors ItkVtkNative's onReady).
+   */
+  onReady?: (instance: WebGpuViewerInstance | null) => void;
 };
 
-export default function WebGpuNative({ dataUrl }: WebGpuNativeProps) {
+export default function WebGpuNative({ dataUrl, onReady }: WebGpuNativeProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // Hold the latest onReady in a ref so changing the callback identity doesn't re-run the renderer.
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
 
   useEffect(() => {
     if (!containerRef.current || !dataUrl || !webGpuAvailability().ok) return;
 
     const container = containerRef.current;
     let cancelled = false;
-    let handle: { dispose: () => void } | null = null;
+    let handle: WebGpuViewerInstance | null = null;
 
-    // The renderer's per-frame loop re-fits the canvas backing store to its CSS box, so styling the
-    // canvas to fill the container is enough — hidden→visible panes self-correct on the next frame.
+    // Docked layout: canvas fills a flex:1 host on the left, the Finch HUD lives in a fixed-width
+    // sidebar on the right. Because the renderer's stage is `canvas.parentElement` (canvasHost) and
+    // its per-frame loop re-fits the canvas backing store to its CSS box, shrinking the canvas beside
+    // the sidebar "just works" — hidden→visible panes self-correct on the next frame.
+    const canvasHost = document.createElement('div');
+    canvasHost.style.flex = '1';
+    canvasHost.style.minWidth = '0';
+    canvasHost.style.position = 'relative';
+
     const canvas = document.createElement('canvas');
     canvas.style.width = '100%';
     canvas.style.height = '100%';
     canvas.style.display = 'block';
-    container.appendChild(canvas);
+    canvasHost.appendChild(canvas);
 
-    run(canvas, { zarrUrl: dataUrl })
+    const sidebarHost = document.createElement('div');
+    sidebarHost.style.width = '320px';
+    sidebarHost.style.flexShrink = '0';
+    sidebarHost.style.overflow = 'auto';
+
+    container.appendChild(canvasHost);
+    container.appendChild(sidebarHost);
+
+    run(canvas, { zarrUrl: dataUrl, hudMount: sidebarHost })
       .then((created) => {
         if (cancelled) {
           created.dispose();
           return;
         }
         handle = created;
+        onReadyRef.current?.(created);
       })
       .catch((error) => {
         if (!cancelled) console.error('WebGpuNative: failed to start renderer:', error);
@@ -77,6 +104,7 @@ export default function WebGpuNative({ dataUrl }: WebGpuNativeProps) {
       } catch (error) {
         console.warn('WebGpuNative: dispose failed:', error);
       }
+      if (handle) onReadyRef.current?.(null);
       container.innerHTML = '';
     };
   }, [dataUrl]);
@@ -93,5 +121,10 @@ export default function WebGpuNative({ dataUrl }: WebGpuNativeProps) {
     );
   }
 
-  return <div ref={containerRef} style={{ flex: 1, minHeight: 0, width: '100%', position: 'relative' }} />;
+  return (
+    <div
+      ref={containerRef}
+      style={{ flex: 1, minHeight: 0, width: '100%', position: 'relative', display: 'flex', flexDirection: 'row' }}
+    />
+  );
 }

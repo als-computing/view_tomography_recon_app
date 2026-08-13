@@ -25,6 +25,7 @@ import { TiledNotifications } from './TiledNotifications';
 import { TabBar } from './TabBar';
 import { useTabsStore } from './stores/useTabsStore';
 import { useLinkedViewers } from './hooks/useLinkedViewers';
+import { useLinkedWebGpuViewers } from './hooks/useLinkedWebGpuViewers';
 import { applyViewState, captureViewState } from './viewerState';
 import {
   buildShareUrl,
@@ -97,6 +98,29 @@ function App() {
     [isSplit, activeRightId, instanceVersion],
   );
   useLinkedViewers(leftInstance, rightInstance, {
+    camera: linkCamera,
+    rendering: linkRendering,
+    cropping: linkCropping,
+  });
+
+  // WebGPU panes keep their own instance map (its API differs from itk); since `renderer` is
+  // app-wide only one kind is ever mounted, so the two maps never hold instances simultaneously.
+  const webgpuInstancesRef = useRef(new Map());
+  const [webgpuInstanceVersion, setWebgpuInstanceVersion] = useState(0);
+  const handleWebGpuReady = useCallback((id, instance) => {
+    if (instance) webgpuInstancesRef.current.set(id, instance);
+    else webgpuInstancesRef.current.delete(id);
+    setWebgpuInstanceVersion((v) => v + 1);
+  }, []);
+  const leftWebGpu = useMemo(
+    () => (isSplit && activeLeftId ? webgpuInstancesRef.current.get(activeLeftId) ?? null : null),
+    [isSplit, activeLeftId, webgpuInstanceVersion],
+  );
+  const rightWebGpu = useMemo(
+    () => (isSplit && activeRightId ? webgpuInstancesRef.current.get(activeRightId) ?? null : null),
+    [isSplit, activeRightId, webgpuInstanceVersion],
+  );
+  useLinkedWebGpuViewers(leftWebGpu, rightWebGpu, {
     camera: linkCamera,
     rendering: linkRendering,
     cropping: linkCropping,
@@ -192,7 +216,10 @@ function App() {
               style={{ flexDirection: 'column', display: 'flex', ...paneStyle(t.id) }}
             >
               {renderer === 'webgpu' ? (
-                <WebGpuNative dataUrl={t.url} />
+                <WebGpuNative
+                  dataUrl={t.url}
+                  onReady={(instance) => handleWebGpuReady(t.id, instance)}
+                />
               ) : (
                 <ItkVktNative dataUrl={t.url} onReady={(instance) => handleReady(t.id, instance)} />
               )}
