@@ -24,6 +24,14 @@ import { TiledNotifications } from './TiledNotifications';
 import { TabBar } from './TabBar';
 import { useTabsStore } from './stores/useTabsStore';
 import { useLinkedViewers } from './hooks/useLinkedViewers';
+import { applyViewState, captureViewState } from './viewerState';
+import {
+  buildShareUrl,
+  copyToClipboard,
+  fileIdFromZarrUrl,
+  readShareFromLocation,
+  zarrUrlFromFileId,
+} from './shareLink';
 
 const defaultZarrFileUrl = getDefaultZarrFileUrl() || '';
 
@@ -56,9 +64,23 @@ function App() {
   // pane instances passed to useLinkedViewers.
   const instancesRef = useRef(new Map());
   const [instanceVersion, setInstanceVersion] = useState(0);
+  // View state from a shared link, waiting to be replayed onto its viewer once it loads. Keyed by
+  // the tab's zarr url (the tab id isn't known when the deep-link opens the tab).
+  const pendingStateRef = useRef(new Map());
   const handleReady = useCallback((id, instance) => {
-    if (instance) instancesRef.current.set(id, instance);
-    else instancesRef.current.delete(id);
+    if (instance) {
+      instancesRef.current.set(id, instance);
+      // If this viewer was opened from a shared link, replay the saved camera/colors/cropping now
+      // that it's renderable, then consume the pending state so it only applies once.
+      const tab = useTabsStore.getState().tabs.find((t) => t.id === id);
+      const pending = tab && pendingStateRef.current.get(tab.url);
+      if (pending) {
+        pendingStateRef.current.delete(tab.url);
+        applyViewState(instance, pending);
+      }
+    } else {
+      instancesRef.current.delete(id);
+    }
     setInstanceVersion((v) => v + 1);
   }, []);
 
@@ -85,10 +107,38 @@ function App() {
   // survives the brief overlap of two live viewers during a tab switch.
   useEffect(() => installTiledFetchInterceptor(getTiledBaseUrl()), []);
 
-  // Open the configured default reconstruction as the first tab, once.
+  // Seed the first tab, once. A shared link (?share=…) wins over the configured default: open its
+  // reconstruction and stash the saved view state for handleReady to replay when the viewer loads.
   useEffect(() => {
-    if (defaultZarrFileUrl) openTab(defaultZarrFileUrl);
+    const shared = readShareFromLocation();
+    if (shared) {
+      const url = zarrUrlFromFileId(shared.f);
+      pendingStateRef.current.set(url, shared);
+      openTab(url);
+    } else if (defaultZarrFileUrl) {
+      openTab(defaultZarrFileUrl);
+    }
   }, [openTab]);
+
+  // The reconstruction a "Share" click captures: in split view the active left pane, else the sole
+  // shown tab. Null when nothing is open yet.
+  const shareTargetId = isSplit ? activeLeftId : soloId;
+  const handleShare = useCallback(async () => {
+    if (!shareTargetId) return false;
+    const instance = instancesRef.current.get(shareTargetId);
+    const tab = useTabsStore.getState().tabs.find((t) => t.id === shareTargetId);
+    if (!instance || !tab) return false;
+    const fileId = fileIdFromZarrUrl(tab.url);
+    if (!fileId) return false;
+    const url = buildShareUrl({ ...captureViewState(instance), f: fileId });
+    const copied = await copyToClipboard(url);
+    if (!copied) {
+      // Both clipboard paths failed — surface the link so the user can copy it manually.
+      console.warn('Share: could not copy automatically; copy this URL manually:', url);
+      window.prompt('Copy this shareable link:', url);
+    }
+    return copied;
+  }, [shareTargetId]);
 
   // Press Escape to leave split view.
   useEffect(() => {
@@ -115,6 +165,8 @@ function App() {
         logoUrl="images/als_logo_wheel.png"
         title="Tomography Visualizer powered by itk-vtk-viewer"
         onSelect={openTab}
+        onShare={handleShare}
+        canShare={!!shareTargetId}
       />
       <TabBar
         tabs={tabs}

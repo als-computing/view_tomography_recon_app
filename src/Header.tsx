@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import './header.css';
 import { Tiled, TiledItemLinks } from '@blueskyproject/tiled';
@@ -17,10 +17,32 @@ export interface HeaderProps {
    * Callback that receives the selected file URL.
    */
   onSelect?: (file_url: string) => void;
+  /**
+   * Copy a shareable link for the current reconstruction/view to the clipboard. Resolves true when
+   * the link was copied (drives the transient "Copied!" confirmation).
+   */
+  onShare?: () => Promise<boolean> | boolean;
+  /** Whether there's an active reconstruction to share (disables the button when false). */
+  canShare?: boolean;
 }
 
-export const Header = ({ logoUrl, title, onSelect }: HeaderProps) => {
+export const Header = ({ logoUrl, title, onSelect, onShare, canShare = false }: HeaderProps) => {
   const [selectedFolder, setSelectedFolder] = useState<string>('');
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+  }, []);
+
+  const handleShareClick = async () => {
+    if (!onShare) return;
+    const ok = await onShare();
+    if (!ok) return;
+    setCopied(true);
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopied(false), 1500);
+  };
 
   // Server state: the subfolders under the processed path that populate the folder dropdown.
   // TanStack Query handles caching, retries, and refetch-on-focus (so it recovers once the user
@@ -98,6 +120,17 @@ export const Header = ({ logoUrl, title, onSelect }: HeaderProps) => {
             includeAuthTokensInSelectCallback={true}
             initialPath={tiledInitialPath}
           />
+          {onShare && (
+            <button
+              type="button"
+              className="header-share-button"
+              onClick={handleShareClick}
+              disabled={!canShare}
+              title="Copy a link that reopens this scan at the current view"
+            >
+              {copied ? 'Copied!' : 'Share'}
+            </button>
+          )}
         </div>
       </div>
     </header>

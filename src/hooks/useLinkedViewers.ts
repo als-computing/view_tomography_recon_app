@@ -20,7 +20,8 @@
  */
 
 import { useEffect } from 'react';
-import type { ItkVtkCamera, ItkVtkViewerInstance } from '../ItkVtkNative/ItkVtkNative';
+import type { ItkVtkViewerInstance } from '../ItkVtkNative/ItkVtkNative';
+import { CROPPING_MIRRORS, RENDERING_MIRRORS, copyCamera, type Mirror } from '../viewerState';
 
 interface LinkOptions {
   camera: boolean;
@@ -31,96 +32,6 @@ interface LinkOptions {
 interface Subscription {
   unsubscribe: () => void;
 }
-
-/**
- * A single mirrored property: read its current value from the source viewer and write it to the
- * target, triggered whenever any of `events` fires on the source.
- */
-interface Mirror {
-  events: string[];
-  read: (v: ItkVtkViewerInstance) => unknown;
-  write: (v: ItkVtkViewerInstance, value: unknown) => void;
-}
-
-const RENDERING_MIRRORS: Mirror[] = [
-  {
-    events: ['imageColorMapChanged'],
-    read: (v) => v.getImageColorMap(),
-    write: (v, x) => v.setImageColorMap(x),
-  },
-  {
-    events: ['imageColorRangeChanged'],
-    read: (v) => v.getImageColorRange(),
-    write: (v, x) => v.setImageColorRange(x as number[]),
-  },
-  {
-    events: ['imageColorRangeBoundsChanged'],
-    read: (v) => v.getImageColorRangeBounds(),
-    write: (v, x) => v.setImageColorRangeBounds(x as number[]),
-  },
-  {
-    events: ['imagePiecewiseFunctionPointsChanged'],
-    read: (v) => v.getImagePiecewiseFunctionPoints(),
-    write: (v, x) => v.setImagePiecewiseFunctionPoints(x),
-  },
-  {
-    events: ['imagePiecewiseFunctionGaussiansChanged'],
-    read: (v) => v.getImagePiecewiseFunctionGaussians(),
-    write: (v, x) => v.setImagePiecewiseFunctionGaussians(x),
-  },
-  {
-    events: ['imageGradientOpacityChanged'],
-    read: (v) => v.getImageGradientOpacity(),
-    write: (v, x) => v.setImageGradientOpacity(x),
-  },
-  {
-    events: ['imageGradientOpacityScaleChanged'],
-    read: (v) => v.getImageGradientOpacityScale(),
-    write: (v, x) => v.setImageGradientOpacityScale(x),
-  },
-  {
-    events: ['imageVolumeSampleDistanceChanged'],
-    read: (v) => v.getImageVolumeSampleDistance(),
-    write: (v, x) => v.setImageVolumeSampleDistance(x),
-  },
-  {
-    events: ['imageBlendModeChanged'],
-    read: (v) => v.getImageBlendMode(),
-    write: (v, x) => v.setImageBlendMode(x),
-  },
-  {
-    events: ['toggleImageShadow'],
-    read: (v) => v.getImageShadowEnabled(),
-    write: (v, x) => v.setImageShadowEnabled(x as boolean),
-  },
-  {
-    events: ['toggleImageInterpolation'],
-    read: (v) => v.getImageInterpolationEnabled(),
-    write: (v, x) => v.setImageInterpolationEnabled(x as boolean),
-  },
-];
-
-const CROPPING_MIRRORS: Mirror[] = [
-  {
-    events: ['croppingPlanesChanged', 'resetCroppingPlanes'],
-    read: (v) => v.getCroppingPlanes(),
-    write: (v, x) => v.setCroppingPlanes(x),
-  },
-  {
-    events: ['toggleCroppingPlanes'],
-    read: (v) => v.getCroppingPlanesEnabled(),
-    write: (v, x) => v.setCroppingPlanesEnabled(x as boolean),
-  },
-];
-
-const copyCamera = (from: ItkVtkCamera, to: ItkVtkCamera) => {
-  to.set({
-    position: from.getPosition(),
-    focalPoint: from.getFocalPoint(),
-    viewUp: from.getViewUp(),
-    parallelScale: from.getParallelScale(),
-  });
-};
 
 export function useLinkedViewers(
   a: ItkVtkViewerInstance | null,
