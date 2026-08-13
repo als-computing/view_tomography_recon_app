@@ -19,6 +19,9 @@ import { create } from 'zustand';
 
 export type PaneSide = 'left' | 'right';
 
+/** The volume renderer used by all viewers (app-wide toggle). */
+export type RendererKind = 'itk' | 'webgpu';
+
 export interface ReconTab {
   id: string;
   /** Zarr URL loaded into the viewer. */
@@ -43,6 +46,8 @@ export interface TabsState {
   linkRendering: boolean;
   /** Sync the cropping (ROI) planes between the two split panes. */
   linkCropping: boolean;
+  /** Which volume renderer every viewer uses (app-wide, not per tab). */
+  renderer: RendererKind;
 
   /** Open a url as a tab in the left pane (focus it if already open) and activate it. */
   openTab: (url: string) => void;
@@ -59,6 +64,10 @@ export interface TabsState {
   setLinkCamera: (value: boolean) => void;
   setLinkRendering: (value: boolean) => void;
   setLinkCropping: (value: boolean) => void;
+  /** Set the app-wide volume renderer. */
+  setRenderer: (renderer: RendererKind) => void;
+  /** Flip the app-wide volume renderer between itk and webgpu. */
+  toggleRenderer: () => void;
 }
 
 /** Grace period a hidden tab's viewer stays mounted before being disposed. */
@@ -130,6 +139,7 @@ export const useTabsStore = create<TabsState>()((set, get) => {
     linkCamera: true,
     linkRendering: true,
     linkCropping: true,
+    renderer: 'itk',
 
     openTab: (url) => {
       const existing = get().tabs.find((t) => t.url === url);
@@ -240,5 +250,7 @@ export const useTabsStore = create<TabsState>()((set, get) => {
     setLinkCamera: (value) => set({ linkCamera: value }),
     setLinkRendering: (value) => set({ linkRendering: value }),
     setLinkCropping: (value) => set({ linkCropping: value }),
+    setRenderer: (renderer) => set({ renderer }),
+    toggleRenderer: () => set((s) => ({ renderer: s.renderer === 'itk' ? 'webgpu' : 'itk' })),
   };
 });

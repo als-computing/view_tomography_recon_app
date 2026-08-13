@@ -57,9 +57,9 @@
   gap: 6px;
 }
 
-/* "Share" button — copies a link that reopens the current scan at the current view. Styled to sit
-   quietly beside the folder picker and Tiled browse button. */
-.header-share-button {
+/* "Share" and "Renderer" buttons — quiet pills beside the folder picker and Tiled browse button. */
+.header-share-button,
+.header-renderer-toggle {
   cursor: pointer;
   border: 0;
   border-radius: 3em;
@@ -73,11 +73,13 @@
   box-shadow: rgba(0, 0, 0, 0.15) 0 0 0 1px inset;
 }
 
-.header-share-button:hover:not(:disabled) {
+.header-share-button:hover:not(:disabled),
+.header-renderer-toggle:hover:not(:disabled) {
   background-color: rgba(30, 167, 253, 0.1);
 }
 
-.header-share-button:disabled {
+.header-share-button:disabled,
+.header-renderer-toggle:disabled {
   opacity: 0.5;
   cursor: default;
 }

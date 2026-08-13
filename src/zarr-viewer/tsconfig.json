@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["@webgpu/types", "node"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "paths": {
+      "@zarr-viewer/core": ["./src/core/index.ts"],
+      "@zarr-viewer/math": ["./src/math/index.ts"],
+      "@zarr-viewer/scene": ["./src/scene/index.ts"],
+      "@zarr-viewer/controls": ["./src/controls/index.ts"],
+      "@zarr-viewer/io": ["./src/io/index.ts"],
+      "@zarr-viewer/render": ["./src/render/index.ts"]
+    },
+    "baseUrl": "."
+  },
+  "include": ["src/**/*.ts", "vite-zarr-static.ts", "vite.config.ts"]
+}

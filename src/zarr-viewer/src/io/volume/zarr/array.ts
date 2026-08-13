@@ -1,0 +1,331 @@
+/**
+ * Open a single Zarr array as a {@link VolumeSource} (one resolution level).
+ *
+ * @packageDocumentation
+ */
+
+import type { Store } from "./store.js";
+import { readArrayMeta, type ZarrArrayMeta } from "./metadata.js";
+import { codecFromCompressor } from "./codecs.js";
+import {
+  dtypeByteSize,
+  type VolumeChunk,
+  type VolumeDType,
+  type VolumeSource,
+} from "../volume-source.js";
+
+export interface OpenZarrArrayOptions {
+  /** Physical voxel spacing in SI meters (x, y, z). Default `[1,1,1]`. */
+  spacing?: readonly [number, number, number];
+  /** Axis permutation from on-disk order to x,y,z (default identity). */
+  axisToXyz?: readonly [number, number, number];
+  /** Declared or estimated value range. */
+  valueRange?: readonly [number, number];
+  /** Display unit name for spacing (e.g. `"micrometer"`). */
+  spacingUnitName?: string;
+}
+
+function chunkKey(meta: ZarrArrayMeta, indices: number[]): string {
+  const body = indices.join(meta.dimensionSeparator);
+  return meta.path ? `${meta.path}/${body}` : body;
+}
+
+function typedView(buf: ArrayBuffer, dtype: VolumeDType, littleEndian: boolean): ArrayBufferView {
+  // Platform is LE; swap if big-endian multi-byte (rare for tomography).
+  if (!littleEndian && dtypeByteSize(dtype) > 1) {
+    const u8 = new Uint8Array(buf);
+    const bpe = dtypeByteSize(dtype);
+    for (let i = 0; i < u8.length; i += bpe) {
+      for (let j = 0; j < bpe / 2; j++) {
+        const a = u8[i + j]!;
+        u8[i + j] = u8[i + bpe - 1 - j]!;
+        u8[i + bpe - 1 - j] = a;
+      }
+    }
+  }
+  switch (dtype) {
+    case "uint8":
+      return new Uint8Array(buf);
+    case "int8":
+      return new Int8Array(buf);
+    case "uint16":
+      return new Uint16Array(buf);
+    case "int16":
+      return new Int16Array(buf);
+    case "uint32":
+      return new Uint32Array(buf);
+    case "int32":
+      return new Int32Array(buf);
+    case "float32":
+      return new Float32Array(buf);
+    case "float64":
+      return new Float64Array(buf);
+    default:
+      return new Uint8Array(buf);
+  }
+}
+
+function fillBuffer(dtype: VolumeDType, count: number, fill: number): ArrayBufferView {
+  switch (dtype) {
+    case "float32": {
+      const a = new Float32Array(count);
+      a.fill(fill);
+      return a;
+    }
+    case "float64": {
+      const a = new Float64Array(count);
+      a.fill(fill);
+      return a;
+    }
+    case "uint8": {
+      const a = new Uint8Array(count);
+      a.fill(fill);
+      return a;
+    }
+    case "uint16": {
+      const a = new Uint16Array(count);
+      a.fill(fill);
+      return a;
+    }
+    default: {
+      const a = new Float32Array(count);
+      a.fill(fill);
+      return a;
+    }
+  }
+}
+
+/**
+ * Crop a full-size C-order chunk buffer down to the valid region.
+ *
+ * Zarr v2 stores edge chunks at the full {@link ZarrArrayMeta.chunks} shape (padding with
+ * `fill_value`). Valid voxels are therefore **not** a contiguous byte prefix when a fast axis is
+ * truncated — taking `product(validShape)` bytes alone produces stripes/seams on coarse LODs.
+ */
+function cropCOrderChunk(
+  full: ArrayBufferView,
+  fullShape: readonly [number, number, number],
+  validShape: readonly [number, number, number],
+  dtype: VolumeDType,
+): ArrayBufferView {
+  const [f0, f1, f2] = fullShape;
+  const [v0, v1, v2] = validShape;
+  if (v0 === f0 && v1 === f1 && v2 === f2) return full;
+  const out = fillBuffer(dtype, v0 * v1 * v2, 0);
+  const src = full as unknown as ArrayLike<number>;
+  const dst = out as unknown as { [i: number]: number };
+  for (let i0 = 0; i0 < v0; i0++) {
+    for (let i1 = 0; i1 < v1; i1++) {
+      for (let i2 = 0; i2 < v2; i2++) {
+        const si = i2 + f2 * (i1 + f1 * i0);
+        const di = i2 + v2 * (i1 + v1 * i0);
+        dst[di] = src[si]!;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Transpose a C-order chunk from on-disk axis order to x,y,z.
+ * `axisToXyz[i]` = on-disk axis index that becomes output axis i (0=x,1=y,2=z).
+ */
+function permuteChunkToXyz(
+  data: ArrayBufferView,
+  diskShape: readonly [number, number, number],
+  axisToXyz: readonly [number, number, number],
+  dtype: VolumeDType,
+): { shape: [number, number, number]; data: ArrayBufferView } {
+  const [d0, d1, d2] = diskShape;
+  const outShape: [number, number, number] = [
+    diskShape[axisToXyz[0]]!,
+    diskShape[axisToXyz[1]]!,
+    diskShape[axisToXyz[2]]!,
+  ];
+  // Identity fast path.
+  if (axisToXyz[0] === 0 && axisToXyz[1] === 1 && axisToXyz[2] === 2) {
+    return { shape: [d0, d1, d2], data };
+  }
+
+  const n = d0 * d1 * d2;
+  const src = new Float64Array(n);
+  const srcView = data as unknown as ArrayLike<number>;
+  for (let i = 0; i < n; i++) src[i] = Number(srcView[i]);
+
+  const outBuf = fillBuffer(dtype, outShape[0] * outShape[1] * outShape[2], 0);
+  const outView = outBuf as unknown as { [i: number]: number };
+
+  for (let i0 = 0; i0 < d0; i0++) {
+    for (let i1 = 0; i1 < d1; i1++) {
+      for (let i2 = 0; i2 < d2; i2++) {
+        const disk = [i0, i1, i2] as const;
+        const x = disk[axisToXyz[0]]!;
+        const y = disk[axisToXyz[1]]!;
+        const z = disk[axisToXyz[2]]!;
+        const si = i2 + d2 * (i1 + d1 * i0);
+        const di = x + outShape[0] * (y + outShape[1] * z);
+        outView[di] = src[si]!;
+      }
+    }
+  }
+  return { shape: outShape, data: outBuf };
+}
+
+class ZarrArraySource implements VolumeSource {
+  public readonly dimensions: readonly [number, number, number];
+  public readonly spacing: readonly [number, number, number];
+  public readonly dtype: VolumeDType;
+  public readonly valueRange: readonly [number, number];
+  public readonly levelCount = 1;
+  public readonly spacingUnitName?: string;
+
+  private readonly meta: ZarrArrayMeta;
+  private readonly store: Store;
+  private readonly axisToXyz: readonly [number, number, number];
+  private readonly codec;
+
+  public constructor(
+    store: Store,
+    meta: ZarrArrayMeta,
+    options: OpenZarrArrayOptions,
+  ) {
+    this.store = store;
+    this.meta = meta;
+    this.axisToXyz = options.axisToXyz ?? [0, 1, 2];
+    this.codec = codecFromCompressor(meta.compressor);
+    this.dtype = meta.dtype;
+    this.spacing = options.spacing ?? [1, 1, 1];
+    this.spacingUnitName = options.spacingUnitName;
+    this.valueRange = options.valueRange ?? [0, 1];
+
+    const disk = meta.shape;
+    this.dimensions = [
+      disk[this.axisToXyz[0]] ?? 1,
+      disk[this.axisToXyz[1]] ?? 1,
+      disk[this.axisToXyz[2]] ?? 1,
+    ];
+  }
+
+  public dimensionsAt(_level: number): readonly [number, number, number] {
+    return this.dimensions;
+  }
+
+  public spacingAt(_level: number): readonly [number, number, number] {
+    return this.spacing;
+  }
+
+  private diskChunkCounts(): number[] {
+    return this.meta.shape.map((s, i) => Math.ceil(s / this.meta.chunks[i]!));
+  }
+
+  public async readChunk(level: number, x: number, y: number, z: number): Promise<VolumeChunk> {
+    if (level !== 0) throw new Error("ZarrArraySource has only level 0");
+    // Map xyz voxel → disk indices, then to chunk coords.
+    const diskVoxel = [0, 0, 0];
+    diskVoxel[this.axisToXyz[0]] = x;
+    diskVoxel[this.axisToXyz[1]] = y;
+    diskVoxel[this.axisToXyz[2]] = z;
+    const ci = diskVoxel.map((v, ax) => Math.floor(v / this.meta.chunks[ax]!));
+    return this.readDiskChunk(ci);
+  }
+
+  private async readDiskChunk(chunkIndices: number[]): Promise<VolumeChunk> {
+    const key = chunkKey(this.meta, chunkIndices);
+    const compressed = await this.store.get(key);
+    const fullShape: [number, number, number] = [
+      this.meta.chunks[0]!,
+      this.meta.chunks[1]!,
+      this.meta.chunks[2]!,
+    ];
+    const validShape: [number, number, number] = [0, 0, 0];
+    for (let ax = 0; ax < 3; ax++) {
+      const start = chunkIndices[ax]! * this.meta.chunks[ax]!;
+      validShape[ax] = Math.min(this.meta.chunks[ax]!, this.meta.shape[ax]! - start);
+    }
+    const validCount = validShape[0]! * validShape[1]! * validShape[2]!;
+    const fullCount = fullShape[0]! * fullShape[1]! * fullShape[2]!;
+    const bpe = this.meta.bytesPerElement;
+    let raw: ArrayBufferView;
+    if (!compressed) {
+      raw = fillBuffer(this.dtype, validCount, this.meta.fillValue);
+    } else {
+      const decoded = await this.codec.decode(compressed);
+      const fullBytes = fullCount * bpe;
+      const validBytes = validCount * bpe;
+      if (decoded.byteLength >= fullBytes) {
+        // Standard Zarr v2: full chunk with edge padding — crop with full strides.
+        const buf = decoded.buffer.slice(
+          decoded.byteOffset,
+          decoded.byteOffset + fullBytes,
+        ) as ArrayBuffer;
+        const fullView = typedView(buf, this.dtype, this.meta.littleEndian);
+        raw = cropCOrderChunk(fullView, fullShape, validShape, this.dtype);
+      } else if (decoded.byteLength >= validBytes) {
+        // Some writers emit a tightly packed valid region (non-standard but harmless).
+        const buf = decoded.buffer.slice(
+          decoded.byteOffset,
+          decoded.byteOffset + validBytes,
+        ) as ArrayBuffer;
+        raw = typedView(buf, this.dtype, this.meta.littleEndian);
+      } else {
+        throw new Error(
+          `chunk ${key}: decoded ${decoded.byteLength} < valid ${validBytes} (full ${fullBytes})`,
+        );
+      }
+    }
+
+    const { shape, data } = permuteChunkToXyz(raw, validShape, this.axisToXyz, this.dtype);
+
+    const originDisk = chunkIndices.map((c, ax) => c * this.meta.chunks[ax]!);
+    const origin: [number, number, number] = [
+      originDisk[this.axisToXyz[0]]!,
+      originDisk[this.axisToXyz[1]]!,
+      originDisk[this.axisToXyz[2]]!,
+    ];
+    return { origin, shape, data };
+  }
+
+  public async *chunks(level: number): AsyncIterable<VolumeChunk> {
+    if (level !== 0) throw new Error("ZarrArraySource has only level 0");
+    const counts = this.diskChunkCounts();
+    // Iterate disk chunk grid; yield xyz-ordered chunks.
+    for (let c0 = 0; c0 < counts[0]!; c0++) {
+      for (let c1 = 0; c1 < counts[1]!; c1++) {
+        for (let c2 = 0; c2 < (counts[2] ?? 1); c2++) {
+          yield await this.readDiskChunk([c0, c1, c2]);
+        }
+      }
+    }
+  }
+}
+
+/** Open a Zarr array at `path` as a single-level {@link VolumeSource}. */
+export async function openZarrArray(
+  store: Store,
+  path = "",
+  options: OpenZarrArrayOptions = {},
+): Promise<VolumeSource> {
+  const meta = await readArrayMeta(store, path);
+  if (meta.shape.length !== 3) {
+    throw new Error(`openZarrArray: expected 3D array, got shape [${meta.shape}]`);
+  }
+  return new ZarrArraySource(store, meta, options);
+}
+
+/** Estimate `[min,max]` by scanning all chunks (ok for coarse LOD). */
+export async function estimateValueRange(source: VolumeSource, level = 0): Promise<[number, number]> {
+  let min = Infinity;
+  let max = -Infinity;
+  for await (const chunk of source.chunks(level)) {
+    const view = chunk.data as unknown as ArrayLike<number>;
+    const n = view.length;
+    for (let i = 0; i < n; i++) {
+      const v = view[i]!;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 1];
+  if (min === max) return [min, min + 1];
+  return [min, max];
+}

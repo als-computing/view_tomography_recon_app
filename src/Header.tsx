@@ -9,6 +9,8 @@ import {
   getTiledBaseUrl,
   TILED_PROCESSED_PATH,
 } from './utils';
+import type { RendererKind } from './stores/useTabsStore';
+import { webGpuAvailability } from './WebGpuNative/WebGpuNative';
 
 export interface HeaderProps {
   logoUrl: string;
@@ -24,9 +26,21 @@ export interface HeaderProps {
   onShare?: () => Promise<boolean> | boolean;
   /** Whether there's an active reconstruction to share (disables the button when false). */
   canShare?: boolean;
+  /** The app-wide volume renderer currently in use. */
+  renderer?: RendererKind;
+  /** Flip the app-wide volume renderer between itk and webgpu. */
+  onToggleRenderer?: () => void;
 }
 
-export const Header = ({ logoUrl, title, onSelect, onShare, canShare = false }: HeaderProps) => {
+export const Header = ({
+  logoUrl,
+  title,
+  onSelect,
+  onShare,
+  canShare = false,
+  renderer = 'itk',
+  onToggleRenderer,
+}: HeaderProps) => {
   const [selectedFolder, setSelectedFolder] = useState<string>('');
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -129,6 +143,21 @@ export const Header = ({ logoUrl, title, onSelect, onShare, canShare = false }: 
               title="Copy a link that reopens this scan at the current view"
             >
               {copied ? 'Copied!' : 'Share'}
+            </button>
+          )}
+          {onToggleRenderer && (
+            <button
+              type="button"
+              className="header-renderer-toggle"
+              onClick={onToggleRenderer}
+              disabled={!webGpuAvailability().ok}
+              title={
+                webGpuAvailability().ok
+                  ? 'Switch the volume renderer between ITK (itk-vtk) and WebGPU'
+                  : webGpuAvailability().reason
+              }
+            >
+              Renderer: {renderer === 'webgpu' ? 'WebGPU' : 'ITK'} ⇄
             </button>
           )}
         </div>

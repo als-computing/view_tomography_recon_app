@@ -5,7 +5,9 @@ import reactHooks from 'eslint-plugin-react-hooks'
 import reactRefresh from 'eslint-plugin-react-refresh'
 
 export default [
-  { ignores: ['dist'] },
+  // Ignore build output — including the vendored WebGPU renderer's own standalone build under
+  // src/zarr-viewer/ (its source is TypeScript and isn't linted here anyway).
+  { ignores: ['dist', '**/dist', 'src/zarr-viewer/node_modules'] },
   {
     files: ['**/*.{js,jsx}'],
     languageOptions: {

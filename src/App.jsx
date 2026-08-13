@@ -20,6 +20,7 @@ import { getDefaultZarrFileUrl, getTiledBaseUrl, TILED_PROCESSED_PATH } from './
 import { installTiledTokenBridge } from './tiledTokenBridge';
 import { installTiledFetchInterceptor } from './ItkVtkNative/tiledAuth';
 import ItkVktNative from './ItkVtkNative/ItkVtkNative';
+import WebGpuNative from './WebGpuNative/WebGpuNative';
 import { TiledNotifications } from './TiledNotifications';
 import { TabBar } from './TabBar';
 import { useTabsStore } from './stores/useTabsStore';
@@ -52,6 +53,8 @@ function App() {
   const setLinkCamera = useTabsStore((s) => s.setLinkCamera);
   const setLinkRendering = useTabsStore((s) => s.setLinkRendering);
   const setLinkCropping = useTabsStore((s) => s.setLinkCropping);
+  const renderer = useTabsStore((s) => s.renderer);
+  const toggleRenderer = useTabsStore((s) => s.toggleRenderer);
 
   const hasLeft = useMemo(() => tabs.some((t) => t.pane === 'left'), [tabs]);
   const hasRight = useMemo(() => tabs.some((t) => t.pane === 'right'), [tabs]);
@@ -167,6 +170,8 @@ function App() {
         onSelect={openTab}
         onShare={handleShare}
         canShare={!!shareTargetId}
+        renderer={renderer}
+        onToggleRenderer={toggleRenderer}
       />
       <TabBar
         tabs={tabs}
@@ -186,7 +191,11 @@ function App() {
               className="viewer-pane"
               style={{ flexDirection: 'column', display: 'flex', ...paneStyle(t.id) }}
             >
-              <ItkVktNative dataUrl={t.url} onReady={(instance) => handleReady(t.id, instance)} />
+              {renderer === 'webgpu' ? (
+                <WebGpuNative dataUrl={t.url} />
+              ) : (
+                <ItkVktNative dataUrl={t.url} onReady={(instance) => handleReady(t.id, instance)} />
+              )}
             </div>
           ))}
         {isSplit && <div className="viewer-divider" />}
