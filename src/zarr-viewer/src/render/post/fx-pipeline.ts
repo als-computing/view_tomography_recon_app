@@ -24,11 +24,22 @@ export class FxPipeline {
   readonly #ctx: GpuContext;
   readonly #graph: RenderGraph;
   #stack: PostStack;
+  /**
+   * Fraction of the swapchain resolution the volume + post chain runs at (1 = full). Lower values
+   * (e.g. 0.5) quarter the per-pixel shadow/AO marching cost; the final post pass bilinearly
+   * upscales the result to the full-res swapchain.
+   */
+  #renderScale = 1;
 
   public constructor(ctx: GpuContext) {
     this.#ctx = ctx;
     this.#graph = new RenderGraph(ctx.device);
     this.#stack = new PostStack([]);
+  }
+
+  /** Set the internal render resolution as a fraction (0, 1] of the swapchain size. */
+  public setRenderScale(scale: number): void {
+    this.#renderScale = Math.min(1, Math.max(0.1, scale));
   }
 
   /**
@@ -53,9 +64,12 @@ export class FxPipeline {
     const { canvasContext, canvas, format } = this.#ctx;
     const w = Math.max(1, canvas.width);
     const h = Math.max(1, canvas.height);
+    // Internal render size (volume + post chain). The final post pass upscales to the full swapchain.
+    const rw = Math.max(1, Math.round(w * this.#renderScale));
+    const rh = Math.max(1, Math.round(h * this.#renderScale));
     const graph = this.#graph.reset();
 
-    const hdr = graph.createTexture({ size: [w, h, 1], format: HDR_FORMAT, usage: HDR_USAGE });
+    const hdr = graph.createTexture({ size: [rw, rh, 1], format: HDR_FORMAT, usage: HDR_USAGE });
     graph.addPass({
       name: "volume",
       writes: [hdr],
@@ -77,7 +91,7 @@ export class FxPipeline {
     });
 
     const out = graph.importTexture(canvasContext.getCurrentTexture(), "swap", format);
-    this.#stack.build(graph, hdr, { size: [w, h, 1], format: HDR_FORMAT, output: out });
+    this.#stack.build(graph, hdr, { size: [rw, rh, 1], format: HDR_FORMAT, output: out });
     graph.execute();
   }
 

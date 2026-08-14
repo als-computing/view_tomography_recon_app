@@ -29,6 +29,9 @@ import {
   OpacityCurveEditor,
   DEFAULT_OPACITY_POINTS,
   colorMapNames,
+  makeDirectionalLight,
+  makeSpotLight,
+  type GpuLight,
   type ColorMapName,
   type OpacityPoint,
   type VolumeBlendMode,
@@ -50,7 +53,7 @@ import { FxPipeline } from "./render/post/fx-pipeline.js";
 
 const DEFAULT_ZARR = "/datasets/petiole.zarr";
 
-type PanelId = "data" | "tf" | "render" | "slices" | "crop" | "measure" | "postfx";
+type PanelId = "data" | "tf" | "render" | "slices" | "crop" | "measure" | "postfx" | "lighting";
 
 /** Change events emitted by a {@link WebGpuViewerInstance}. */
 export type WebGpuViewerEvent = "cameraChange" | "renderingChange" | "croppingChange";
@@ -92,6 +95,28 @@ export interface WebGpuRenderingState {
   fxSharpenAmount: number;
   fxVignette: boolean;
   fxVignetteAmount: number;
+  // Lighting: per-mode on/off + color (sRGB hex) + intensity, shading params, shadows, AO, half-res.
+  lightGlobalOn: boolean;
+  lightGlobalColor: string;
+  lightGlobalIntensity: number;
+  lightAzimuth: number;
+  lightElevation: number;
+  lightFlashOn: boolean;
+  lightFlashColor: string;
+  lightFlashIntensity: number;
+  lightStageOn: boolean;
+  lightStageColor: string;
+  lightStageIntensity: number;
+  lightAmbient: number;
+  lightSpecular: number;
+  lightRoughness: number;
+  shadowOn: boolean;
+  shadowQuality: number;
+  shadowStrength: number;
+  aoOn: boolean;
+  aoRadius: number;
+  aoIntensity: number;
+  halfRes: boolean;
 }
 
 /** The ROI crop box plus the slice planes (positions, per-axis enables, overlay visibility). */
@@ -208,6 +233,29 @@ export async function run(
   let fxSharpenAmount = 0.5;
   let fxVignette = false;
   let fxVignetteAmount = 0.4;
+  // Lighting state. Defaults preserve today's look: one warm global directional; flashlight / stage /
+  // shadows / AO off, full-res. The light set is rebuilt per frame from the camera basis.
+  let lightGlobalOn = true;
+  let lightGlobalColor = "#fff2e0";
+  let lightGlobalIntensity = 1;
+  let lightAzimuth = 38; // degrees
+  let lightElevation = 56; // degrees
+  let lightFlashOn = false;
+  let lightFlashColor = "#ffffff";
+  let lightFlashIntensity = 1.2;
+  let lightStageOn = false;
+  let lightStageColor = "#cfe0ff";
+  let lightStageIntensity = 0.6;
+  let lightAmbient = 0.22;
+  let lightSpecular = 0.4;
+  let lightRoughness = 0.6;
+  let shadowOn = false;
+  let shadowQuality = 24;
+  let shadowStrength = 0.85;
+  let aoOn = false;
+  let aoRadius = 0.08;
+  let aoIntensity = 0.7;
+  let halfRes = false;
   let sliceX = 0.5;
   let sliceY = 0.5;
   let sliceZ = 0.5;
@@ -253,6 +301,27 @@ export async function run(
     fxSharpenAmount,
     fxVignette,
     fxVignetteAmount,
+    lightGlobalOn,
+    lightGlobalColor,
+    lightGlobalIntensity,
+    lightAzimuth,
+    lightElevation,
+    lightFlashOn,
+    lightFlashColor,
+    lightFlashIntensity,
+    lightStageOn,
+    lightStageColor,
+    lightStageIntensity,
+    lightAmbient,
+    lightSpecular,
+    lightRoughness,
+    shadowOn,
+    shadowQuality,
+    shadowStrength,
+    aoOn,
+    aoRadius,
+    aoIntensity,
+    halfRes,
   });
   const readCropping = (): WebGpuCroppingState => ({
     cropMin: [cropMin[0], cropMin[1], cropMin[2]],
@@ -350,6 +419,97 @@ export async function run(
     fxPipeline.setStack(effects);
   };
   rebuildFxStack();
+
+  // sRGB hex (from <input type="color">) → linear RGB for the HDR shading path.
+  const srgbToLinear = (c: number): number =>
+    c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  const hexToLinearRgb = (hex: string): [number, number, number] => {
+    const h = hex.replace("#", "");
+    return [
+      srgbToLinear(parseInt(h.slice(0, 2), 16) / 255),
+      srgbToLinear(parseInt(h.slice(2, 4), 16) / 255),
+      srgbToLinear(parseInt(h.slice(4, 6), 16) / 255),
+    ];
+  };
+
+  // Push the (non-per-frame) lighting params to the renderer + set the half-res lever. Called on any
+  // Lighting-panel change; the light *positions* themselves are rebuilt per frame (below).
+  const applyLighting = (): void => {
+    volumeRenderer.setLightingParams({
+      masterAmbient: lightAmbient,
+      specStrength: lightSpecular,
+      roughness: lightRoughness,
+      shadowEnable: shadowOn,
+      shadowSteps: shadowQuality,
+      shadowStrength,
+      aoEnable: aoOn,
+      aoRadius,
+      aoIntensity,
+      aoSamples: 6,
+    });
+    fxPipeline.setRenderScale(halfRes ? 0.5 : 1);
+  };
+
+  // Rebuild the GPU light list from the enabled modes + the camera basis. Global is a fixed-direction
+  // directional (also drives the studio env); flashlight is a spot at the eye aimed at the sample;
+  // stage lights are four spots pinned to the screen corners aiming inward for even fill.
+  const buildFrameLights = (
+    eye: { x: number; y: number; z: number },
+    right: readonly [number, number, number],
+    up: readonly [number, number, number],
+    fwd: readonly [number, number, number],
+    extent: number,
+  ): GpuLight[] => {
+    const lights: GpuLight[] = [];
+    if (lightGlobalOn) {
+      const el = (lightElevation * Math.PI) / 180;
+      const az = (lightAzimuth * Math.PI) / 180;
+      const dir: [number, number, number] = [
+        Math.cos(el) * Math.cos(az),
+        Math.sin(el),
+        Math.cos(el) * Math.sin(az),
+      ];
+      lights.push(makeDirectionalLight(dir, hexToLinearRgb(lightGlobalColor), lightGlobalIntensity));
+    }
+    if (lightFlashOn) {
+      lights.push(
+        makeSpotLight(
+          [eye.x, eye.y, eye.z],
+          [-eye.x, -eye.y, -eye.z],
+          hexToLinearRgb(lightFlashColor),
+          lightFlashIntensity,
+          { range: extent * 6, innerConeAngle: Math.PI * 0.28, outerConeAngle: Math.PI * 0.44 },
+        ),
+      );
+    }
+    if (lightStageOn) {
+      const d = extent * 2.2; // in front of the eye along the view axis
+      const k = extent * 1.7; // corner spread
+      const col = hexToLinearRgb(lightStageColor);
+      const corners: [number, number][] = [
+        [-1, -1],
+        [1, -1],
+        [-1, 1],
+        [1, 1],
+      ];
+      for (const [sx, sy] of corners) {
+        const pos: [number, number, number] = [
+          eye.x + fwd[0] * d + right[0] * k * sx + up[0] * k * sy,
+          eye.y + fwd[1] * d + right[1] * k * sx + up[1] * k * sy,
+          eye.z + fwd[2] * d + right[2] * k * sx + up[2] * k * sy,
+        ];
+        lights.push(
+          makeSpotLight(pos, [-pos[0], -pos[1], -pos[2]], col, lightStageIntensity, {
+            range: extent * 8,
+            innerConeAngle: Math.PI * 0.34,
+            outerConeAngle: Math.PI * 0.48,
+          }),
+        );
+      }
+    }
+    return lights;
+  };
+  applyLighting();
 
   const scene = new Scene();
   const camera = new Node("Camera");
@@ -718,6 +878,10 @@ export async function run(
     return Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
   }
 
+  const colorRow = (id: string, label: string, value: string): string =>
+    `<label class="whud__row" style="font-size:11px;align-items:center;gap:8px">${label} ` +
+    `<input type="color" data-color="${id}" value="${value}" style="width:32px;height:20px;padding:0;border:none;background:none;cursor:pointer"/></label>`;
+
   // Dual-thumb [lo, hi] range slider. `group` scopes the pair (e.g. "color", "cropX") so one delegated
   // input handler drives every range: two overlaid range inputs, a visual track/fill, and a value label.
   const rangeSlider = (
@@ -885,6 +1049,34 @@ export async function run(
       slider("fxVignetteAmount", "Vignette amount", fxVignetteAmount, 0, 1, 0.02),
     ].join("");
 
+    // Lighting section — three modes (global / camera flashlight / 4-corner stage) each with color +
+    // intensity, shared shading params, volumetric shadows, ambient occlusion, and a half-res lever.
+    const lightingBody = [
+      `<label class="whud__check"><input type="checkbox" data-chk="lightGlobalOn" ${lightGlobalOn ? "checked" : ""}/> Global directional</label>`,
+      colorRow("lightGlobalColor", "Color", lightGlobalColor),
+      slider("lightGlobalIntensity", "Intensity", lightGlobalIntensity, 0, 4, 0.05),
+      slider("lightAzimuth", "Azimuth°", lightAzimuth, 0, 360, 1),
+      slider("lightElevation", "Elevation°", lightElevation, -90, 90, 1),
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightFlashOn" ${lightFlashOn ? "checked" : ""}/> Camera flashlight</label>`,
+      colorRow("lightFlashColor", "Color", lightFlashColor),
+      slider("lightFlashIntensity", "Intensity", lightFlashIntensity, 0, 4, 0.05),
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightStageOn" ${lightStageOn ? "checked" : ""}/> Stage lights (4 corners)</label>`,
+      colorRow("lightStageColor", "Color", lightStageColor),
+      slider("lightStageIntensity", "Intensity", lightStageIntensity, 0, 4, 0.05),
+      `<div class="whud__hint" style="margin-top:6px">Shading</div>`,
+      slider("lightAmbient", "Ambient", lightAmbient, 0, 1, 0.01),
+      slider("lightSpecular", "Specular", lightSpecular, 0, 2, 0.05),
+      slider("lightRoughness", "Roughness", lightRoughness, 0, 1, 0.02),
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="shadowOn" ${shadowOn ? "checked" : ""}/> Shadows</label>`,
+      slider("shadowQuality", "Shadow steps", shadowQuality, 4, 64, 1),
+      slider("shadowStrength", "Shadow strength", shadowStrength, 0, 1, 0.02),
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="aoOn" ${aoOn ? "checked" : ""}/> Ambient occlusion</label>`,
+      slider("aoRadius", "AO radius", aoRadius, 0.01, 0.3, 0.01),
+      slider("aoIntensity", "AO intensity", aoIntensity, 0, 1, 0.02),
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${halfRes ? "checked" : ""}/> Half resolution</label>`,
+      `<div class="whud__hint">Shadows + AO cast secondary rays per sample. Enable half-res on large volumes to keep it interactive.</div>`,
+    ].join("");
+
     ui.innerHTML = [
       `<div class="whud__header">` +
         `<span class="whud__title">OME-Zarr viewer</span>` +
@@ -896,6 +1088,7 @@ export async function run(
       section("data", "Data", dataBody),
       section("tf", "Transfer Function", tfBody),
       section("render", "Render", renderBody),
+      section("lighting", "Lighting", lightingBody),
       section("slices", "Slices", slicesBody),
       section("crop", "Crop", cropBody),
       section("measure", "Measure", measureBody),
@@ -1018,6 +1211,21 @@ export async function run(
     "fxSharpenAmount",
     "fxVignetteAmount",
   ]);
+  // Lighting sliders: set the closure var, push params (applyLighting), and emit for links / share.
+  const LIGHTING_SLIDERS = new Set([
+    "lightGlobalIntensity",
+    "lightAzimuth",
+    "lightElevation",
+    "lightFlashIntensity",
+    "lightStageIntensity",
+    "lightAmbient",
+    "lightSpecular",
+    "lightRoughness",
+    "shadowQuality",
+    "shadowStrength",
+    "aoRadius",
+    "aoIntensity",
+  ]);
 
   ui.addEventListener("input", (e) => {
     const t = e.target as HTMLInputElement;
@@ -1047,8 +1255,34 @@ export async function run(
         emitRendering();
         return;
       }
+      if (
+        t.dataset.chk === "lightGlobalOn" ||
+        t.dataset.chk === "lightFlashOn" ||
+        t.dataset.chk === "lightStageOn" ||
+        t.dataset.chk === "shadowOn" ||
+        t.dataset.chk === "aoOn" ||
+        t.dataset.chk === "halfRes"
+      ) {
+        if (t.dataset.chk === "lightGlobalOn") lightGlobalOn = on;
+        else if (t.dataset.chk === "lightFlashOn") lightFlashOn = on;
+        else if (t.dataset.chk === "lightStageOn") lightStageOn = on;
+        else if (t.dataset.chk === "shadowOn") shadowOn = on;
+        else if (t.dataset.chk === "aoOn") aoOn = on;
+        else if (t.dataset.chk === "halfRes") halfRes = on;
+        applyLighting();
+        emitRendering();
+        return;
+      }
       applyRender();
       emitCropping();
+      return;
+    }
+    if (t.dataset.color) {
+      const cid = t.dataset.color;
+      if (cid === "lightGlobalColor") lightGlobalColor = t.value;
+      else if (cid === "lightFlashColor") lightFlashColor = t.value;
+      else if (cid === "lightStageColor") lightStageColor = t.value;
+      emitRendering();
       return;
     }
     if (t.dataset.range) {
@@ -1177,12 +1411,56 @@ export async function run(
         fxVignetteAmount = v;
         rebuildFxStack();
         break;
+      case "lightGlobalIntensity":
+        lightGlobalIntensity = v;
+        break;
+      case "lightAzimuth":
+        lightAzimuth = v;
+        break;
+      case "lightElevation":
+        lightElevation = v;
+        break;
+      case "lightFlashIntensity":
+        lightFlashIntensity = v;
+        break;
+      case "lightStageIntensity":
+        lightStageIntensity = v;
+        break;
+      case "lightAmbient":
+        lightAmbient = v;
+        applyLighting();
+        break;
+      case "lightSpecular":
+        lightSpecular = v;
+        applyLighting();
+        break;
+      case "lightRoughness":
+        lightRoughness = v;
+        applyLighting();
+        break;
+      case "shadowQuality":
+        shadowQuality = v;
+        applyLighting();
+        break;
+      case "shadowStrength":
+        shadowStrength = v;
+        applyLighting();
+        break;
+      case "aoRadius":
+        aoRadius = v;
+        applyLighting();
+        break;
+      case "aoIntensity":
+        aoIntensity = v;
+        applyLighting();
+        break;
       default:
         break;
     }
     if (RENDERING_SLIDERS.has(id)) emitRendering();
     else if (CROPPING_SLIDERS.has(id)) emitCropping();
     else if (FX_SLIDERS.has(id)) emitRendering();
+    else if (LIGHTING_SLIDERS.has(id)) emitRendering();
   });
 
   // Ctrl/Meta+click or pick-mode click → feature pick (Shift left free for pan).
@@ -1371,6 +1649,19 @@ export async function run(
     view.copy(camera.worldMatrix()).invert();
     viewProj.multiplyMatrices(proj, view);
     lastViewProj.copy(viewProj);
+    // Rebuild the procedural light set from the camera basis so flashlight / stage lights track the
+    // view. Global stays fixed-direction. Must run before recordInto (uploads the light buffer).
+    const rL = Math.hypot(wm[0]!, wm[1]!, wm[2]!) || 1;
+    const uL = Math.hypot(wm[4]!, wm[5]!, wm[6]!) || 1;
+    volumeRenderer.setLights(
+      buildFrameLights(
+        camera.position,
+        [wm[0]! / rL, wm[1]! / rL, wm[2]! / rL],
+        [wm[4]! / uL, wm[5]! / uL, wm[6]! / uL],
+        [fx, fy, fz],
+        extent,
+      ),
+    );
     // Volume → linear HDR, then the post stack to the swapchain (one encoder / one submit). The DOM
     // overlay (gizmo + scale bar) draws to a separate canvas and is unaffected.
     fxPipeline.render({ r: 0.015, g: 0.02, b: 0.035, a: 1 }, (pass) => {
@@ -1441,9 +1732,32 @@ export async function run(
       fxSharpenAmount = state.fxSharpenAmount ?? fxSharpenAmount;
       fxVignette = state.fxVignette ?? fxVignette;
       fxVignetteAmount = state.fxVignetteAmount ?? fxVignetteAmount;
+      // Lighting fields are optional on the wire (older peers/links may omit them); fall back.
+      lightGlobalOn = state.lightGlobalOn ?? lightGlobalOn;
+      lightGlobalColor = state.lightGlobalColor ?? lightGlobalColor;
+      lightGlobalIntensity = state.lightGlobalIntensity ?? lightGlobalIntensity;
+      lightAzimuth = state.lightAzimuth ?? lightAzimuth;
+      lightElevation = state.lightElevation ?? lightElevation;
+      lightFlashOn = state.lightFlashOn ?? lightFlashOn;
+      lightFlashColor = state.lightFlashColor ?? lightFlashColor;
+      lightFlashIntensity = state.lightFlashIntensity ?? lightFlashIntensity;
+      lightStageOn = state.lightStageOn ?? lightStageOn;
+      lightStageColor = state.lightStageColor ?? lightStageColor;
+      lightStageIntensity = state.lightStageIntensity ?? lightStageIntensity;
+      lightAmbient = state.lightAmbient ?? lightAmbient;
+      lightSpecular = state.lightSpecular ?? lightSpecular;
+      lightRoughness = state.lightRoughness ?? lightRoughness;
+      shadowOn = state.shadowOn ?? shadowOn;
+      shadowQuality = state.shadowQuality ?? shadowQuality;
+      shadowStrength = state.shadowStrength ?? shadowStrength;
+      aoOn = state.aoOn ?? aoOn;
+      aoRadius = state.aoRadius ?? aoRadius;
+      aoIntensity = state.aoIntensity ?? aoIntensity;
+      halfRes = state.halfRes ?? halfRes;
       applyTf();
       applyRender();
       rebuildFxStack();
+      applyLighting();
       renderUi();
     },
     getCropping: readCropping,

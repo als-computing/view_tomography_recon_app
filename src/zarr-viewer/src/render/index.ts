@@ -44,3 +44,27 @@ export type {
   PassDesc,
   CompiledGraph,
 } from "./graph/render-graph.js";
+
+export {
+  MAX_LIGHTS,
+  GPU_LIGHT_STRIDE_BYTES,
+  GpuLightKind,
+  DEFAULT_POINT_RANGE,
+  DEFAULT_SPOT_INNER,
+  DEFAULT_SPOT_OUTER,
+  makeDirectionalLight,
+  makePointLight,
+  makeSpotLight,
+  makeRectLight,
+  distanceAttenuation,
+  spotAttenuation,
+  keyDirectionalFromLights,
+  packLightsStd430,
+  lightBufferByteSize,
+  LightingEnvironment,
+  BRDF_WGSL,
+  LIGHT_STRUCT_WGSL,
+  LIGHT_EVAL_WGSL,
+  LIGHTS_WGSL,
+} from "./lighting/index.js";
+export type { GpuLight, GpuLightKindCode } from "./lighting/index.js";

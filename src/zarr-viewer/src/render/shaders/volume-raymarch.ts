@@ -7,8 +7,10 @@
  * @packageDocumentation
  */
 
-/** Byte size of the volume frame uniform block (mat4 + 11 × vec4). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 240;
+import { LIGHT_STRUCT_WGSL } from "./lights.js";
+
+/** Byte size of the volume frame uniform block (mat4 + 14 × vec4). */
+export const VOLUME_FRAME_UNIFORM_SIZE = 288;
 
 /** High-quality volume ray-march WGSL (vertex + fragment). */
 export const VOLUME_RAYMARCH_WGSL = /* wgsl */ `
@@ -24,16 +26,22 @@ struct Frame {
   cropMax: vec4<f32>,        // xyz = crop max in uvw [0,1]
   slices: vec4<f32>,         // xyz = slice positions in uvw [0,1], w = packed flags
   liquid: vec4<f32>,         // x = ior, y = roughness, z = envIntensity, w = absorptionScale
-  composite: vec4<f32>,      // x = alphaComposite (1 = transparent miss), yzw unused
+  composite: vec4<f32>,      // x = alphaComposite (1 = transparent miss), y = linear-HDR out
+  lightCtl0: vec4<f32>,      // x = numLights, y = masterAmbient, z = specStrength, w = roughness
+  lightCtl1: vec4<f32>,      // x = shadowEnable, y = shadowSteps, z = shadowStrength, w = shadowSoftness
+  lightCtl2: vec4<f32>,      // x = aoEnable, y = aoRadius (uvw frac), z = aoIntensity, w = aoSamples
 };
 
 // slices.w bits: 1=xEn, 2=yEn, 4=zEn, 8=showPlanes, 16/32 = viewMode (0 vol, 1 x, 2 y, 3 z) in bits 4-5
+
+${LIGHT_STRUCT_WGSL}
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var volumeTex: texture_3d<f32>;
 @group(0) @binding(2) var volumeSampler: sampler;
 @group(0) @binding(3) var tfTex: texture_2d<f32>;
 @group(0) @binding(4) var tfSampler: sampler;
+@group(0) @binding(5) var<storage, read> lights: array<Light>;
 
 struct VSOut {
   @builtin(position) clip: vec4<f32>,
@@ -113,25 +121,118 @@ fn envRadiance(dir: vec3<f32>) -> vec3<f32> {
   return mix(ground, sky, hemi) * max(frame.liquid.z, 0.2);
 }
 
-fn shadeSample(base: vec3<f32>, grad: vec3<f32>, viewDir: vec3<f32>, density: f32, lighting: f32) -> vec3<f32> {
+// Gentle smooth-cutoff attenuation (no harsh 1/r²) so stage/flashlight coverage stays even.
+fn volAttenuation(dist: f32, range: f32) -> f32 {
+  if (range <= 0.0) { return 1.0; } // directional: no distance falloff
+  let x = clamp(1.0 - (dist / max(range, 1e-3)) * (dist / max(range, 1e-3)), 0.0, 1.0);
+  return x * x;
+}
+
+// Secondary shadow ray: march from the sample toward the light through the volume, accumulating
+// optical depth, and return transmittance T = exp(-tau). ldir points toward the light (world).
+fn shadowTransmittance(pWorld: vec3<f32>, ldir: vec3<f32>, densityScale: f32) -> f32 {
+  let steps = i32(frame.lightCtl1.y);
+  if (steps <= 0) { return 1.0; }
+  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
+  let ext = max(halfExt.x, max(halfExt.y, halfExt.z));
+  let sStep = (2.0 * ext) / f32(steps);
+  var tau = 0.0;
+  // Offset the start slightly along the light dir to avoid self-shadowing acne.
+  var wp = pWorld + ldir * sStep * 1.5;
+  for (var s = 0; s < steps; s++) {
+    let uvw = (wp + halfExt) / (2.0 * halfExt);
+    if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) { break; }
+    if (inCrop(uvw)) {
+      let a = sampleTf(sampleDensity(uvw)).a;
+      tau += a * densityScale * 12.0 * sStep;
+      if (tau > 8.0) { break; }
+    }
+    wp += ldir * sStep;
+  }
+  let T = exp(-tau);
+  return mix(1.0, T, clamp(frame.lightCtl1.z, 0.0, 1.0));
+}
+
+// Volumetric ambient occlusion: sample density outward along the surface normal; more material
+// above a sample = more occluded (darker ambient).
+fn ambientOcclusion(pWorld: vec3<f32>, n: vec3<f32>) -> f32 {
+  let samples = i32(frame.lightCtl2.w);
+  if (samples <= 0) { return 0.0; }
+  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
+  let ext = max(halfExt.x, max(halfExt.y, halfExt.z));
+  let radius = max(frame.lightCtl2.y, 1e-3) * ext;
+  let stepW = radius / f32(samples);
+  var occ = 0.0;
+  for (var s = 1; s <= samples; s++) {
+    let wp = pWorld + n * stepW * f32(s);
+    let uvw = (wp + halfExt) / (2.0 * halfExt);
+    if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) { break; }
+    occ += sampleTf(sampleDensity(uvw)).a / f32(samples);
+  }
+  return clamp(occ, 0.0, 1.0);
+}
+
+fn shadeSample(
+  base: vec3<f32>,
+  grad: vec3<f32>,
+  viewDir: vec3<f32>,
+  pWorld: vec3<f32>,
+  density: f32,
+  lighting: f32,
+  densityScale: f32,
+) -> vec3<f32> {
   let gLen = length(grad);
   var n = vec3<f32>(0.0, 1.0, 0.0);
   if (gLen > 1e-5) {
     n = normalize(grad);
     if (dot(n, viewDir) < 0.0) { n = -n; }
   }
-  let L = normalize(frame.light.xyz);
-  let H = normalize(L + viewDir);
-  let ndotl = max(dot(n, L), 0.0);
-  let ndoth = max(dot(n, H), 0.0);
-  let ambient = frame.light.w;
-  let diffuse = ndotl;
-  let spec = pow(ndoth, max(frame.shade.w, 1.0)) * smoothstep(0.05, 0.25, density);
-  let rim = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0) * 0.35;
-  let lightCol = frame.shade.xyz;
-  let lit = base * (ambient + diffuse * lightCol) + lightCol * spec * 0.45 + base * rim;
+
+  let numLights = i32(frame.lightCtl0.x);
+  let masterAmbient = frame.lightCtl0.y;
+  let specStrength = frame.lightCtl0.z;
+  // roughness (0 = mirror-sharp) → Blinn-Phong exponent.
+  let shininess = mix(256.0, 8.0, clamp(frame.lightCtl0.w, 0.0, 1.0));
+  let shadowOn = frame.lightCtl1.x > 0.5;
+  let aoOn = frame.lightCtl2.x > 0.5;
+
+  var ao = 0.0;
+  if (aoOn) { ao = ambientOcclusion(pWorld, n) * clamp(frame.lightCtl2.z, 0.0, 1.0); }
+  let ambientTerm = base * masterAmbient * (1.0 - ao);
+
+  var diffuseSpec = vec3<f32>(0.0);
+  for (var i = 0; i < numLights; i++) {
+    let Lgt = lights[i];
+    let kind = i32(Lgt.positionKind.w + 0.5);
+    var ldir: vec3<f32>;
+    var att = 1.0;
+    if (kind == 0) {
+      ldir = normalize(Lgt.directionRange.xyz);
+    } else {
+      let toL = Lgt.positionKind.xyz - pWorld;
+      let dist = length(toL);
+      ldir = toL / max(dist, 1e-4);
+      att = volAttenuation(dist, Lgt.directionRange.w);
+      if (kind == 2) {
+        let cosT = dot(-ldir, normalize(Lgt.directionRange.xyz));
+        att *= smoothstep(Lgt.spotRect.y, Lgt.spotRect.x, cosT);
+      }
+    }
+    if (att <= 0.0) { continue; }
+    let radiance = Lgt.colorIntensity.xyz * Lgt.colorIntensity.w * att;
+    var shadow = 1.0;
+    if (shadowOn) { shadow = shadowTransmittance(pWorld, ldir, densityScale); }
+    let ndotl = max(dot(n, ldir), 0.0);
+    let H = normalize(ldir + viewDir);
+    let ndoth = max(dot(n, H), 0.0);
+    let spec = pow(ndoth, shininess) * specStrength * smoothstep(0.05, 0.25, density);
+    diffuseSpec += (base * ndotl + spec) * radiance * shadow;
+  }
+
+  let rim = base * pow(1.0 - max(dot(n, viewDir), 0.0), 3.0) * 0.25;
+  let lit = ambientTerm + diffuseSpec + rim;
   let edge = smoothstep(0.02, 0.35, gLen);
-  let shaded = mix(base * (ambient + 0.15), lit, clamp(0.35 + edge * 0.65, 0.0, 1.0));
+  let shaded = mix(base * masterAmbient, lit, clamp(0.35 + edge * 0.65, 0.0, 1.0));
   return mix(base, shaded, clamp(lighting, 0.0, 1.0));
 }
 
@@ -354,7 +455,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         if (dielectric) {
           lit = shadeDielectric(src.rgb, src.a, grad, viewDir, rd, density);
         } else {
-          lit = shadeSample(src.rgb, grad, viewDir, density, lighting);
+          lit = shadeSample(src.rgb, grad, viewDir, p, density, lighting, densityScale);
         }
         lit = mix(lit, vec3<f32>(0.95, 0.85, 0.35), planeH * 0.65);
         let a = clamp(alpha, 0.0, 1.0);

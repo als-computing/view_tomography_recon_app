@@ -18,6 +18,7 @@ import {
   VOLUME_FRAME_UNIFORM_SIZE,
   VOLUME_RAYMARCH_WGSL,
 } from "../shaders/volume-raymarch.js";
+import { LightingEnvironment, type GpuLight } from "../lighting/index.js";
 
 /** Volume blend / compositing mode (itk-vtk `setImageBlendMode`). */
 export type VolumeBlendMode = "composite" | "mip" | "minip" | "average";
@@ -126,6 +127,23 @@ export class VolumeRenderer implements Disposable {
   private viewMode: VolumeViewMode = "volume";
   private frameIndex = 0;
 
+  // Multi-light shading (prism lighting library). The light list is rebuilt per frame by the viewer
+  // (global / camera flashlight / stage) and uploaded to this storage buffer; the control params
+  // below drive the shader's shadow-ray and ambient-occlusion marching.
+  private lightEnv: LightingEnvironment | undefined;
+  private numLights = 0;
+  private masterAmbient = 0.22;
+  private specStrength = 0.4;
+  private roughnessL = 0.6;
+  private shadowEnable = false;
+  private shadowSteps = 24;
+  private shadowStrength = 0.85;
+  private shadowSoftness = 0;
+  private aoEnable = false;
+  private aoRadius = 0.08;
+  private aoIntensity = 0.7;
+  private aoSamples = 6;
+
   private pipeline: GPURenderPipeline | undefined;
   private frameUniform: ManagedBuffer | undefined;
   private bindGroup: GPUBindGroup | undefined;
@@ -164,6 +182,10 @@ export class VolumeRenderer implements Disposable {
     this.gradientOpacity = options.gradientOpacity ?? 0;
     this.gradientOpacityScale = options.gradientOpacityScale ?? 0.15;
     this.lightingStrength = options.lightingStrength ?? 1;
+    this.masterAmbient = this.ambient;
+    // Storage buffer of packed lights (bound at binding 5). Small capacity: this viewer uses at most
+    // ~6 procedural lights (1 global + 1 flashlight + 4 stage).
+    this.lightEnv = new LightingEnvironment(ctx.device, 16);
     if (options.liquidShading) this.setLiquidShading(options.liquidShading);
   }
 
@@ -213,6 +235,43 @@ export class VolumeRenderer implements Disposable {
     if (params.absorptionScale !== undefined) {
       this.liquidAbsorptionScale = Math.max(0.05, params.absorptionScale);
     }
+  }
+
+  /**
+   * Replace the light list (uploaded to the GPU storage buffer). Rebuilt each frame by the viewer
+   * from the enabled lighting modes + camera basis. The first directional light also drives the
+   * procedural studio environment (`envRadiance`/`background`).
+   */
+  public setLights(lights: readonly GpuLight[]): void {
+    this.lightEnv!.setLights(lights);
+    this.numLights = this.lightEnv!.lightCount;
+  }
+
+  /** Shadow / AO / master-ambient / specular controls for the multi-light path. */
+  public setLightingParams(params: {
+    masterAmbient?: number;
+    specStrength?: number;
+    roughness?: number;
+    shadowEnable?: boolean;
+    shadowSteps?: number;
+    shadowStrength?: number;
+    shadowSoftness?: number;
+    aoEnable?: boolean;
+    aoRadius?: number;
+    aoIntensity?: number;
+    aoSamples?: number;
+  }): void {
+    if (params.masterAmbient !== undefined) this.masterAmbient = params.masterAmbient;
+    if (params.specStrength !== undefined) this.specStrength = params.specStrength;
+    if (params.roughness !== undefined) this.roughnessL = params.roughness;
+    if (params.shadowEnable !== undefined) this.shadowEnable = params.shadowEnable;
+    if (params.shadowSteps !== undefined) this.shadowSteps = Math.max(0, Math.round(params.shadowSteps));
+    if (params.shadowStrength !== undefined) this.shadowStrength = params.shadowStrength;
+    if (params.shadowSoftness !== undefined) this.shadowSoftness = params.shadowSoftness;
+    if (params.aoEnable !== undefined) this.aoEnable = params.aoEnable;
+    if (params.aoRadius !== undefined) this.aoRadius = params.aoRadius;
+    if (params.aoIntensity !== undefined) this.aoIntensity = params.aoIntensity;
+    if (params.aoSamples !== undefined) this.aoSamples = Math.max(0, Math.round(params.aoSamples));
   }
 
   public setBlendMode(mode: VolumeBlendMode): void {
@@ -345,10 +404,11 @@ export class VolumeRenderer implements Disposable {
     this.invViewProj.copy(viewProj);
     if (!this.invViewProj.invert()) return;
 
-    const lx = this.lightDirection[0];
-    const ly = this.lightDirection[1];
-    const lz = this.lightDirection[2];
-    const llen = Math.hypot(lx, ly, lz) || 1;
+    // Key light for the procedural studio env (background / dielectric): the first directional in
+    // the light list, or a sensible default when none is set.
+    const keyDir = this.lightEnv!.keyLightDirection;
+    const keyRad = this.lightEnv!.keyLightRadiance;
+    const klen = Math.hypot(keyDir[0], keyDir[1], keyDir[2]) || 1;
 
     let flags = 0;
     if (this.sliceEnableX) flags |= 1;
@@ -376,13 +436,13 @@ export class VolumeRenderer implements Disposable {
     const neededSteps = Math.ceil(diagonal / Math.max(this.stepSize, 5e-4)) + 8;
     d[22] = Math.min(this.maxSteps, neededSteps);
     d[23] = this.exposure;
-    d[24] = lx / llen;
-    d[25] = ly / llen;
-    d[26] = lz / llen;
-    d[27] = this.ambient;
-    d[28] = this.lightColor[0];
-    d[29] = this.lightColor[1];
-    d[30] = this.lightColor[2];
+    d[24] = keyDir[0] / klen;
+    d[25] = keyDir[1] / klen;
+    d[26] = keyDir[2] / klen;
+    d[27] = this.masterAmbient;
+    d[28] = keyRad[0];
+    d[29] = keyRad[1];
+    d[30] = keyRad[2];
     d[31] = this.specularPower;
     d[32] = this.boxHalf[0];
     d[33] = this.boxHalf[1];
@@ -412,6 +472,21 @@ export class VolumeRenderer implements Disposable {
     d[57] = this.linearOutput ? 1 : 0; // Frame.composite.y → linear-HDR output flag
     d[58] = 0;
     d[59] = 0;
+    // lightCtl0: numLights, masterAmbient, specStrength, roughness
+    d[60] = this.numLights;
+    d[61] = this.masterAmbient;
+    d[62] = this.specStrength;
+    d[63] = this.roughnessL;
+    // lightCtl1: shadowEnable, shadowSteps, shadowStrength, shadowSoftness
+    d[64] = this.shadowEnable ? 1 : 0;
+    d[65] = this.shadowSteps;
+    d[66] = this.shadowStrength;
+    d[67] = this.shadowSoftness;
+    // lightCtl2: aoEnable, aoRadius, aoIntensity, aoSamples
+    d[68] = this.aoEnable ? 1 : 0;
+    d[69] = this.aoRadius;
+    d[70] = this.aoIntensity;
+    d[71] = this.aoSamples;
     this.frameUniform!.write(d);
 
     pass.setPipeline(this.pipeline!);
@@ -422,8 +497,10 @@ export class VolumeRenderer implements Disposable {
   public dispose(): void {
     this.frameUniform?.dispose();
     this.tfTex?.dispose();
+    this.lightEnv?.dispose();
     this.frameUniform = undefined;
     this.tfTex = undefined;
+    this.lightEnv = undefined;
     this.volumeTex = undefined;
     this.pipeline = undefined;
     this.bindGroup = undefined;
@@ -431,9 +508,9 @@ export class VolumeRenderer implements Disposable {
 
   private ensurePipeline(): void {
     if (this.pipeline) return;
-    const module = this.cache.getModule("volume-raymarch-hq-v4", VOLUME_RAYMARCH_WGSL);
+    const module = this.cache.getModule("volume-raymarch-hq-v5", VOLUME_RAYMARCH_WGSL);
     this.pipeline = this.cache.getRenderPipeline({
-      label: "volume-raymarch-hq-v4",
+      label: "volume-raymarch-hq-v5",
       layout: "auto",
       vertex: { module, entryPoint: "vs_main" },
       fragment: {
@@ -490,6 +567,7 @@ export class VolumeRenderer implements Disposable {
         { binding: 2, resource: this.volumeSampler! },
         { binding: 3, resource: this.tfTex!.createView({ dimension: "2d" }) },
         { binding: 4, resource: this.tfSampler! },
+        { binding: 5, resource: { buffer: this.lightEnv!.gpu } },
       ],
     });
   }
