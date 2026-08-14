@@ -147,7 +147,10 @@ export class VolumeRenderer implements Disposable {
     this.linearOutput = options.linearOutput ?? false;
     this.stepSize = options.stepSize ?? 1 / 260;
     this.densityScale = options.densityScale ?? 1.35;
-    this.maxSteps = options.maxSteps ?? 640;
+    // Hard safety cap on ray-march iterations. The per-frame step count is derived from the box
+    // diagonal / step size (see writeFrame) so a ray always reaches the far face; this only bounds the
+    // pathological case (very fine sampling of a large box).
+    this.maxSteps = options.maxSteps ?? 4096;
     this.exposure = options.exposure ?? 1.15;
     this.lightDirection = [...(options.lightDirection ?? [0.45, 0.85, 0.35])] as [
       number,
@@ -365,7 +368,13 @@ export class VolumeRenderer implements Disposable {
     d[19] = this.frameIndex++;
     d[20] = this.stepSize;
     d[21] = this.densityScale;
-    d[22] = this.maxSteps;
+    // Enough steps to march the full box diagonal at the current step size (+ jitter/rounding margin),
+    // so the far side of the volume is never left unsampled ("backside clipping"). Bounded by the hard
+    // cap for pathological step sizes.
+    const diagonal =
+      2 * Math.hypot(this.boxHalf[0], this.boxHalf[1], this.boxHalf[2]);
+    const neededSteps = Math.ceil(diagonal / Math.max(this.stepSize, 5e-4)) + 8;
+    d[22] = Math.min(this.maxSteps, neededSteps);
     d[23] = this.exposure;
     d[24] = lx / llen;
     d[25] = ly / llen;

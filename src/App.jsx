@@ -20,13 +20,14 @@ import { getDefaultZarrFileUrl, getTiledBaseUrl, TILED_PROCESSED_PATH } from './
 import { installTiledTokenBridge } from './tiledTokenBridge';
 import { installTiledFetchInterceptor } from './ItkVtkNative/tiledAuth';
 import ItkVktNative from './ItkVtkNative/ItkVtkNative';
-import WebGpuNative from './WebGpuNative/WebGpuNative';
+import WebGpuNative, { webGpuAvailability } from './WebGpuNative/WebGpuNative';
 import { TiledNotifications } from './TiledNotifications';
 import { TabBar } from './TabBar';
 import { useTabsStore } from './stores/useTabsStore';
 import { useLinkedViewers } from './hooks/useLinkedViewers';
 import { useLinkedWebGpuViewers } from './hooks/useLinkedWebGpuViewers';
 import { applyViewState, captureViewState } from './viewerState';
+import { applyWebGpuViewState, captureWebGpuViewState } from './webgpuViewerState';
 import {
   buildShareUrl,
   copyToClipboard,
@@ -56,6 +57,7 @@ function App() {
   const setLinkCropping = useTabsStore((s) => s.setLinkCropping);
   const renderer = useTabsStore((s) => s.renderer);
   const toggleRenderer = useTabsStore((s) => s.toggleRenderer);
+  const setRenderer = useTabsStore((s) => s.setRenderer);
 
   const hasLeft = useMemo(() => tabs.some((t) => t.pane === 'left'), [tabs]);
   const hasRight = useMemo(() => tabs.some((t) => t.pane === 'right'), [tabs]);
@@ -78,7 +80,8 @@ function App() {
       // that it's renderable, then consume the pending state so it only applies once.
       const tab = useTabsStore.getState().tabs.find((t) => t.id === id);
       const pending = tab && pendingStateRef.current.get(tab.url);
-      if (pending) {
+      // Only replay itk-shaped snapshots here; a WebGPU snapshot is handled by handleWebGpuReady.
+      if (pending && pending.r !== 'webgpu') {
         pendingStateRef.current.delete(tab.url);
         applyViewState(instance, pending);
       }
@@ -108,8 +111,18 @@ function App() {
   const webgpuInstancesRef = useRef(new Map());
   const [webgpuInstanceVersion, setWebgpuInstanceVersion] = useState(0);
   const handleWebGpuReady = useCallback((id, instance) => {
-    if (instance) webgpuInstancesRef.current.set(id, instance);
-    else webgpuInstancesRef.current.delete(id);
+    if (instance) {
+      webgpuInstancesRef.current.set(id, instance);
+      // Replay a WebGPU shared-link snapshot once this pane is renderable, then consume it.
+      const tab = useTabsStore.getState().tabs.find((t) => t.id === id);
+      const pending = tab && pendingStateRef.current.get(tab.url);
+      if (pending && pending.r === 'webgpu') {
+        pendingStateRef.current.delete(tab.url);
+        applyWebGpuViewState(instance, pending);
+      }
+    } else {
+      webgpuInstancesRef.current.delete(id);
+    }
     setWebgpuInstanceVersion((v) => v + 1);
   }, []);
   const leftWebGpu = useMemo(
@@ -139,6 +152,11 @@ function App() {
   useEffect(() => {
     const shared = readShareFromLocation();
     if (shared) {
+      // A WebGPU snapshot opens in the WebGPU renderer (if this device supports it); otherwise it
+      // falls back to itk — the scan still opens, only the saved pose/colors won't replay.
+      if (shared.r === 'webgpu' && webGpuAvailability().ok) {
+        setRenderer('webgpu');
+      }
       const url = zarrUrlFromFileId(shared.f);
       pendingStateRef.current.set(url, shared);
       openTab(url);
@@ -152,12 +170,23 @@ function App() {
   const shareTargetId = isSplit ? activeLeftId : soloId;
   const handleShare = useCallback(async () => {
     if (!shareTargetId) return false;
-    const instance = instancesRef.current.get(shareTargetId);
     const tab = useTabsStore.getState().tabs.find((t) => t.id === shareTargetId);
-    if (!instance || !tab) return false;
+    if (!tab) return false;
     const fileId = fileIdFromZarrUrl(tab.url);
     if (!fileId) return false;
-    const url = buildShareUrl({ ...captureViewState(instance), f: fileId });
+    // Capture from whichever renderer is live; the snapshot is tagged so the recipient reopens it in
+    // the same renderer with the same pose/colors/cropping.
+    let shareState;
+    if (renderer === 'webgpu') {
+      const instance = webgpuInstancesRef.current.get(shareTargetId);
+      if (!instance) return false;
+      shareState = { ...captureWebGpuViewState(instance), f: fileId, r: 'webgpu' };
+    } else {
+      const instance = instancesRef.current.get(shareTargetId);
+      if (!instance) return false;
+      shareState = { ...captureViewState(instance), f: fileId, r: 'itk' };
+    }
+    const url = buildShareUrl(shareState);
     const copied = await copyToClipboard(url);
     if (!copied) {
       // Both clipboard paths failed — surface the link so the user can copy it manually.
@@ -165,7 +194,7 @@ function App() {
       window.prompt('Copy this shareable link:', url);
     }
     return copied;
-  }, [shareTargetId]);
+  }, [shareTargetId, renderer]);
 
   // Press Escape to leave split view.
   useEffect(() => {

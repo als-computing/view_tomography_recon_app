@@ -4,6 +4,8 @@
  * @packageDocumentation
  */
 
+import { SCIVIS_MAPS, type ColorStop } from "./sciviscolor-maps.js";
+
 /** RGB sample in linear [0, 1]. */
 export type Rgb = readonly [number, number, number];
 
@@ -28,8 +30,8 @@ function sampleStops(stops: readonly Rgb[], t: number): Rgb {
   return lerp3(stops[i]!, stops[i + 1]!, f - i);
 }
 
-/** Built-in colormap names. */
-export type ColorMapName =
+/** Built-in (evenly-spaced) colormap names. */
+export type BuiltinColorMapName =
   | "grayscale"
   | "bone"
   | "hot"
@@ -39,7 +41,13 @@ export type ColorMapName =
   | "magenta"
   | "cyan";
 
-const MAPS: Record<ColorMapName, readonly Rgb[]> = {
+/**
+ * Any selectable colormap name: a built-in or a scraped SciVisColor map ({@link SCIVIS_MAPS}). The
+ * `(string & {})` keeps built-in literals autocompleting while still accepting the dynamic SciVis keys.
+ */
+export type ColorMapName = BuiltinColorMapName | (string & {});
+
+const MAPS: Record<BuiltinColorMapName, readonly Rgb[]> = {
   grayscale: [
     [0, 0, 0],
     [1, 1, 1],
@@ -95,12 +103,37 @@ const MAPS: Record<ColorMapName, readonly Rgb[]> = {
   ],
 };
 
-/** Sample a named colormap. */
-export function sampleColorMap(name: ColorMapName, t: number): Rgb {
-  return sampleStops(MAPS[name], t);
+/** Sample a positioned-stop colormap (SciVisColor maps have non-uniform x positions). */
+function samplePositioned(stops: readonly ColorStop[], t: number): Rgb {
+  const x = Math.min(1, Math.max(0, t));
+  const n = stops.length;
+  if (n === 0) return [0, 0, 0];
+  const first = stops[0]!;
+  if (x <= first[0]) return [first[1], first[2], first[3]];
+  const last = stops[n - 1]!;
+  if (x >= last[0]) return [last[1], last[2], last[3]];
+  for (let i = 0; i < n - 1; i++) {
+    const a = stops[i]!;
+    const b = stops[i + 1]!;
+    if (x >= a[0] && x <= b[0]) {
+      const span = b[0] - a[0] || 1;
+      const u = (x - a[0]) / span;
+      return [a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u, a[3] + (b[3] - a[3]) * u];
+    }
+  }
+  return [last[1], last[2], last[3]];
 }
 
-/** List available colormap names. */
+/** Sample a named colormap — a built-in (evenly-spaced) or a SciVisColor map (positioned stops). */
+export function sampleColorMap(name: ColorMapName, t: number): Rgb {
+  const builtin = MAPS[name as BuiltinColorMapName];
+  if (builtin) return sampleStops(builtin, t);
+  const scivis = SCIVIS_MAPS[name];
+  if (scivis) return samplePositioned(scivis, t);
+  return sampleStops(MAPS.grayscale, t);
+}
+
+/** List available colormap names: built-ins first, then the scraped SciVisColor maps. */
 export function colorMapNames(): ColorMapName[] {
-  return Object.keys(MAPS) as ColorMapName[];
+  return [...Object.keys(MAPS), ...Object.keys(SCIVIS_MAPS)] as ColorMapName[];
 }

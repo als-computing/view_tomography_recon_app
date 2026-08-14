@@ -16,9 +16,18 @@ import { getTiledBaseUrl } from './utils';
 import type { CapturedViewState } from './viewerState';
 
 /** A shareable snapshot: the reconstruction's file id `f` plus the captured view state. */
-export interface ShareState extends CapturedViewState {
+export interface ShareState extends Omit<CapturedViewState, 'camera'> {
   /** Tiled file id — the path segment after `/zarr/v2/` (equivalently after `/api/v1/`). */
   f: string;
+  /**
+   * Which renderer captured this snapshot. Absent → itk (back-compat with links shared before the
+   * WebGPU renderer existed). Determines both how the view state is shaped and which renderer the
+   * recipient's app switches to when opening the link. `camera` is renderer-specific: an itk
+   * `CameraPose` for `'itk'`, a `WebGpuCameraState` for `'webgpu'`.
+   */
+  r?: 'itk' | 'webgpu';
+  /** WebGPU camera pose (overrides the itk-shaped `camera` from CapturedViewState when `r === 'webgpu'`). */
+  camera?: unknown;
 }
 
 /** Extract the Tiled file id from a full zarr URL (`…/zarr/v2/<fileId>`), or null if absent. */

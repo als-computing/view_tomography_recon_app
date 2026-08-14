@@ -44,6 +44,7 @@ import {
   resizeDemoCanvas,
 } from "./demo-session.js";
 import { ensureHudStyles } from "./hud-theme.js";
+import { ViewportOverlay } from "./render/overlay/viewport-overlay.js";
 
 const DEFAULT_ZARR = "/datasets/petiole.zarr";
 
@@ -125,6 +126,20 @@ function mulMat4Vec4(
     e[2]! * x + e[6]! * y + e[10]! * z + e[14]! * w,
     e[3]! * x + e[7]! * y + e[11]! * z + e[15]! * w,
   ];
+}
+
+/** Largest "nice" 1/2/5·10ⁿ value ≤ x — for a scale bar whose length never exceeds its pixel budget. */
+function niceFloor125(x: number): number {
+  const exp = Math.floor(Math.log10(x));
+  const base = Math.pow(10, exp);
+  const f = x / base; // in [1, 10)
+  const m = f >= 5 ? 5 : f >= 2 ? 2 : 1;
+  return m * base;
+}
+
+/** Format a nice-number for a scale-bar label, stripping float noise (e.g. 0.30000004 → "0.3"). */
+function formatNice(v: number): string {
+  return String(Number(v.toPrecision(6)));
 }
 
 function zarrUrlFromQuery(): string {
@@ -268,7 +283,9 @@ export async function run(
   const volumeRenderer = new VolumeRenderer(ctx, {
     stepSize: baseStep,
     densityScale,
-    maxSteps: 720,
+    // Safety cap only; the renderer derives per-frame step count from the box diagonal so the whole
+    // depth is always marched (no backside clipping) regardless of orientation or sample distance.
+    maxSteps: 4096,
     exposure,
     ambient: 0.22,
     clearColor: [0.015, 0.02, 0.035, 1],
@@ -317,6 +334,10 @@ export async function run(
     return true;
   };
   session.onDispose(() => controls.dispose());
+
+  // Bottom-left overlay over the render viewport: axis gizmo + physical scale bar (redrawn each frame).
+  const overlay = new ViewportOverlay(canvas.parentElement ?? document.body);
+  session.onDispose(() => overlay.dispose());
 
   const readCamera = (): WebGpuCameraState => controls.getState();
 
@@ -641,6 +662,22 @@ export async function run(
     return Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
   }
 
+  // Dual-thumb [lo, hi] range slider. `group` scopes the pair (e.g. "color", "cropX") so one delegated
+  // input handler drives every range: two overlaid range inputs, a visual track/fill, and a value label.
+  const rangeSlider = (
+    group: string,
+    label: string,
+    lo: number,
+    hi: number,
+    step = 0.005,
+  ): string =>
+    `<div class="whud__range" data-range-group="${group}">` +
+    `<div class="whud__range-track"><div class="whud__range-fill" data-range-fill style="left:${lo * 100}%;width:${(hi - lo) * 100}%"></div></div>` +
+    `<input class="whud__range-input" type="range" min="0" max="1" step="${step}" value="${lo}" data-range="${group}:lo" aria-label="${label} low"/>` +
+    `<input class="whud__range-input" type="range" min="0" max="1" step="${step}" value="${hi}" data-range="${group}:hi" aria-label="${label} high"/>` +
+    `</div>` +
+    `<div class="whud__range-labels"><span>${label}</span><span data-range-vals>${fmt(lo)} – ${fmt(hi)}</span></div>`;
+
   const renderUi = (): void => {
     curveEditor?.dispose();
     curveEditor = undefined;
@@ -684,12 +721,7 @@ export async function run(
       `<div class="whud__hint">Opacity curve (drag · dbl-click add) · volume histogram behind</div>`,
       `<canvas id="opacity-curve" style="width:100%;height:84px;display:block;touch-action:none;cursor:crosshair"></canvas>`,
       // Dual-thumb color-range slider under the graph — both heads set [colorLo, colorHi] together.
-      `<div class="whud__range">` +
-        `<div class="whud__range-track"><div class="whud__range-fill" data-range-fill style="left:${colorLo * 100}%;width:${(colorHi - colorLo) * 100}%"></div></div>` +
-        `<input class="whud__range-input" type="range" min="0" max="1" step="0.005" value="${colorLo}" data-range="colorLo" aria-label="Color low"/>` +
-        `<input class="whud__range-input" type="range" min="0" max="1" step="0.005" value="${colorHi}" data-range="colorHi" aria-label="Color high"/>` +
-      `</div>`,
-      `<div class="whud__range-labels"><span>Color range</span><span data-range-vals>${fmt(colorLo)} – ${fmt(colorHi)}</span></div>`,
+      rangeSlider("color", "Color range", colorLo, colorHi, 0.005),
     ].join("");
 
     // Render section
@@ -749,15 +781,12 @@ export async function run(
       `</details>`,
     ].join("");
 
-    // Crop section
+    // Crop section — one dual-thumb [min, max] slider per axis (ROI in UVW 0–1).
     const cropBody = [
       `<div class="whud__hint">ROI crop (UVW 0–1)</div>`,
-      slider("cminX", "Min X", cropMin[0], 0, 1, 0.01),
-      slider("cminY", "Min Y", cropMin[1], 0, 1, 0.01),
-      slider("cminZ", "Min Z", cropMin[2], 0, 1, 0.01),
-      slider("cmaxX", "Max X", cropMax[0], 0, 1, 0.01),
-      slider("cmaxY", "Max Y", cropMax[1], 0, 1, 0.01),
-      slider("cmaxZ", "Max Z", cropMax[2], 0, 1, 0.01),
+      rangeSlider("cropX", "X", cropMin[0], cropMax[0], 0.01),
+      rangeSlider("cropY", "Y", cropMin[1], cropMax[1], 0.01),
+      rangeSlider("cropZ", "Z", cropMin[2], cropMax[2], 0.01),
       `<button type="button" data-act="resetCrop" class="whud__seg-btn" style="margin-top:6px">Reset crop</button>`,
     ].join("");
 
@@ -898,18 +927,9 @@ export async function run(
     "gradScale",
     "lighting",
   ]);
-  const CROPPING_SLIDERS = new Set([
-    "activeSlice",
-    "sliceX",
-    "sliceY",
-    "sliceZ",
-    "cminX",
-    "cminY",
-    "cminZ",
-    "cmaxX",
-    "cmaxY",
-    "cmaxZ",
-  ]);
+  // Single-value sliders that emit a cropping change. (Crop min/max are dual-thumb `data-range`
+  // groups handled separately below — they emit their own croppingChange.)
+  const CROPPING_SLIDERS = new Set(["activeSlice", "sliceX", "sliceY", "sliceZ"]);
 
   ui.addEventListener("input", (e) => {
     const t = e.target as HTMLInputElement;
@@ -930,31 +950,43 @@ export async function run(
       return;
     }
     if (t.dataset.range) {
-      // Dual-thumb color range: two overlaid range inputs. Keep lo <= hi (a thumb dragged past the
-      // other pushes it), reflect the filled band + label, and recolor the graph live.
-      const loEl = ui.querySelector<HTMLInputElement>('[data-range="colorLo"]');
-      const hiEl = ui.querySelector<HTMLInputElement>('[data-range="colorHi"]');
+      // Dual-thumb range (color low/high, or per-axis crop min/max). Everything is scoped to this
+      // group's `.whud__range` wrapper so multiple ranges coexist. Keep lo <= hi (a thumb dragged past
+      // its partner pushes it), reflect the filled band + label in place, then dispatch by group.
+      const [group, end] = t.dataset.range.split(":"); // e.g. "cropX", "lo"
+      const wrap = t.closest<HTMLElement>(".whud__range");
+      if (!wrap) return;
+      const loEl = wrap.querySelector<HTMLInputElement>('[data-range$=":lo"]');
+      const hiEl = wrap.querySelector<HTMLInputElement>('[data-range$=":hi"]');
       if (!loEl || !hiEl) return;
       let lo = Number(loEl.value);
       let hi = Number(hiEl.value);
       if (lo > hi) {
-        if (t.dataset.range === "colorLo") hi = lo;
+        if (end === "lo") hi = lo;
         else lo = hi;
         loEl.value = String(lo);
         hiEl.value = String(hi);
       }
-      colorLo = lo;
-      colorHi = hi;
-      const fill = ui.querySelector<HTMLElement>("[data-range-fill]");
+      const fill = wrap.querySelector<HTMLElement>("[data-range-fill]");
       if (fill) {
         fill.style.left = `${lo * 100}%`;
         fill.style.width = `${(hi - lo) * 100}%`;
       }
-      const vals = ui.querySelector("[data-range-vals]");
+      const vals = wrap.nextElementSibling?.querySelector("[data-range-vals]");
       if (vals) vals.textContent = `${fmt(lo)} – ${fmt(hi)}`;
-      applyTf();
-      curveEditor?.setColorRange([colorLo, colorHi]);
-      emitRendering();
+      if (group === "color") {
+        colorLo = lo;
+        colorHi = hi;
+        applyTf();
+        curveEditor?.setColorRange([colorLo, colorHi]);
+        emitRendering();
+      } else if (group === "cropX" || group === "cropY" || group === "cropZ") {
+        const axis = group === "cropX" ? 0 : group === "cropY" ? 1 : 2;
+        cropMin[axis] = lo;
+        cropMax[axis] = hi;
+        applyRender();
+        emitCropping();
+      }
       return;
     }
     if (!t.dataset.slider) return;
@@ -1021,30 +1053,6 @@ export async function run(
         break;
       case "sliceZ":
         sliceZ = v;
-        applyRender();
-        break;
-      case "cminX":
-        cropMin[0] = v;
-        applyRender();
-        break;
-      case "cminY":
-        cropMin[1] = v;
-        applyRender();
-        break;
-      case "cminZ":
-        cropMin[2] = v;
-        applyRender();
-        break;
-      case "cmaxX":
-        cropMax[0] = v;
-        applyRender();
-        break;
-      case "cmaxY":
-        cropMax[1] = v;
-        applyRender();
-        break;
-      case "cmaxZ":
-        cropMax[2] = v;
         applyRender();
         break;
       default:
@@ -1241,6 +1249,30 @@ export async function run(
     viewProj.multiplyMatrices(proj, view);
     lastViewProj.copy(viewProj);
     volumeRenderer.render(viewProj, camera.position);
+
+    // Bottom-left overlay: axis gizmo (camera world basis) + physical scale bar. The gizmo uses the
+    // world right/up/forward columns of the camera; forward (fx,fy,fz) is already unit-normalized above.
+    const rlen = Math.hypot(wm[0]!, wm[1]!, wm[2]!) || 1;
+    const ulen = Math.hypot(wm[4]!, wm[5]!, wm[6]!) || 1;
+    // Scale bar: world (sim µm) per CSS pixel at the orbit-target depth (perspective → exact at target).
+    let scaleBar: { px: number; label: string } | null = null;
+    const cssH = canvas.clientHeight;
+    if (cssH > 0 && Number.isFinite(controls.distance) && controls.distance > 0) {
+      const worldPerPx = (2 * controls.distance * Math.tan(controls.fovY / 2)) / cssH;
+      const targetPx = 100;
+      const u = lengthUnit();
+      const rawVal = units.fromSim(targetPx * worldPerPx, units.LENGTH, sim).to(u);
+      if (Number.isFinite(rawVal) && rawVal > 0) {
+        const nice = niceFloor125(rawVal);
+        scaleBar = { px: (nice / rawVal) * targetPx, label: `${formatNice(nice)} ${u.symbol}` };
+      }
+    }
+    overlay.draw({
+      right: [wm[0]! / rlen, wm[1]! / rlen, wm[2]! / rlen],
+      up: [wm[4]! / ulen, wm[5]! / ulen, wm[6]! / ulen],
+      forward: [fx, fy, fz],
+      scaleBar,
+    });
   });
 
   session.onDispose(() => {
