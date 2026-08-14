@@ -19,9 +19,14 @@
       "@zarr-viewer/scene": ["./src/scene/index.ts"],
       "@zarr-viewer/controls": ["./src/controls/index.ts"],
       "@zarr-viewer/io": ["./src/io/index.ts"],
-      "@zarr-viewer/render": ["./src/render/index.ts"]
+      "@zarr-viewer/render": ["./src/render/index.ts"],
+      "@prism/core": ["./src/core/index.ts"],
+      "@prism/math": ["./src/math/index.ts"],
+      "@prism/render": ["./src/render/index.ts"],
+      "@prism/fx": ["./src/fx/src/index.ts"]
     },
     "baseUrl": "."
   },
-  "include": ["src/**/*.ts", "vite-zarr-static.ts", "vite.config.ts"]
+  "include": ["src/**/*.ts", "vite-zarr-static.ts", "vite.config.ts"],
+  "exclude": ["src/fx/test"]
 }

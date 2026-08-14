@@ -18,6 +18,12 @@ export default defineConfig({
       '@zarr-viewer/controls': resolve(zarrViewerSrc, 'controls/index.ts'),
       '@zarr-viewer/io': resolve(zarrViewerSrc, 'io/index.ts'),
       '@zarr-viewer/render': resolve(zarrViewerSrc, 'render/index.ts'),
+      // The dropped-in `@prism/fx` package resolves its `@prism/*` deps to the same viewer sources,
+      // so a future prism re-copy of fx/ needs no import rewrites.
+      '@prism/core': resolve(zarrViewerSrc, 'core/index.ts'),
+      '@prism/math': resolve(zarrViewerSrc, 'math/index.ts'),
+      '@prism/render': resolve(zarrViewerSrc, 'render/index.ts'),
+      '@prism/fx': resolve(zarrViewerSrc, 'fx/src/index.ts'),
     },
   },
   server: {

@@ -37,6 +37,7 @@ import {
 import { Scene, Node } from "@zarr-viewer/scene";
 import { OrbitControls } from "@zarr-viewer/controls";
 import { Mat4, Vec3 } from "@zarr-viewer/math";
+import { bloom, tonemap, fxaa, sharpen, vignette, type ToneMapOperator, type Effect } from "@prism/fx";
 import {
   createDemoSession,
   createDemoHud,
@@ -45,10 +46,11 @@ import {
 } from "./demo-session.js";
 import { ensureHudStyles } from "./hud-theme.js";
 import { ViewportOverlay } from "./render/overlay/viewport-overlay.js";
+import { FxPipeline } from "./render/post/fx-pipeline.js";
 
 const DEFAULT_ZARR = "/datasets/petiole.zarr";
 
-type PanelId = "data" | "tf" | "render" | "slices" | "crop" | "measure";
+type PanelId = "data" | "tf" | "render" | "slices" | "crop" | "measure" | "postfx";
 
 /** Change events emitted by a {@link WebGpuViewerInstance}. */
 export type WebGpuViewerEvent = "cameraChange" | "renderingChange" | "croppingChange";
@@ -79,6 +81,17 @@ export interface WebGpuRenderingState {
   gradScale: number;
   lighting: number;
   viewMode: VolumeViewMode;
+  // Post-processing FX (tonemap is always applied; the rest are toggle-gated).
+  fxOperator: ToneMapOperator;
+  fxExposure: number;
+  fxBloom: boolean;
+  fxBloomThreshold: number;
+  fxBloomIntensity: number;
+  fxFxaa: boolean;
+  fxSharpen: boolean;
+  fxSharpenAmount: number;
+  fxVignette: boolean;
+  fxVignetteAmount: number;
 }
 
 /** The ROI crop box plus the slice planes (positions, per-axis enables, overlay visibility). */
@@ -183,6 +196,18 @@ export async function run(
   let gradScale = 0.12;
   let lighting = 0.85;
   let viewMode: VolumeViewMode = "volume";
+  // Post FX state. Tonemap is always applied (the HDR→display map + exposure); everything else is
+  // toggle-gated. Defaults reproduce today's look: ACES at exposure 0, all extras off.
+  let fxOperator: ToneMapOperator = "aces";
+  let fxExposure = 0;
+  let fxBloom = false;
+  let fxBloomThreshold = 1.1;
+  let fxBloomIntensity = 0.6;
+  let fxFxaa = false;
+  let fxSharpen = false;
+  let fxSharpenAmount = 0.5;
+  let fxVignette = false;
+  let fxVignetteAmount = 0.4;
   let sliceX = 0.5;
   let sliceY = 0.5;
   let sliceZ = 0.5;
@@ -218,6 +243,16 @@ export async function run(
     gradScale,
     lighting,
     viewMode,
+    fxOperator,
+    fxExposure,
+    fxBloom,
+    fxBloomThreshold,
+    fxBloomIntensity,
+    fxFxaa,
+    fxSharpen,
+    fxSharpenAmount,
+    fxVignette,
+    fxVignetteAmount,
   });
   const readCropping = (): WebGpuCroppingState => ({
     cropMin: [cropMin[0], cropMin[1], cropMin[2]],
@@ -293,7 +328,28 @@ export async function run(
     gradientOpacity: gradOpacity,
     gradientOpacityScale: gradScale,
     lightingStrength: lighting,
+    // Render into a linear-HDR target so the post stack tonemaps once (the shader skips its inline
+    // ACES+gamma). Both are construct-time only.
+    colorFormat: "rgba16float",
+    linearOutput: true,
   });
+
+  // Post-processing driver: volume → linear HDR → bloom/tonemap/fxaa/sharpen/vignette → swapchain.
+  const fxPipeline = new FxPipeline(ctx);
+  const rebuildFxStack = (): void => {
+    const effects: Effect[] = [];
+    // HDR-space effects first (bloom operates on linear HDR), then the mandatory tonemap maps
+    // HDR→sRGB LDR, then the LDR effects (fxaa → sharpen → vignette).
+    if (fxBloom) {
+      effects.push(bloom({ threshold: fxBloomThreshold, intensity: fxBloomIntensity }));
+    }
+    effects.push(tonemap(fxOperator, { exposureStops: fxExposure }));
+    if (fxFxaa) effects.push(fxaa());
+    if (fxSharpen) effects.push(sharpen({ amount: fxSharpenAmount }));
+    if (fxVignette) effects.push(vignette({ amount: fxVignetteAmount }));
+    fxPipeline.setStack(effects);
+  };
+  rebuildFxStack();
 
   const scene = new Scene();
   const camera = new Node("Camera");
@@ -545,7 +601,7 @@ export async function run(
     physicalSizeSim(sizeSim, source, sim, next);
     volumeRenderer.setBoxHalfSize(sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5);
     frameExtent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z);
-    controls.minDistance = Math.max(frameExtent * 0.02, 0.05);
+    controls.minDistance = Math.max(frameExtent * 0.001, 0.01); // was frameExtent * 0.02
     // Cap zoom-out so the volume can't recede to a sub-pixel speck (and so eye-space magnitudes stay
     // float32-stable). ~20× the largest extent still frames the whole volume comfortably.
     controls.maxDistance = frameExtent * 20;
@@ -811,6 +867,24 @@ export async function run(
       `<div class="whud__hint">Uses ray pick through the volume + 6-connected flood fill. Crop snaps to the feature. Prefer L2+ for speed on huge volumes.</div>`,
     ].join("");
 
+    // Post FX section — tonemap (always on) + toggle-gated bloom / FXAA / sharpen / vignette.
+    const tmOps: ToneMapOperator[] = ["aces", "reinhard", "reinhard-extended"];
+    const tmOptions = tmOps
+      .map((o) => `<option value="${o}" ${o === fxOperator ? "selected" : ""}>${o}</option>`)
+      .join("");
+    const postfxBody = [
+      `<label class="whud__row" style="font-size:11px">Tonemap <select id="fxop" class="whud__select">${tmOptions}</select></label>`,
+      slider("fxExposure", "Exposure (stops)", fxExposure, -4, 4, 0.05),
+      `<label class="whud__check"><input type="checkbox" data-chk="fxBloom" ${fxBloom ? "checked" : ""}/> Bloom</label>`,
+      slider("fxBloomThreshold", "Bloom threshold", fxBloomThreshold, 0, 3, 0.05),
+      slider("fxBloomIntensity", "Bloom intensity", fxBloomIntensity, 0, 2, 0.05),
+      `<label class="whud__check"><input type="checkbox" data-chk="fxFxaa" ${fxFxaa ? "checked" : ""}/> FXAA (anti-alias edges)</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="fxSharpen" ${fxSharpen ? "checked" : ""}/> Sharpen</label>`,
+      slider("fxSharpenAmount", "Sharpen amount", fxSharpenAmount, 0, 2, 0.05),
+      `<label class="whud__check"><input type="checkbox" data-chk="fxVignette" ${fxVignette ? "checked" : ""}/> Vignette</label>`,
+      slider("fxVignetteAmount", "Vignette amount", fxVignetteAmount, 0, 1, 0.02),
+    ].join("");
+
     ui.innerHTML = [
       `<div class="whud__header">` +
         `<span class="whud__title">OME-Zarr viewer</span>` +
@@ -825,6 +899,7 @@ export async function run(
       section("slices", "Slices", slicesBody),
       section("crop", "Crop", cropBody),
       section("measure", "Measure", measureBody),
+      section("postfx", "Post FX", postfxBody),
       `<div class="whud__hint">Pan: Space+drag / Shift / middle / right · wheel zooms to cursor · P / Ctrl+click pick · [ ] LOD · O open</div>`,
     ].join("");
 
@@ -915,6 +990,10 @@ export async function run(
       applyTf();
       curveEditor?.setColorMap(colorMap);
       emitRendering();
+    } else if (t.id === "fxop") {
+      fxOperator = t.value as ToneMapOperator;
+      rebuildFxStack();
+      emitRendering();
     }
   });
 
@@ -930,6 +1009,15 @@ export async function run(
   // Single-value sliders that emit a cropping change. (Crop min/max are dual-thumb `data-range`
   // groups handled separately below — they emit their own croppingChange.)
   const CROPPING_SLIDERS = new Set(["activeSlice", "sliceX", "sliceY", "sliceZ"]);
+  // Post-FX sliders: each drives a stack rebuild (effect params are captured at build time) and
+  // emits a rendering change so links / share carry the value.
+  const FX_SLIDERS = new Set([
+    "fxExposure",
+    "fxBloomThreshold",
+    "fxBloomIntensity",
+    "fxSharpenAmount",
+    "fxVignetteAmount",
+  ]);
 
   ui.addEventListener("input", (e) => {
     const t = e.target as HTMLInputElement;
@@ -943,6 +1031,20 @@ export async function run(
         pickMode = on;
         canvas.style.cursor = pickMode ? "crosshair" : "";
         renderUi();
+        return;
+      }
+      if (
+        t.dataset.chk === "fxBloom" ||
+        t.dataset.chk === "fxFxaa" ||
+        t.dataset.chk === "fxSharpen" ||
+        t.dataset.chk === "fxVignette"
+      ) {
+        if (t.dataset.chk === "fxBloom") fxBloom = on;
+        else if (t.dataset.chk === "fxFxaa") fxFxaa = on;
+        else if (t.dataset.chk === "fxSharpen") fxSharpen = on;
+        else if (t.dataset.chk === "fxVignette") fxVignette = on;
+        rebuildFxStack();
+        emitRendering();
         return;
       }
       applyRender();
@@ -1055,11 +1157,32 @@ export async function run(
         sliceZ = v;
         applyRender();
         break;
+      case "fxExposure":
+        fxExposure = v;
+        rebuildFxStack();
+        break;
+      case "fxBloomThreshold":
+        fxBloomThreshold = v;
+        rebuildFxStack();
+        break;
+      case "fxBloomIntensity":
+        fxBloomIntensity = v;
+        rebuildFxStack();
+        break;
+      case "fxSharpenAmount":
+        fxSharpenAmount = v;
+        rebuildFxStack();
+        break;
+      case "fxVignetteAmount":
+        fxVignetteAmount = v;
+        rebuildFxStack();
+        break;
       default:
         break;
     }
     if (RENDERING_SLIDERS.has(id)) emitRendering();
     else if (CROPPING_SLIDERS.has(id)) emitCropping();
+    else if (FX_SLIDERS.has(id)) emitRendering();
   });
 
   // Ctrl/Meta+click or pick-mode click → feature pick (Shift left free for pan).
@@ -1248,7 +1371,11 @@ export async function run(
     view.copy(camera.worldMatrix()).invert();
     viewProj.multiplyMatrices(proj, view);
     lastViewProj.copy(viewProj);
-    volumeRenderer.render(viewProj, camera.position);
+    // Volume → linear HDR, then the post stack to the swapchain (one encoder / one submit). The DOM
+    // overlay (gizmo + scale bar) draws to a separate canvas and is unaffected.
+    fxPipeline.render({ r: 0.015, g: 0.02, b: 0.035, a: 1 }, (pass) => {
+      volumeRenderer.recordInto(pass, viewProj, camera.position);
+    });
 
     // Bottom-left overlay: axis gizmo (camera world basis) + physical scale bar. The gizmo uses the
     // world right/up/forward columns of the camera; forward (fx,fy,fz) is already unit-normalized above.
@@ -1276,6 +1403,7 @@ export async function run(
   });
 
   session.onDispose(() => {
+    fxPipeline.dispose();
     volumeRenderer.dispose();
   });
 
@@ -1302,8 +1430,20 @@ export async function run(
       gradScale = state.gradScale;
       lighting = state.lighting;
       viewMode = state.viewMode;
+      // FX fields are optional on the wire (older peers/links may omit them); fall back to current.
+      fxOperator = state.fxOperator ?? fxOperator;
+      fxExposure = state.fxExposure ?? fxExposure;
+      fxBloom = state.fxBloom ?? fxBloom;
+      fxBloomThreshold = state.fxBloomThreshold ?? fxBloomThreshold;
+      fxBloomIntensity = state.fxBloomIntensity ?? fxBloomIntensity;
+      fxFxaa = state.fxFxaa ?? fxFxaa;
+      fxSharpen = state.fxSharpen ?? fxSharpen;
+      fxSharpenAmount = state.fxSharpenAmount ?? fxSharpenAmount;
+      fxVignette = state.fxVignette ?? fxVignette;
+      fxVignetteAmount = state.fxVignetteAmount ?? fxVignetteAmount;
       applyTf();
       applyRender();
+      rebuildFxStack();
       renderUi();
     },
     getCropping: readCropping,

@@ -35,3 +35,12 @@ export type { OpacityCurveEditorOptions } from "./volume/opacity-curve-editor.js
 
 export { sampleColorMap, colorMapNames } from "./volume/colormaps.js";
 export type { ColorMapName } from "./volume/colormaps.js";
+
+export { RenderGraph } from "./graph/render-graph.js";
+export type {
+  ResourceHandle,
+  RenderGraphTextureDesc,
+  PassContext,
+  PassDesc,
+  CompiledGraph,
+} from "./graph/render-graph.js";
