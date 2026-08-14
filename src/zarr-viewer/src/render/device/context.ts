@@ -28,6 +28,12 @@ export interface GpuContext {
   readonly canvasContext: GPUCanvasContext;
   /** The preferred canvas texture format for the current platform. */
   readonly format: GPUTextureFormat;
+  /**
+   * Whether the device can *linearly filter* 32-bit-float textures. When true the volume can use a
+   * filterable `r32float` texture for full precision; otherwise `r16float` is the highest-precision
+   * filterable option.
+   */
+  readonly supportsFloat32Filtering: boolean;
 }
 
 /**
@@ -56,9 +62,26 @@ export async function createContext(
     throw new PrismError("gpu_error", "No suitable GPU adapter was found");
   }
 
-  const device = await adapter.requestDevice({
-    requiredFeatures: options.requiredFeatures ?? [],
-  });
+  // Auto-enable float32 linear filtering when the adapter supports it, so the volume can opt into a
+  // filterable r32float texture for full precision. Merged (deduped) with any caller-required features.
+  const wantFloat32Filterable = adapter.features.has("float32-filterable");
+  const requiredFeatures = Array.from(
+    new Set<GPUFeatureName>([
+      ...(options.requiredFeatures ?? []),
+      ...(wantFloat32Filterable ? (["float32-filterable"] as GPUFeatureName[]) : []),
+    ]),
+  );
+
+  // Volume uploads go through an internal WebGPU staging buffer sized to the whole level, which can be
+  // hundreds of MiB — well past the 256 MiB default `maxBufferSize`. Raise the buffer/binding limits to
+  // what the adapter actually supports so `writeTexture` for a large level doesn't fail validation.
+  const requiredLimits: Record<string, number> = {
+    maxBufferSize: adapter.limits.maxBufferSize,
+    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+  };
+
+  const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
+  const supportsFloat32Filtering = device.features.has("float32-filterable");
 
   const canvasContext = canvas.getContext("webgpu");
   if (!canvasContext) {
@@ -72,5 +95,5 @@ export async function createContext(
     alphaMode: options.alphaMode ?? "opaque",
   });
 
-  return { adapter, device, canvas, canvasContext, format };
+  return { adapter, device, canvas, canvasContext, format, supportsFloat32Filtering };
 }

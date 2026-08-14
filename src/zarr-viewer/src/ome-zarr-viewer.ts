@@ -22,7 +22,8 @@ import {
 } from "@zarr-viewer/io";
 import {
   createContext,
-  uploadVolume,
+  VolumeLoader,
+  type VolumeLevelResult,
   VolumeRenderer,
   composeTransferFunction,
   OpacityCurveEditor,
@@ -246,6 +247,16 @@ export async function run(
     listUploadableLevels(source, { maxTextureDimension: maxTex });
 
   let levels = allowedLevels();
+
+  // Finest multiscale level we auto-stream to. 0 = finest/largest; higher = coarser. Full-res levels
+  // (0/1) are too large to hold comfortably in a browser GPU for now, so the progressive loader stops
+  // at level 2. Manual level buttons / `[` `]` remain escape hatches to go finer.
+  const MIN_DISPLAY_LEVEL = 2;
+  // Finest level we're willing to display: the finest available that isn't below MIN_DISPLAY_LEVEL,
+  // or the coarsest level if the dataset has nothing that fine. `levels` is ascending (0 first).
+  const finestTargetLevel = (): number =>
+    levels.find((lv) => lv >= MIN_DISPLAY_LEVEL) ?? levels[levels.length - 1]!;
+
   if (levels.length === 0) {
     const hud = createDemoHud({ position: "bottom-left" });
     session.mountHud(hud);
@@ -311,9 +322,18 @@ export async function run(
 
   const sim = units.UNIT_PRESETS.microscopy;
   const sizeSim = new Vec3();
-  let volumeTex: Awaited<ReturnType<typeof uploadVolume>> | undefined;
   let histogram: Float32Array | undefined;
   let curveEditor: OpacityCurveEditor | undefined;
+
+  // Progressive coarse→fine loader: owns the per-level GPU textures and streams finer levels toward
+  // `targetLevel`, never downgrading what's displayed. `level` tracks the level currently on screen.
+  const loader = new VolumeLoader(ctx.device, {
+    supportsFloat32Filtering: ctx.supportsFloat32Filtering,
+  });
+  session.onDispose(() => loader.dispose());
+  let loaderOpened = false;
+  let targetLevel = level;
+  let frameExtent = 1;
 
   ensureHudStyles();
   const docked = options?.hudMount != null;
@@ -470,50 +490,62 @@ export async function run(
     return `${pos.to(u).toFixed(1)} ${u.symbol}`;
   };
 
-  const applyLevel = async (next: number, reframe = false): Promise<void> => {
-    if (!levels.includes(next) || loading) return;
-    loading = true;
+  // Called by the loader each time a (finer) level's texture becomes ready. Swaps the volume, updates
+  // the histogram + ray step for the displayed resolution, and clears "loading" once target is reached.
+  const onDisplayedLevel = (result: VolumeLevelResult): void => {
+    level = result.level;
+    volumeRenderer.setVolume(result.texture);
+    histogram = result.histogram;
+    curveEditor?.setHistogram(histogram);
+    const [sx, sy, sz] = source.spacingAt(level);
+    baseStep = Math.max(
+      Math.max(
+        units.toSim(new units.Quantity(sx, units.LENGTH), sim),
+        units.toSim(new units.Quantity(sy, units.LENGTH), sim),
+        units.toSim(new units.Quantity(sz, units.LENGTH), sim),
+      ) * 0.55,
+      frameExtent / 400,
+    );
+    loading = level !== targetLevel; // still streaming toward a finer target
+    applyRender();
+    renderUi();
+  };
+  loader.onLevel(onDisplayedLevel);
+
+  // Aim the loader at `next` and (re)frame. Framing is level-independent (all multiscale levels cover
+  // the same physical extent), so it's applied from the target before any texture lands. The loader
+  // streams coarsest→target and never downgrades what's shown, so requesting a level coarser than the
+  // one displayed is a no-op ("avoid going back to low res").
+  const applyLevel = (next: number, reframe = false): void => {
+    if (!levels.includes(next)) return;
+    targetLevel = next;
     lastPick = undefined;
     pickStatus = "";
-    renderUi();
-    try {
-      level = next;
-      volumeTex?.texture.dispose();
-      volumeTex = await uploadVolume(ctx.device, source, { level });
-      volumeRenderer.setVolume(volumeTex.texture);
-      histogram = volumeTex.histogram;
-      curveEditor?.setHistogram(histogram);
-      physicalSizeSim(sizeSim, source, sim, level);
-      volumeRenderer.setBoxHalfSize(sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5);
-      const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z);
-      controls.minDistance = Math.max(extent * 0.02, 0.05);
-      // Cap zoom-out so the volume can't recede to a sub-pixel speck (and so eye-space magnitudes
-      // stay float32-stable). ~20× the largest extent still frames the whole volume comfortably.
-      controls.maxDistance = extent * 20;
-      const [sx, sy, sz] = source.spacingAt(level);
-      baseStep = Math.max(
-        Math.max(
-          units.toSim(new units.Quantity(sx, units.LENGTH), sim),
-          units.toSim(new units.Quantity(sy, units.LENGTH), sim),
-          units.toSim(new units.Quantity(sz, units.LENGTH), sim),
-        ) * 0.55,
-        extent / 400,
-      );
-      if (reframe) {
-        if (viewMode === "volume") {
-          controls.distance = extent * 2.2;
-          camera.position.set(extent * 1.2, extent * 0.85, extent * 1.2);
-          controls.syncFromNode();
-          controls.update(0);
-        } else {
-          frameSliceCamera();
-        }
+    physicalSizeSim(sizeSim, source, sim, next);
+    volumeRenderer.setBoxHalfSize(sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5);
+    frameExtent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z);
+    controls.minDistance = Math.max(frameExtent * 0.02, 0.05);
+    // Cap zoom-out so the volume can't recede to a sub-pixel speck (and so eye-space magnitudes stay
+    // float32-stable). ~20× the largest extent still frames the whole volume comfortably.
+    controls.maxDistance = frameExtent * 20;
+    if (reframe) {
+      if (viewMode === "volume") {
+        controls.distance = frameExtent * 2.2;
+        camera.position.set(frameExtent * 1.2, frameExtent * 0.85, frameExtent * 1.2);
+        controls.syncFromNode();
+        controls.update(0);
+      } else {
+        frameSliceCamera();
       }
-      applyRender();
-    } finally {
-      loading = false;
-      renderUi();
     }
+    loading = true;
+    if (!loaderOpened) {
+      loaderOpened = true;
+      loader.open(source, levels, targetLevel);
+    } else {
+      loader.setTargetLevel(targetLevel);
+    }
+    renderUi();
   };
 
   const runPickAt = async (clientX: number, clientY: number): Promise<void> => {
@@ -1062,7 +1094,8 @@ export async function run(
   canvas.addEventListener("wheel", onSliceWheel, { passive: false });
   session.onDispose(() => canvas.removeEventListener("wheel", onSliceWheel));
 
-  await applyLevel(level, true);
+  // Auto-stream coarsest→level 2 (progressive hi-res, capped so full-res levels don't blow up the GPU).
+  applyLevel(finestTargetLevel(), true);
   applyTf();
   applyRender();
   renderUi();
@@ -1070,8 +1103,8 @@ export async function run(
   session.onKeyDown((e) => {
     void (async () => {
       const idx = levels.indexOf(level);
-      if (e.code === "BracketLeft" && idx < levels.length - 1) await applyLevel(levels[idx + 1]!);
-      else if (e.code === "BracketRight" && idx > 0) await applyLevel(levels[idx - 1]!);
+      if (e.code === "BracketLeft" && idx < levels.length - 1) applyLevel(levels[idx + 1]!);
+      else if (e.code === "BracketRight" && idx > 0) applyLevel(levels[idx - 1]!);
       else if (e.code === "Digit1") {
         enterViewMode("xPlane", true);
         openSections.add("slices");
@@ -1123,7 +1156,8 @@ export async function run(
         levels = allowedLevels();
         lastPick = undefined;
         pickStatus = "";
-        if (levels.length) await applyLevel(levels[levels.length - 1]!, true);
+        loaderOpened = false; // new dataset → reopen the loader (drops old resident textures)
+        if (levels.length) applyLevel(finestTargetLevel(), true);
       } else if (e.code === "KeyE") {
         cropMin = [0, 0, 0];
         cropMax = [1, 1, 1];
@@ -1210,7 +1244,6 @@ export async function run(
   });
 
   session.onDispose(() => {
-    volumeTex?.texture.dispose();
     volumeRenderer.dispose();
   });
 

@@ -10,10 +10,20 @@ import { dtypeByteSize } from "@zarr-viewer/io";
 import type { VolumeSource } from "@zarr-viewer/io";
 import { ManagedTexture } from "../resources/texture.js";
 
+/**
+ * GPU texture format for the volume — a precision vs VRAM trade-off:
+ * - `r8unorm`  — 8-bit (256 levels), 1 byte/voxel. Low memory, visible banding on narrow windows.
+ * - `r16float` — 16-bit half (~2048 levels), 2 bytes/voxel. Filterable in core WebGPU. Default.
+ * - `r32float` — full float, 4 bytes/voxel. Filterable only with the `float32-filterable` feature.
+ */
+export type VolumeTextureFormat = "r8unorm" | "r16float" | "r32float";
+
 /** Options for {@link uploadVolume}. */
 export interface UploadVolumeOptions {
   /** Multiscale level to upload (default 0). */
   level?: number;
+  /** Texture format / precision (default `"r16float"`). */
+  format?: VolumeTextureFormat;
 }
 
 /** Number of bins in the intensity histogram returned by {@link uploadVolume}. */
@@ -88,22 +98,28 @@ export async function uploadVolume(
     histogram[b]++;
   }
 
+  const format: VolumeTextureFormat = options.format ?? "r16float";
+  const bytesPerElem = format === "r8unorm" ? 1 : format === "r16float" ? 2 : 4;
   // WebGPU requires bytesPerRow to be a multiple of 256 for writeTexture.
-  const bytesPerRow = Math.ceil(width / 256) * 256;
+  const bytesPerRow = Math.ceil((width * bytesPerElem) / 256) * 256;
   const packed = new Uint8Array(bytesPerRow * height * depth);
+  const view = new DataView(packed.buffer);
   for (let z = 0; z < depth; z++) {
     for (let y = 0; y < height; y++) {
       const row = z * height * bytesPerRow + y * bytesPerRow;
       for (let x = 0; x < width; x++) {
-        const v = dens[x + y * width + z * width * height]!;
-        packed[row + x] = Math.round(clamp01(v) * 255);
+        const v = clamp01(dens[x + y * width + z * width * height]!);
+        const off = row + x * bytesPerElem;
+        if (format === "r8unorm") view.setUint8(off, Math.round(v * 255));
+        else if (format === "r16float") view.setUint16(off, floatToHalf(v), true);
+        else view.setFloat32(off, v, true);
       }
     }
   }
 
   const texture = new ManagedTexture(device, {
     size: [width, height, depth],
-    format: "r8unorm",
+    format,
     dimension: "3d",
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   });
@@ -120,6 +136,49 @@ export async function uploadVolume(
 
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** Bytes per voxel for a volume texture format. */
+export function volumeFormatBytes(format: VolumeTextureFormat): number {
+  return format === "r8unorm" ? 1 : format === "r16float" ? 2 : 4;
+}
+
+/**
+ * Pick the highest precision that fits a per-texture VRAM budget: `r32float` when the device can
+ * linearly filter it and it fits, else `r16float`, else `r8unorm` under memory pressure.
+ */
+export function chooseVolumeFormat(
+  voxelCount: number,
+  opts: { supportsFloat32Filtering: boolean; budgetBytes?: number },
+): VolumeTextureFormat {
+  const budget = opts.budgetBytes ?? 512 * 1024 * 1024;
+  if (opts.supportsFloat32Filtering && voxelCount * 4 <= budget) return "r32float";
+  if (voxelCount * 2 <= budget) return "r16float";
+  return "r8unorm";
+}
+
+// Scratch views for reinterpreting a float32's bits (for the half-float encoder).
+const f32Scratch = new Float32Array(1);
+const i32Scratch = new Int32Array(f32Scratch.buffer);
+
+/**
+ * Encode a JS number as an IEEE-754 half-float (16-bit) bit pattern (little-endian consumer writes it).
+ * Our inputs are clamped to [0,1] so only the normal/subnormal-to-zero paths are exercised, but the
+ * full range is handled for safety.
+ */
+function floatToHalf(value: number): number {
+  f32Scratch[0] = value;
+  const x = i32Scratch[0]!;
+  const sign = (x >> 16) & 0x8000;
+  const exp = ((x >> 23) & 0xff) - 127 + 15;
+  const mantissa = x & 0x7fffff;
+  if (exp <= 0) {
+    if (exp < -10) return sign; // too small → signed zero
+    const m = (mantissa | 0x800000) >> (1 - exp);
+    return sign | (m >> 13);
+  }
+  if (exp >= 0x1f) return sign | 0x7c00 | (mantissa ? 0x200 : 0); // overflow → inf / NaN
+  return sign | (exp << 10) | (mantissa >> 13);
 }
 
 /** Interpret a chunk's typed array as float samples (one per voxel). */

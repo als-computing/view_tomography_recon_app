@@ -7,8 +7,10 @@
 export { createContext } from "./device/context.js";
 export type { DeviceOptions, GpuContext } from "./device/context.js";
 
-export { uploadVolume } from "./volume/volume-texture.js";
-export type { UploadVolumeOptions } from "./volume/volume-texture.js";
+export { uploadVolume, chooseVolumeFormat, volumeFormatBytes } from "./volume/volume-texture.js";
+export type { UploadVolumeOptions, VolumeTextureFormat } from "./volume/volume-texture.js";
+export { VolumeLoader } from "./volume/volume-loader.js";
+export type { VolumeLevelResult, VolumeLoaderOptions } from "./volume/volume-loader.js";
 
 export { VolumeRenderer } from "./volume/volume-renderer.js";
 export type {
