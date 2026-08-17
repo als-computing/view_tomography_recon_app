@@ -113,9 +113,18 @@ export interface WebGpuRenderingState {
   shadowOn: boolean;
   shadowQuality: number;
   shadowStrength: number;
+  shadowSoftness: number;
+  shadowCastGlobal: boolean;
+  shadowCastFlash: boolean;
+  shadowCastStage: boolean;
   aoOn: boolean;
   aoRadius: number;
   aoIntensity: number;
+  aoSamples: number;
+  flashConeDeg: number;
+  flashRange: number;
+  stageConeDeg: number;
+  stageRange: number;
   halfRes: boolean;
 }
 
@@ -252,10 +261,22 @@ export async function run(
   let shadowOn = false;
   let shadowQuality = 24;
   let shadowStrength = 0.85;
+  let shadowSoftness = 0.3;
   let aoOn = false;
   let aoRadius = 0.08;
   let aoIntensity = 0.7;
+  let aoSamples = 6;
   let halfRes = false;
+  // Spot cone (outer half-angle, degrees) + range (× volume extent) for the flashlight / stage lights.
+  // The inner cone is derived at 0.7× the outer for a soft edge.
+  let flashConeDeg = 79;
+  let flashRange = 6;
+  let stageConeDeg = 86;
+  let stageRange = 8;
+  // Which modes cast shadows (perf: fewer casters = cheaper). Global + flashlight cast by default.
+  let shadowCastGlobal = true;
+  let shadowCastFlash = true;
+  let shadowCastStage = false;
   let sliceX = 0.5;
   let sliceY = 0.5;
   let sliceZ = 0.5;
@@ -318,9 +339,18 @@ export async function run(
     shadowOn,
     shadowQuality,
     shadowStrength,
+    shadowSoftness,
+    shadowCastGlobal,
+    shadowCastFlash,
+    shadowCastStage,
     aoOn,
     aoRadius,
     aoIntensity,
+    aoSamples,
+    flashConeDeg,
+    flashRange,
+    stageConeDeg,
+    stageRange,
     halfRes,
   });
   const readCropping = (): WebGpuCroppingState => ({
@@ -442,10 +472,11 @@ export async function run(
       shadowEnable: shadowOn,
       shadowSteps: shadowQuality,
       shadowStrength,
+      shadowSoftness,
       aoEnable: aoOn,
       aoRadius,
       aoIntensity,
-      aoSamples: 6,
+      aoSamples,
     });
     fxPipeline.setRenderScale(halfRes ? 0.5 : 1);
   };
@@ -469,23 +500,29 @@ export async function run(
         Math.sin(el),
         Math.cos(el) * Math.sin(az),
       ];
-      lights.push(makeDirectionalLight(dir, hexToLinearRgb(lightGlobalColor), lightGlobalIntensity));
+      const gl = makeDirectionalLight(dir, hexToLinearRgb(lightGlobalColor), lightGlobalIntensity);
+      gl.castShadows = shadowCastGlobal;
+      lights.push(gl);
     }
     if (lightFlashOn) {
-      lights.push(
-        makeSpotLight(
-          [eye.x, eye.y, eye.z],
-          [-eye.x, -eye.y, -eye.z],
-          hexToLinearRgb(lightFlashColor),
-          lightFlashIntensity,
-          { range: extent * 6, innerConeAngle: Math.PI * 0.28, outerConeAngle: Math.PI * 0.44 },
-        ),
+      const outer = (flashConeDeg * Math.PI) / 180;
+      // True camera headlight: positioned exactly at the eye (canvas center) and pointed forward along
+      // the camera's view direction, so it tracks the camera 1:1. No offset, no pull-back.
+      const fl = makeSpotLight(
+        [eye.x, eye.y, eye.z],
+        [fwd[0], fwd[1], fwd[2]], // forward into the scene (camera view direction)
+        hexToLinearRgb(lightFlashColor),
+        lightFlashIntensity,
+        { range: extent * flashRange, innerConeAngle: outer * 0.7, outerConeAngle: outer },
       );
+      fl.castShadows = shadowCastFlash;
+      lights.push(fl);
     }
     if (lightStageOn) {
       const d = extent * 2.2; // in front of the eye along the view axis
       const k = extent * 1.7; // corner spread
       const col = hexToLinearRgb(lightStageColor);
+      const outer = (stageConeDeg * Math.PI) / 180;
       const corners: [number, number][] = [
         [-1, -1],
         [1, -1],
@@ -498,13 +535,13 @@ export async function run(
           eye.y + fwd[1] * d + right[1] * k * sx + up[1] * k * sy,
           eye.z + fwd[2] * d + right[2] * k * sx + up[2] * k * sy,
         ];
-        lights.push(
-          makeSpotLight(pos, [-pos[0], -pos[1], -pos[2]], col, lightStageIntensity, {
-            range: extent * 8,
-            innerConeAngle: Math.PI * 0.34,
-            outerConeAngle: Math.PI * 0.48,
-          }),
-        );
+        const sl = makeSpotLight(pos, [-pos[0], -pos[1], -pos[2]], col, lightStageIntensity, {
+          range: extent * stageRange,
+          innerConeAngle: outer * 0.7,
+          outerConeAngle: outer,
+        });
+        sl.castShadows = shadowCastStage;
+        lights.push(sl);
       }
     }
     return lights;
@@ -1060,9 +1097,13 @@ export async function run(
       `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightFlashOn" ${lightFlashOn ? "checked" : ""}/> Camera flashlight</label>`,
       colorRow("lightFlashColor", "Color", lightFlashColor),
       slider("lightFlashIntensity", "Intensity", lightFlashIntensity, 0, 4, 0.05),
+      slider("flashConeDeg", "Cone°", flashConeDeg, 10, 89, 1),
+      slider("flashRange", "Range ×ext", flashRange, 1, 20, 0.5),
       `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightStageOn" ${lightStageOn ? "checked" : ""}/> Stage lights (4 corners)</label>`,
       colorRow("lightStageColor", "Color", lightStageColor),
       slider("lightStageIntensity", "Intensity", lightStageIntensity, 0, 4, 0.05),
+      slider("stageConeDeg", "Cone°", stageConeDeg, 10, 89, 1),
+      slider("stageRange", "Range ×ext", stageRange, 1, 20, 0.5),
       `<div class="whud__hint" style="margin-top:6px">Shading</div>`,
       slider("lightAmbient", "Ambient", lightAmbient, 0, 1, 0.01),
       slider("lightSpecular", "Specular", lightSpecular, 0, 2, 0.05),
@@ -1070,9 +1111,15 @@ export async function run(
       `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="shadowOn" ${shadowOn ? "checked" : ""}/> Shadows</label>`,
       slider("shadowQuality", "Shadow steps", shadowQuality, 4, 64, 1),
       slider("shadowStrength", "Shadow strength", shadowStrength, 0, 1, 0.02),
+      slider("shadowSoftness", "Shadow softness", shadowSoftness, 0, 1, 0.02),
+      `<div class="whud__hint" style="margin-top:4px">Casters (fewer = faster)</div>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastGlobal" ${shadowCastGlobal ? "checked" : ""}/> Global</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastFlash" ${shadowCastFlash ? "checked" : ""}/> Flashlight</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastStage" ${shadowCastStage ? "checked" : ""}/> Stage</label>`,
       `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="aoOn" ${aoOn ? "checked" : ""}/> Ambient occlusion</label>`,
       slider("aoRadius", "AO radius", aoRadius, 0.01, 0.3, 0.01),
       slider("aoIntensity", "AO intensity", aoIntensity, 0, 1, 0.02),
+      slider("aoSamples", "AO samples", aoSamples, 1, 16, 1),
       `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${halfRes ? "checked" : ""}/> Half resolution</label>`,
       `<div class="whud__hint">Shadows + AO cast secondary rays per sample. Enable half-res on large volumes to keep it interactive.</div>`,
     ].join("");
@@ -1223,8 +1270,14 @@ export async function run(
     "lightRoughness",
     "shadowQuality",
     "shadowStrength",
+    "shadowSoftness",
     "aoRadius",
     "aoIntensity",
+    "aoSamples",
+    "flashConeDeg",
+    "flashRange",
+    "stageConeDeg",
+    "stageRange",
   ]);
 
   ui.addEventListener("input", (e) => {
@@ -1261,7 +1314,10 @@ export async function run(
         t.dataset.chk === "lightStageOn" ||
         t.dataset.chk === "shadowOn" ||
         t.dataset.chk === "aoOn" ||
-        t.dataset.chk === "halfRes"
+        t.dataset.chk === "halfRes" ||
+        t.dataset.chk === "shadowCastGlobal" ||
+        t.dataset.chk === "shadowCastFlash" ||
+        t.dataset.chk === "shadowCastStage"
       ) {
         if (t.dataset.chk === "lightGlobalOn") lightGlobalOn = on;
         else if (t.dataset.chk === "lightFlashOn") lightFlashOn = on;
@@ -1269,6 +1325,9 @@ export async function run(
         else if (t.dataset.chk === "shadowOn") shadowOn = on;
         else if (t.dataset.chk === "aoOn") aoOn = on;
         else if (t.dataset.chk === "halfRes") halfRes = on;
+        else if (t.dataset.chk === "shadowCastGlobal") shadowCastGlobal = on;
+        else if (t.dataset.chk === "shadowCastFlash") shadowCastFlash = on;
+        else if (t.dataset.chk === "shadowCastStage") shadowCastStage = on;
         applyLighting();
         emitRendering();
         return;
@@ -1453,6 +1512,27 @@ export async function run(
       case "aoIntensity":
         aoIntensity = v;
         applyLighting();
+        break;
+      case "shadowSoftness":
+        shadowSoftness = v;
+        applyLighting();
+        break;
+      case "aoSamples":
+        aoSamples = v;
+        applyLighting();
+        break;
+      // Cone/range feed buildFrameLights (rebuilt per frame) — just store the value.
+      case "flashConeDeg":
+        flashConeDeg = v;
+        break;
+      case "flashRange":
+        flashRange = v;
+        break;
+      case "stageConeDeg":
+        stageConeDeg = v;
+        break;
+      case "stageRange":
+        stageRange = v;
         break;
       default:
         break;
@@ -1750,9 +1830,18 @@ export async function run(
       shadowOn = state.shadowOn ?? shadowOn;
       shadowQuality = state.shadowQuality ?? shadowQuality;
       shadowStrength = state.shadowStrength ?? shadowStrength;
+      shadowSoftness = state.shadowSoftness ?? shadowSoftness;
+      shadowCastGlobal = state.shadowCastGlobal ?? shadowCastGlobal;
+      shadowCastFlash = state.shadowCastFlash ?? shadowCastFlash;
+      shadowCastStage = state.shadowCastStage ?? shadowCastStage;
       aoOn = state.aoOn ?? aoOn;
       aoRadius = state.aoRadius ?? aoRadius;
       aoIntensity = state.aoIntensity ?? aoIntensity;
+      aoSamples = state.aoSamples ?? aoSamples;
+      flashConeDeg = state.flashConeDeg ?? flashConeDeg;
+      flashRange = state.flashRange ?? flashRange;
+      stageConeDeg = state.stageConeDeg ?? stageConeDeg;
+      stageRange = state.stageRange ?? stageRange;
       halfRes = state.halfRes ?? halfRes;
       applyTf();
       applyRender();

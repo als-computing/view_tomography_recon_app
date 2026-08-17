@@ -129,17 +129,43 @@ fn volAttenuation(dist: f32, range: f32) -> f32 {
 }
 
 // Secondary shadow ray: march from the sample toward the light through the volume, accumulating
-// optical depth, and return transmittance T = exp(-tau). ldir points toward the light (world).
-fn shadowTransmittance(pWorld: vec3<f32>, ldir: vec3<f32>, densityScale: f32) -> f32 {
-  let steps = i32(frame.lightCtl1.y);
-  if (steps <= 0) { return 1.0; }
+// optical depth, and return transmittance T = exp(-tau). ldir points toward the light (world);
+// maxDist is the distance to the (positional) light, or huge for directional. seed is a per-sample
+// hash in [0,1) used to jitter the start (anti-banding) and dither a soft penumbra.
+//
+// The step is tied to the PRIMARY ray step (frame.params.x), not the box size, so the shadow's
+// optical depth uses the same sampling rate as the composite (same sigma = a*densityScale*12) --
+// keeping shadow darkness consistent instead of resolution-dependent. shadowSteps (lightCtl1.y) is a
+// cap on how far we march.
+fn shadowTransmittance(
+  pWorld: vec3<f32>, ldir: vec3<f32>, densityScale: f32, maxDist: f32, seed: f32,
+) -> f32 {
+  let stepsCap = i32(frame.lightCtl1.y);
+  if (stepsCap <= 0) { return 1.0; }
   let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
-  let ext = max(halfExt.x, max(halfExt.y, halfExt.z));
-  let sStep = (2.0 * ext) / f32(steps);
+  let ext2 = 2.0 * max(halfExt.x, max(halfExt.y, halfExt.z));
+  let softness = clamp(frame.lightCtl1.w, 0.0, 1.0);
+  let sStep = max(frame.params.x, 5e-4) * 1.6;
+  // March at most: to the light, across the box, and within the step budget.
+  let marchLen = min(min(ext2, maxDist), f32(stepsCap) * sStep);
+  // Soft shadows: laterally offset the whole ray by up to (softness) steps -- a dithered penumbra that
+  // averages out under FXAA / temporal jitter. Build a basis perpendicular to the light direction.
+  var origin = pWorld;
+  if (softness > 0.0) {
+    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(ldir.y) > 0.9);
+    let tang = normalize(cross(ldir, up));
+    let bitan = cross(ldir, tang);
+    let j1 = fract(seed * 17.13) - 0.5;
+    let j2 = fract(seed * 41.71 + 0.37) - 0.5;
+    origin += (tang * j1 + bitan * j2) * softness * sStep * 2.0;
+  }
+  // Jittered start bias (>= half a step) avoids self-shadow acne and banding.
+  let bias = (0.5 + seed) * sStep;
+  var traveled = bias;
+  var wp = origin + ldir * bias;
   var tau = 0.0;
-  // Offset the start slightly along the light dir to avoid self-shadowing acne.
-  var wp = pWorld + ldir * sStep * 1.5;
-  for (var s = 0; s < steps; s++) {
+  loop {
+    if (traveled >= marchLen) { break; }
     let uvw = (wp + halfExt) / (2.0 * halfExt);
     if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) { break; }
     if (inCrop(uvw)) {
@@ -148,6 +174,7 @@ fn shadowTransmittance(pWorld: vec3<f32>, ldir: vec3<f32>, densityScale: f32) ->
       if (tau > 8.0) { break; }
     }
     wp += ldir * sStep;
+    traveled += sStep;
   }
   let T = exp(-tau);
   return mix(1.0, T, clamp(frame.lightCtl1.z, 0.0, 1.0));
@@ -155,7 +182,7 @@ fn shadowTransmittance(pWorld: vec3<f32>, ldir: vec3<f32>, densityScale: f32) ->
 
 // Volumetric ambient occlusion: sample density outward along the surface normal; more material
 // above a sample = more occluded (darker ambient).
-fn ambientOcclusion(pWorld: vec3<f32>, n: vec3<f32>) -> f32 {
+fn ambientOcclusion(pWorld: vec3<f32>, n: vec3<f32>, seed: f32) -> f32 {
   let samples = i32(frame.lightCtl2.w);
   if (samples <= 0) { return 0.0; }
   let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
@@ -164,14 +191,20 @@ fn ambientOcclusion(pWorld: vec3<f32>, n: vec3<f32>) -> f32 {
   let stepW = radius / f32(samples);
   var occ = 0.0;
   for (var s = 1; s <= samples; s++) {
-    let wp = pWorld + n * stepW * f32(s);
+    // Jitter each tap by (seed) within its step so the AO probe doesn't band on flat features.
+    let wp = pWorld + n * stepW * (f32(s) - 0.5 + seed);
     let uvw = (wp + halfExt) / (2.0 * halfExt);
     if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) { break; }
-    occ += sampleTf(sampleDensity(uvw)).a / f32(samples);
+    if (inCrop(uvw)) {
+      occ += sampleTf(sampleDensity(uvw)).a / f32(samples);
+    }
   }
   return clamp(occ, 0.0, 1.0);
 }
 
+// seed is a per-sample hash for shadow/AO jitter. heavy gates the expensive secondary rays
+// (shadow + AO) to samples that actually contribute to the image (front-of-volume, not yet opaque);
+// low-contribution samples still get cheap diffuse/spec so the look is unchanged.
 fn shadeSample(
   base: vec3<f32>,
   grad: vec3<f32>,
@@ -180,6 +213,8 @@ fn shadeSample(
   density: f32,
   lighting: f32,
   densityScale: f32,
+  seed: f32,
+  heavy: bool,
 ) -> vec3<f32> {
   let gLen = length(grad);
   var n = vec3<f32>(0.0, 1.0, 0.0);
@@ -197,7 +232,7 @@ fn shadeSample(
   let aoOn = frame.lightCtl2.x > 0.5;
 
   var ao = 0.0;
-  if (aoOn) { ao = ambientOcclusion(pWorld, n) * clamp(frame.lightCtl2.z, 0.0, 1.0); }
+  if (aoOn && heavy) { ao = ambientOcclusion(pWorld, n, seed) * clamp(frame.lightCtl2.z, 0.0, 1.0); }
   let ambientTerm = base * masterAmbient * (1.0 - ao);
 
   var diffuseSpec = vec3<f32>(0.0);
@@ -206,11 +241,13 @@ fn shadeSample(
     let kind = i32(Lgt.positionKind.w + 0.5);
     var ldir: vec3<f32>;
     var att = 1.0;
+    var maxDist = 1e30;
     if (kind == 0) {
       ldir = normalize(Lgt.directionRange.xyz);
     } else {
       let toL = Lgt.positionKind.xyz - pWorld;
       let dist = length(toL);
+      maxDist = dist;
       ldir = toL / max(dist, 1e-4);
       att = volAttenuation(dist, Lgt.directionRange.w);
       if (kind == 2) {
@@ -221,7 +258,11 @@ fn shadeSample(
     if (att <= 0.0) { continue; }
     let radiance = Lgt.colorIntensity.xyz * Lgt.colorIntensity.w * att;
     var shadow = 1.0;
-    if (shadowOn) { shadow = shadowTransmittance(pWorld, ldir, densityScale); }
+    // Only shadow-casting lights (spotRect.z flag, set per light on the CPU) cast, and only for
+    // contributing samples (heavy) -- clamps the biggest cost while matching the visible result.
+    if (shadowOn && heavy && Lgt.spotRect.z > 0.5) {
+      shadow = shadowTransmittance(pWorld, ldir, densityScale, maxDist, seed);
+    }
     let ndotl = max(dot(n, ldir), 0.0);
     let H = normalize(ldir + viewDir);
     let ndoth = max(dot(n, H), 0.0);
@@ -451,11 +492,15 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
       var alpha = 1.0 - exp(-sigma * stepSize);
       alpha = max(alpha, planeH * 0.35);
       if (alpha > 1e-4) {
+        // Gate the expensive shadow/AO rays to samples that still meaningfully affect the image:
+        // in front of the volume (remaining transmittance high) and locally opaque enough to matter.
+        let heavy = (1.0 - color.a) > 0.03 && alpha > 0.03;
+        let sseed = fract(jitter + f32(i) * 0.61803399);
         var lit: vec3<f32>;
         if (dielectric) {
           lit = shadeDielectric(src.rgb, src.a, grad, viewDir, rd, density);
         } else {
-          lit = shadeSample(src.rgb, grad, viewDir, p, density, lighting, densityScale);
+          lit = shadeSample(src.rgb, grad, viewDir, p, density, lighting, densityScale, sseed, heavy);
         }
         lit = mix(lit, vec3<f32>(0.95, 0.85, 0.35), planeH * 0.65);
         let a = clamp(alpha, 0.0, 1.0);

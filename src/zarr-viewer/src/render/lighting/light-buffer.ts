@@ -41,7 +41,10 @@ export function packLightsStd430(lights: readonly GpuLight[], maxLights = MAX_LI
       L.directionRange[2]!,
       L.directionRange[3]!,
     );
-    builder.vec4(L.spotRect[0]!, L.spotRect[1]!, L.spotRect[2]!, L.spotRect[3]!);
+    // spotRect.z carries the cast-shadows flag (1/0) for directional/spot lights; the volume shader
+    // reads it to decide which lights march a shadow ray. (Rect lights, unused here, keep width in .z.)
+    const shadowZ = L.castShadows === undefined ? L.spotRect[2]! : L.castShadows ? 1 : 0;
+    builder.vec4(L.spotRect[0]!, L.spotRect[1]!, shadowZ, L.spotRect[3]!);
   }
   // Always reserve at least one light slot so the storage buffer is non-empty for WebGPU.
   if (n === 0) {
