@@ -16,7 +16,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Header } from './Header';
 import './App.css';
 
-import { getDefaultZarrFileUrl, getTiledBaseUrl, TILED_PROCESSED_PATH } from './utils';
+import { getDefaultZarrFileUrl, getTiledBaseUrl, getProcessedPath } from './utils';
 import { installTiledTokenBridge } from './tiledTokenBridge';
 import { installTiledFetchInterceptor } from './ItkVtkNative/tiledAuth';
 import ItkVktNative from './ItkVtkNative/ItkVtkNative';
@@ -35,8 +35,6 @@ import {
   readShareFromLocation,
   zarrUrlFromFileId,
 } from './shareLink';
-
-const defaultZarrFileUrl = getDefaultZarrFileUrl() || '';
 
 function App() {
   const tabs = useTabsStore((s) => s.tabs);
@@ -57,6 +55,10 @@ function App() {
   const setLinkCropping = useTabsStore((s) => s.setLinkCropping);
   const renderer = useTabsStore((s) => s.renderer);
   const toggleRenderer = useTabsStore((s) => s.toggleRenderer);
+  const serverId = useTabsStore((s) => s.serverId);
+  const setServerId = useTabsStore((s) => s.setServerId);
+  // Default scan for the active server — re-derived whenever the server switches.
+  const defaultZarrFileUrl = useMemo(() => getDefaultZarrFileUrl() || '', [serverId]);
   const setRenderer = useTabsStore((s) => s.setRenderer);
 
   const hasLeft = useMemo(() => tabs.some((t) => t.pane === 'left'), [tabs]);
@@ -139,13 +141,13 @@ function App() {
     cropping: linkCropping,
   });
 
-  // Answer token requests from the (legacy) viewer iframe.
-  useEffect(() => installTiledTokenBridge(), []);
+  // Answer token requests from the (legacy) viewer iframe. Re-install per server (refresh endpoint).
+  useEffect(() => installTiledTokenBridge(), [serverId]);
 
   // Attach the Tiled Bearer token to every viewer's zarr requests via a SINGLE app-level fetch/XHR
-  // interceptor (installed once for the Tiled origin). One interceptor covers all viewers, so it
-  // survives the brief overlap of two live viewers during a tab switch.
-  useEffect(() => installTiledFetchInterceptor(getTiledBaseUrl()), []);
+  // interceptor scoped to the active Tiled origin. Re-install when the server switches so chunk
+  // requests to the new origin get the token (the effect's cleanup uninstalls the previous one).
+  useEffect(() => installTiledFetchInterceptor(getTiledBaseUrl()), [serverId]);
 
   // Seed the first tab, once. A shared link (?share=…) wins over the configured default: open its
   // reconstruction and stash the saved view state for handleReady to replay when the viewer loads.
@@ -164,6 +166,17 @@ function App() {
       openTab(defaultZarrFileUrl);
     }
   }, [openTab]);
+
+  // When the Tiled server switches, the store clears all tabs (old-origin URLs) — open the new
+  // server's default scan. Skip the initial mount (handled by the seed effect above).
+  const serverInitRef = useRef(true);
+  useEffect(() => {
+    if (serverInitRef.current) {
+      serverInitRef.current = false;
+      return;
+    }
+    if (defaultZarrFileUrl) openTab(defaultZarrFileUrl);
+  }, [serverId, defaultZarrFileUrl, openTab]);
 
   // The reconstruction a "Share" click captures: in split view the active left pane, else the sole
   // shown tab. Null when nothing is open yet.
@@ -225,6 +238,8 @@ function App() {
         canShare={!!shareTargetId}
         renderer={renderer}
         onToggleRenderer={toggleRenderer}
+        serverId={serverId}
+        onSelectServer={setServerId}
       />
       <TabBar
         tabs={tabs}
@@ -292,7 +307,7 @@ function App() {
         )}
       </div>
       {/* Live "new reconstruction ready" toasts (+ OS notification) for the signed-in user's ESAFs. */}
-      <TiledNotifications parentPath={TILED_PROCESSED_PATH} onView={openTab} />
+      <TiledNotifications key={serverId} parentPath={getProcessedPath()} onView={openTab} />
     </div>
   );
 }

@@ -1,5 +1,6 @@
 import { TiledItemLinks } from "@blueskyproject/tiled";
 import { getValidTiledToken } from "./tiledToken";
+import { getActiveServer } from "./tiledServers";
 
 
 /**
@@ -84,19 +85,14 @@ export const createZarrFileUrlFromTiledItem = (tiledItemData: TiledItemLinks): s
  * - '/api/v1' as the API path
  */
 export const getTiledBaseUrl = (): string => {
-    if (import.meta.env.VITE_API_TILED_URL) {
-        const apiUrl = import.meta.env.VITE_API_TILED_URL;
-        if (!apiUrl.includes('/api/v1')) {
-            console.warn("getTiledBaseUrl: VITE_API_TILED_URL (" + apiUrl + ") does not contain expected /api/v1, using defaults instead.");
-            const defaultUrl = createDefaultTiledBaseUrl();
-            console.log("using default tiled base url:", defaultUrl);
-            return defaultUrl;
-        }
-        const sanitizedUrl = sanitizeTiledBaseUrl(apiUrl);
-        return sanitizedUrl;
-    } else {
+    // The base URL now comes from the runtime-selected server (see tiledServers.ts), not build-time
+    // env, so the header dropdown can switch Local/Remote without a rebuild.
+    const apiUrl = getActiveServer().apiUrl;
+    if (!apiUrl.includes('/api/v1')) {
+        console.warn("getTiledBaseUrl: server apiUrl (" + apiUrl + ") does not contain expected /api/v1, using defaults instead.");
         return createDefaultTiledBaseUrl();
     }
+    return sanitizeTiledBaseUrl(apiUrl);
 };
 
 /**
@@ -221,17 +217,12 @@ export const sanitizeTiledBaseUrl = (tiledBaseUrl: string): string => {
  * and use that file ID if no environment variable is set
  */
 export const getDefaultZarrFileUrl = (): string | null => {
-    // Get default file ID from env variable
-    //TODO: search Tiled for the most recent zarr file (metadata contains "ngff:Image" value) and take that file ID if no env
-    const defaultFileId = import.meta.env.VITE_TILED_DEFAULT_FILE_ID;
+    const defaultFileId = getActiveServer().defaultFileId;
     if (!defaultFileId) {
         return null;
-    } else {
-        const tiledBaseUrl = getTiledBaseUrl();
-        const tiledBaseZarrUrl = tiledBaseUrl.replace('/api/v1', '/zarr/v2');
-        const zarr_file_url = `${tiledBaseZarrUrl}/${defaultFileId}`;
-        return zarr_file_url;
     }
+    const tiledBaseZarrUrl = getTiledBaseUrl().replace('/api/v1', '/zarr/v2');
+    return `${tiledBaseZarrUrl}/${defaultFileId}`;
 }
 
 /**
@@ -278,12 +269,10 @@ export const isTokenExpired = (token: string | null | undefined, skewSeconds = 3
 
 /**
  * Parent catalog path whose immediate subfolders populate the folder dropdown in the header.
- *
- * Configurable via the `VITE_TILED_PROCESSED_PATH` env variable (matching the app's other
- * `VITE_`-prefixed config), defaulting to the bl832 processed tree.
+ * Comes from the active {@link getActiveServer} config so it follows the Local/Remote selection
+ * (a function, not a const, since the selection can change at runtime).
  */
-export const TILED_PROCESSED_PATH: string =
-    import.meta.env.VITE_TILED_PROCESSED_PATH ?? 'beamlines/bl832/processed';
+export const getProcessedPath = (): string => getActiveServer().processedPath;
 
 /**
  * Lists the container (folder) children directly under `parentPath` on the Tiled server.

@@ -7,10 +7,11 @@ import {
   createZarrFileUrlFromTiledItem,
   fetchTiledContainerChildren,
   getTiledBaseUrl,
-  TILED_PROCESSED_PATH,
+  getProcessedPath,
 } from './utils';
 import type { RendererKind } from './stores/useTabsStore';
 import { webGpuAvailability } from './WebGpuNative/WebGpuNative';
+import { TILED_SERVERS, getActiveServer, type TiledServerId } from './tiledServers';
 
 export interface HeaderProps {
   logoUrl: string;
@@ -30,6 +31,10 @@ export interface HeaderProps {
   renderer?: RendererKind;
   /** Flip the app-wide volume renderer between itk and webgpu. */
   onToggleRenderer?: () => void;
+  /** The active Tiled server (Local/Remote). */
+  serverId?: TiledServerId;
+  /** Switch the active Tiled server. */
+  onSelectServer?: (id: TiledServerId) => void;
 }
 
 export const Header = ({
@@ -40,6 +45,8 @@ export const Header = ({
   canShare = false,
   renderer = 'itk',
   onToggleRenderer,
+  serverId,
+  onSelectServer,
 }: HeaderProps) => {
   const [selectedFolder, setSelectedFolder] = useState<string>('');
   const [copied, setCopied] = useState(false);
@@ -61,11 +68,18 @@ export const Header = ({
   // Server state: the subfolders under the processed path that populate the folder dropdown.
   // TanStack Query handles caching, retries, and refetch-on-focus (so it recovers once the user
   // logs in on an auth-required server).
+  const processedPath = getProcessedPath();
   const { data: folders = [], isLoading, isError } = useQuery({
-    queryKey: ['tiled-children', TILED_PROCESSED_PATH],
-    queryFn: ({ signal }) => fetchTiledContainerChildren(TILED_PROCESSED_PATH, signal),
+    // Keyed by server so switching Local/Remote refetches the new server's folders.
+    queryKey: ['tiled-children', serverId, processedPath],
+    queryFn: ({ signal }) => fetchTiledContainerChildren(processedPath, signal),
   });
   const status: 'loading' | 'ready' | 'error' = isLoading ? 'loading' : isError ? 'error' : 'ready';
+
+  // Reset the folder selection when the server switches (the old folder doesn't exist on the new one).
+  useEffect(() => {
+    setSelectedFolder('');
+  }, [serverId]);
 
   // Default the selection once folders load (preserve the app's previous default of 'dabramov').
   useEffect(() => {
@@ -80,9 +94,9 @@ export const Header = ({
   // needs it visible to open the browser and log in, which is what lets the dropdown load.
   // Join parent + folder, dropping empty segments so a root parent ('') doesn't yield a leading '/'.
   const selectedPath = selectedFolder
-    ? [TILED_PROCESSED_PATH, selectedFolder].filter(Boolean).join('/')
+    ? [processedPath, selectedFolder].filter(Boolean).join('/')
     : '';
-  const tiledInitialPath = selectedPath || TILED_PROCESSED_PATH;
+  const tiledInitialPath = selectedPath || processedPath;
 
   const handleTiledWidgetSelect = (tiledSelectedItemData: TiledItemLinks) => {
     const file_url = createZarrFileUrlFromTiledItem(tiledSelectedItemData);
@@ -104,6 +118,21 @@ export const Header = ({
           <h1>{title}</h1>
         </div>
         <div className="header-tiled-controls">
+          {onSelectServer && (
+            <label className="header-folder-picker">
+              Server:{' '}
+              <select
+                value={serverId ?? getActiveServer().id}
+                onChange={(event) => onSelectServer(event.target.value as TiledServerId)}
+              >
+                {TILED_SERVERS.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <label className="header-folder-picker">
             Folder:{' '}
             <select
@@ -125,8 +154,8 @@ export const Header = ({
             </select>
           </label>
           <Tiled
-            key={tiledInitialPath}
-            oidcRedirectUrl="http://tiled-test:5174/tomo_viewer/"
+            key={`${serverId ?? getActiveServer().id}:${tiledInitialPath}`}
+            oidcRedirectUrl={getActiveServer().oidcRedirectUrl}
             isButtonMode={true}
             onSelectCallback={handleTiledWidgetSelect}
             tiledBaseUrl={getTiledBaseUrl()}

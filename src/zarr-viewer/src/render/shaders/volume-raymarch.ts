@@ -10,7 +10,7 @@
 import { LIGHT_STRUCT_WGSL } from "./lights.js";
 
 /** Byte size of the volume frame uniform block (mat4 + 14 × vec4). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 288;
+export const VOLUME_FRAME_UNIFORM_SIZE = 320;
 
 /** High-quality volume ray-march WGSL (vertex + fragment). */
 export const VOLUME_RAYMARCH_WGSL = /* wgsl */ `
@@ -30,6 +30,8 @@ struct Frame {
   lightCtl0: vec4<f32>,      // x = numLights, y = masterAmbient, z = specStrength, w = roughness
   lightCtl1: vec4<f32>,      // x = shadowEnable, y = shadowSteps, z = shadowStrength, w = shadowSoftness
   lightCtl2: vec4<f32>,      // x = aoEnable, y = aoRadius (uvw frac), z = aoIntensity, w = aoSamples
+  measurePlane: vec4<f32>,   // x = enable, y = depth (world, along view axis), z = gray, w = alpha
+  measureFwd: vec4<f32>,     // xyz = camera forward (world, unit); marks the measure plane in depth
 };
 
 // slices.w bits: 1=xEn, 2=yEn, 4=zEn, 8=showPlanes, 16/32 = viewMode (0 vol, 1 x, 2 y, 3 z) in bits 4-5
@@ -397,11 +399,29 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   let alphaComposite = frame.composite.x > 0.5;
   let bg = background(rd);
 
+  // Measure plane: a fronto-parallel grey sheet at a fixed depth in front of the camera. t at which the
+  // ray crosses it = depth / cos(angle to view axis). Composited in depth order so the volume in front
+  // occludes it and it dims volume behind (a real depth cue), not a flat overlay.
+  let measureOn = frame.measurePlane.x > 0.5;
+  let planeGray = frame.measurePlane.z;
+  let planeAlpha = clamp(frame.measurePlane.w, 0.0, 1.0);
+  let cosR = dot(rd, frame.measureFwd.xyz);
+  var planeT = -1.0;
+  if (measureOn && planeAlpha > 0.0 && cosR > 1e-4) { planeT = frame.measurePlane.y / cosR; }
+
   let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
   let boxMin = -halfExt;
   let boxMax = halfExt;
   let hit = intersectAabb(ro, rd, boxMin, boxMax);
   if (hit.x > hit.y || hit.y < 0.0) {
+    // No volume along this ray — still paint the measure plane where it sits in front of the camera.
+    if (planeT > 0.0) {
+      if (alphaComposite) { return vec4<f32>(vec3<f32>(planeGray) * planeAlpha, planeAlpha); }
+      let comp = mix(bg, vec3<f32>(planeGray), planeAlpha);
+      if (frame.composite.y >= 0.5) { return vec4<f32>(comp, 1.0); }
+      let outC = tonemapACES(comp);
+      return vec4<f32>(pow(outC, vec3<f32>(0.95)), 1.0);
+    }
     if (alphaComposite) {
       return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
@@ -436,10 +456,19 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   var avgRgb = vec3<f32>(0.0);
   var avgW = 0.0;
   let viewDir = -rd;
+  // Only composite the plane in front-to-back composite mode; disabled for MIP/minIP/average.
+  var planeDone = !(planeT > 0.0) || blendMode != 0;
   var i = 0;
   loop {
     if (i >= maxSteps || t > tEnd) { break; }
     if (blendMode == 0 && color.a > 0.995) { break; }
+
+    // Cross the measure plane in depth order: composite it before the sample once the ray reaches it.
+    if (!planeDone && t >= planeT) {
+      let om = 1.0 - color.a;
+      color = vec4<f32>(color.rgb + om * planeAlpha * vec3<f32>(planeGray), color.a + om * planeAlpha);
+      planeDone = true;
+    }
 
     let p = ro + rd * t;
     let uvw = clamp((p + halfExt) / (2.0 * halfExt), vec3<f32>(0.0), vec3<f32>(1.0));
@@ -511,6 +540,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     t += stepSize;
     i += 1;
+  }
+
+  // Plane sits behind all volume samples (or the ray left the box before reaching it): composite last.
+  if (!planeDone) {
+    let om = 1.0 - color.a;
+    color = vec4<f32>(color.rgb + om * planeAlpha * vec3<f32>(planeGray), color.a + om * planeAlpha);
   }
 
   var outRgb: vec3<f32>;

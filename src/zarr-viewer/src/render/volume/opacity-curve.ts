@@ -25,6 +25,12 @@ export interface ComposeTransferFunctionOptions {
   opacityScale?: number;
   /** LUT sample count when building stops. Default `32`. */
   samples?: number;
+  /**
+   * Optional intensity remap LUT (e.g. a contrast-limited histogram-equalization CDF), sampled after
+   * the color window: the colormap is looked up at `remap(ct)` instead of `ct`. Values in `[0,1]`; any
+   * length (linearly interpolated). Omit for the default linear window.
+   */
+  intensityRemap?: Float32Array;
 }
 
 function clamp01(v: number): number {
@@ -72,16 +78,26 @@ export function composeTransferFunction(
   const [cLo, cHi] = options.colorRange ?? [0, 1];
   const cSpan = Math.max(1e-6, cHi - cLo);
   const scale = options.opacityScale ?? 1;
+  const remap = options.intensityRemap;
   const n = Math.max(8, options.samples ?? 32);
   const stops: TransferStop[] = [];
   for (let i = 0; i < n; i++) {
     const t = i / (n - 1);
-    const ct = clamp01((t - cLo) / cSpan);
+    let ct = clamp01((t - cLo) / cSpan);
+    if (remap && remap.length > 1) ct = sampleLut(remap, ct);
     const [r, g, b] = sampleColorMap(map, ct);
     const a = clamp01(sampleOpacity(opacityPts, t) * scale);
     stops.push({ position: t, color: [r, g, b, a] });
   }
   return new TransferFunction(stops);
+}
+
+/** Sample a normalized-domain LUT at x in [0,1] with linear interpolation. */
+function sampleLut(lut: Float32Array, x: number): number {
+  const f = clamp01(x) * (lut.length - 1);
+  const i = Math.floor(f);
+  if (i >= lut.length - 1) return lut[lut.length - 1]!;
+  return lut[i]! + (lut[i + 1]! - lut[i]!) * (f - i);
 }
 
 /** Move / insert an opacity point; keeps intensity sorted and clamped. */

@@ -74,6 +74,8 @@ export interface WebGpuRenderingState {
   colorMap: ColorMapName;
   colorLo: number;
   colorHi: number;
+  equalizeOn: boolean;
+  equalizeClip: number;
   opacityScale: number;
   opacityPoints: OpacityPoint[];
   densityScale: number;
@@ -126,6 +128,10 @@ export interface WebGpuRenderingState {
   stageConeDeg: number;
   stageRange: number;
   halfRes: boolean;
+  measurePlaneOn: boolean;
+  measureDepth: number;
+  measurePlaneGray: number;
+  measurePlaneAlpha: number;
 }
 
 /** The ROI crop box plus the slice planes (positions, per-axis enables, overlay visibility). */
@@ -184,11 +190,6 @@ function niceFloor125(x: number): number {
   return m * base;
 }
 
-/** Format a nice-number for a scale-bar label, stripping float noise (e.g. 0.30000004 → "0.3"). */
-function formatNice(v: number): string {
-  return String(Number(v.toPrecision(6)));
-}
-
 function zarrUrlFromQuery(): string {
   const q = new URLSearchParams(window.location.search).get("zarr");
   return q && q.length > 0 ? q : DEFAULT_ZARR;
@@ -222,6 +223,11 @@ export async function run(
   let colorHi = 0.85;
   let opacityScale = 1;
   let opacityPoints: OpacityPoint[] = [...DEFAULT_OPACITY_POINTS];
+  // Auto-contrast: global contrast-limited histogram equalization (a CLAHE-style but non-adaptive
+  // remap) applied to the colormap sampling; off by default. Clip limit ≈ OpenCV CLAHE clipLimit.
+  let equalizeOn = false;
+  let equalizeClip = 2;
+  let equalizeRemap: Float32Array | undefined; // CDF remap LUT while equalizeOn
   let densityScale = 1.45;
   let exposure = 1.2;
   let sampleDist = 1;
@@ -290,6 +296,13 @@ export async function run(
   let loading = false;
   let baseStep = 1 / 220;
   let pickMode = false;
+  // Measure plane: a camera-linked fronto-parallel reference plane the edge rulers calibrate to. When
+  // off, the rulers use the orbit-pivot depth (exact at the volume center). When on, they use
+  // `measureDepth` (× extent) in front of the camera and a faint grid marks that plane.
+  let measurePlaneOn = false;
+  let measureDepth = 0.5; // 0..1 fraction across the volume's depth footprint (0 = front face, 1 = back)
+  let measurePlaneGray = 0.6; // plane greyscale value [0,1]
+  let measurePlaneAlpha = 0.35; // plane opacity [0,1]
   let measuring = false;
   let lastPick: PickedFeature | undefined;
   let pickStatus = "";
@@ -302,6 +315,8 @@ export async function run(
     colorMap,
     colorLo,
     colorHi,
+    equalizeOn,
+    equalizeClip,
     opacityScale,
     opacityPoints: opacityPoints.map((p) => [p[0], p[1]] as const),
     densityScale,
@@ -352,6 +367,10 @@ export async function run(
     stageConeDeg,
     stageRange,
     halfRes,
+    measurePlaneOn,
+    measureDepth,
+    measurePlaneGray,
+    measurePlaneAlpha,
   });
   const readCropping = (): WebGpuCroppingState => ({
     cropMin: [cropMin[0], cropMin[1], cropMin[2]],
@@ -596,7 +615,8 @@ export async function run(
 
   const sim = units.UNIT_PRESETS.microscopy;
   const sizeSim = new Vec3();
-  let histogram: Float32Array | undefined;
+  let histogram: Float32Array | undefined; // the DISPLAYED histogram (equalized when equalizeOn)
+  let rawHistogram: Float32Array | undefined; // the true distribution (percentiles + toggling equalize)
   let curveEditor: OpacityCurveEditor | undefined;
 
   // Progressive coarse→fine loader: owns the per-level GPU textures and streams finer levels toward
@@ -673,11 +693,90 @@ export async function run(
       colorRange: [colorLo, colorHi],
       opacityScale,
       samples: 48,
+      intensityRemap: equalizeOn ? equalizeRemap : undefined,
     });
     volumeRenderer.setTransferFunction(tf, 512);
     curveEditor?.setColorMap(colorMap);
     curveEditor?.setPoints(opacityPoints);
     curveEditor?.setColorRange([colorLo, colorHi]);
+  };
+
+  // --- Auto-contrast helpers (operate on the normalized [0,1] intensity histogram) ---------------
+  // Percentile auto-window (matches Seg Studio stretch.ts, default 2–98%). Bin 0 is skipped: uploadVolume
+  // zero-fills empty voxels, piling background mass into bin 0 which would bias the low percentile.
+  const autoWindow = (hist: Float32Array, loP = 0.02, hiP = 0.98): [number, number] => {
+    const n = hist.length;
+    let total = 0;
+    for (let i = 1; i < n; i++) total += hist[i]!;
+    if (total <= 0) return [colorLo, colorHi];
+    const loT = total * loP;
+    const hiT = total * hiP;
+    let loBin = 1;
+    let hiBin = n - 1;
+    let cum = 0;
+    for (let i = 1; i < n; i++) {
+      cum += hist[i]!;
+      if (cum >= loT) { loBin = i; break; }
+    }
+    cum = 0;
+    for (let i = 1; i < n; i++) {
+      cum += hist[i]!;
+      if (cum >= hiT) { hiBin = i; break; }
+    }
+    let lo = loBin / n;
+    let hi = hiBin / n;
+    if (hi - lo < 0.02) {
+      const mid = (lo + hi) / 2;
+      lo = Math.max(0, mid - 0.01);
+      hi = Math.min(1, mid + 0.01);
+    }
+    return [lo, hi];
+  };
+
+  // Contrast-limited (global) histogram equalization → a normalized CDF remap LUT. Bins are clipped to
+  // clip×mean and the excess redistributed (OpenCV-style), background bin 0 ignored.
+  const buildEqualizeRemap = (hist: Float32Array, clip: number): Float32Array => {
+    const n = hist.length;
+    const work = new Float32Array(n);
+    let total = 0;
+    for (let i = 1; i < n; i++) { work[i] = hist[i]!; total += hist[i]!; }
+    const lut = new Float32Array(n);
+    if (total <= 0) {
+      for (let i = 0; i < n; i++) lut[i] = i / (n - 1);
+      return lut;
+    }
+    const mean = total / (n - 1);
+    const limit = Math.max(mean, clip * mean);
+    let excess = 0;
+    for (let i = 1; i < n; i++) if (work[i]! > limit) { excess += work[i]! - limit; work[i] = limit; }
+    const add = excess / (n - 1);
+    let sum = 0;
+    for (let i = 1; i < n; i++) { work[i] = work[i]! + add; sum += work[i]!; }
+    let cum = 0;
+    for (let i = 0; i < n; i++) { cum += work[i]!; lut[i] = sum > 0 ? cum / sum : i / (n - 1); }
+    return lut;
+  };
+
+  // Move each bin's mass to its remapped position → the displayed (equalized) histogram.
+  const rebinThroughRemap = (hist: Float32Array, remap: Float32Array): Float32Array => {
+    const n = hist.length;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const dst = Math.min(n - 1, Math.max(0, Math.round(remap[i]! * (n - 1))));
+      out[dst] += hist[i]!;
+    }
+    return out;
+  };
+
+  // Recompute the equalize remap + displayed histogram from the raw distribution and current toggle.
+  const recomputeEqualize = (): void => {
+    if (equalizeOn && rawHistogram) {
+      equalizeRemap = buildEqualizeRemap(rawHistogram, equalizeClip);
+      histogram = rebinThroughRemap(rawHistogram, equalizeRemap);
+    } else {
+      equalizeRemap = undefined;
+      histogram = rawHistogram;
+    }
   };
 
   const applyRender = (): void => {
@@ -769,8 +868,10 @@ export async function run(
   const onDisplayedLevel = (result: VolumeLevelResult): void => {
     level = result.level;
     volumeRenderer.setVolume(result.texture);
-    histogram = result.histogram;
-    curveEditor?.setHistogram(histogram);
+    rawHistogram = result.histogram;
+    recomputeEqualize(); // sets `histogram` (equalized when on) + refreshes the remap for this level
+    if (histogram) curveEditor?.setHistogram(histogram);
+    if (equalizeOn) applyTf(); // the remap changed with the new level's distribution
     const [sx, sy, sz] = source.spacingAt(level);
     baseStep = Math.max(
       Math.max(
@@ -979,6 +1080,12 @@ export async function run(
       `<canvas id="opacity-curve" style="width:100%;height:84px;display:block;touch-action:none;cursor:crosshair"></canvas>`,
       // Dual-thumb color-range slider under the graph — both heads set [colorLo, colorHi] together.
       rangeSlider("color", "Color range", colorLo, colorHi, 0.005),
+      // Auto contrast: percentile auto-window + global contrast-limited equalization.
+      `<div class="whud__row" style="gap:8px;margin-top:4px">` +
+        `<button type="button" data-act="autoContrast" class="whud__seg-btn">Auto</button>` +
+        `<label class="whud__check" style="margin:0"><input type="checkbox" data-chk="equalizeOn" ${equalizeOn ? "checked" : ""}/> Equalize</label>` +
+        `</div>`,
+      slider("equalizeClip", "Clip limit", equalizeClip, 1, 8, 0.5),
     ].join("");
 
     // Render section
@@ -1060,7 +1167,12 @@ export async function run(
         ].join("")
       : "";
     const measureBody = [
-      `<div class="whud__hint">Click a structure to grow a connected component and measure its physical volume (current LOD).</div>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="measurePlaneOn" ${measurePlaneOn ? "checked" : ""}/> Measure plane (camera-linked ruler)</label>`,
+      slider("measureDepth", "Plane depth (front→back)", measureDepth, 0, 1, 0.01),
+      slider("measureGray", "Plane gray", measurePlaneGray, 0, 1, 0.02),
+      slider("measureAlpha", "Plane opacity", measurePlaneAlpha, 0, 1, 0.02),
+      `<div class="whud__hint">A grey sheet that sweeps from the volume's front face (0) to its back face (1) along the view axis, tracking zoom; the volume in front of it occludes it and it dims volume behind, so you can read depth. Rulers calibrate to this plane; off = exact at the volume center.</div>`,
+      `<div class="whud__hint" style="margin-top:8px">Click a structure to grow a connected component and measure its physical volume (current LOD).</div>`,
       `<label class="whud__check"><input type="checkbox" data-chk="pickMode" ${pickMode ? "checked" : ""}/> Pick mode (or Ctrl+click)</label>`,
       `<div class="whud__row"><button type="button" data-act="clearPick" class="whud__seg-btn">Clear selection</button></div>`,
       pickStatus ? `<div style="margin-top:8px;font-size:11px">${pickStatus}</div>` : "",
@@ -1212,6 +1324,16 @@ export async function run(
       frameSliceCamera();
       return;
     }
+    if (btn.dataset.act === "autoContrast") {
+      // Percentile auto-window from the true distribution → color levels; refresh UI + slider thumbs.
+      if (rawHistogram) {
+        [colorLo, colorHi] = autoWindow(rawHistogram);
+        applyTf();
+        renderUi();
+        emitRendering();
+      }
+      return;
+    }
     if (btn.dataset.act === "clearPick") {
       lastPick = undefined;
       pickStatus = "";
@@ -1245,6 +1367,10 @@ export async function run(
     "gradOp",
     "gradScale",
     "lighting",
+    "equalizeClip",
+    "measureDepth",
+    "measureGray",
+    "measureAlpha",
   ]);
   // Single-value sliders that emit a cropping change. (Crop min/max are dual-thumb `data-range`
   // groups handled separately below — they emit their own croppingChange.)
@@ -1305,6 +1431,19 @@ export async function run(
         else if (t.dataset.chk === "fxSharpen") fxSharpen = on;
         else if (t.dataset.chk === "fxVignette") fxVignette = on;
         rebuildFxStack();
+        emitRendering();
+        return;
+      }
+      if (t.dataset.chk === "equalizeOn") {
+        equalizeOn = on;
+        recomputeEqualize();
+        applyTf();
+        renderUi(); // refresh the histogram (equalized vs raw) + curve editor
+        emitRendering();
+        return;
+      }
+      if (t.dataset.chk === "measurePlaneOn") {
+        measurePlaneOn = on; // the render loop reads this live; just emit for links/share
         emitRendering();
         return;
       }
@@ -1393,6 +1532,23 @@ export async function run(
       case "opacityScale":
         opacityScale = v;
         applyTf();
+        break;
+      case "measureDepth":
+        measureDepth = v; // the render loop reads these live (ruler + plane depth/appearance)
+        break;
+      case "measureGray":
+        measurePlaneGray = v;
+        break;
+      case "measureAlpha":
+        measurePlaneAlpha = v;
+        break;
+      case "equalizeClip":
+        equalizeClip = v;
+        if (equalizeOn) {
+          recomputeEqualize();
+          applyTf();
+          if (histogram) curveEditor?.setHistogram(histogram);
+        }
         break;
       case "sampleDist":
         sampleDist = v;
@@ -1742,6 +1898,27 @@ export async function run(
         extent,
       ),
     );
+    // Measure plane depth in world units along the view axis. `measureDepth` is a 0..1 fraction across
+    // the volume's actual depth footprint (0 = front face nearest the camera, 1 = back face), so the
+    // plane and its calibrated ruler track zoom instead of a fixed multiple of the extent. The AABB is
+    // centered at the origin with half-extents sizeSim/2; its projected half-depth along the unit view
+    // axis is 0.5·Σ(size·|axisⁱ|). Clamp the front to `near` (usable when the eye is inside the volume)
+    // and the slider fraction to [0,1] (keeps legacy shared values, which used a 0.2..6 range, sane).
+    const halfDepth =
+      0.5 * (sizeSim.x * Math.abs(fx) + sizeSim.y * Math.abs(fy) + sizeSim.z * Math.abs(fz));
+    const frontDepth = Math.max(centerDepth - halfDepth, near);
+    const backDepth = Math.max(centerDepth + halfDepth, frontDepth + 1e-6);
+    const planeT = Math.min(1, Math.max(0, measureDepth));
+    const planeDepth = frontDepth + planeT * (backDepth - frontDepth);
+    // Measure plane: depth-composited grey sheet at `planeDepth` along the view axis. Must run before
+    // recordInto (writes the frame uniform).
+    volumeRenderer.setMeasurePlane({
+      enabled: measurePlaneOn,
+      depth: planeDepth,
+      gray: measurePlaneGray,
+      alpha: measurePlaneAlpha,
+      forward: [fx, fy, fz],
+    });
     // Volume → linear HDR, then the post stack to the swapchain (one encoder / one submit). The DOM
     // overlay (gizmo + scale bar) draws to a separate canvas and is unaffected.
     fxPipeline.render({ r: 0.015, g: 0.02, b: 0.035, a: 1 }, (pass) => {
@@ -1752,24 +1929,38 @@ export async function run(
     // world right/up/forward columns of the camera; forward (fx,fy,fz) is already unit-normalized above.
     const rlen = Math.hypot(wm[0]!, wm[1]!, wm[2]!) || 1;
     const ulen = Math.hypot(wm[4]!, wm[5]!, wm[6]!) || 1;
-    // Scale bar: world (sim µm) per CSS pixel at the orbit-target depth (perspective → exact at target).
-    let scaleBar: { px: number; label: string } | null = null;
+    // Edge rulers: world (sim µm) per CSS pixel at the calibration depth. Perspective ⇒ exact only on
+    // the fronto-parallel plane at that depth; isotropic, so X and Y share one scale. The depth is the
+    // orbit-pivot distance by default, or the camera-linked measure plane depth (a fraction across the
+    // volume's view-axis footprint) when the plane is on (the plane itself is rendered by the volume
+    // shader). ~80px major spacing.
+    const measureDist = measurePlaneOn ? planeDepth : controls.distance;
+    let ruler: {
+      majorPx: number;
+      minorPerMajor: number;
+      majorValue: number;
+      unitLabel: string;
+    } | null = null;
     const cssH = canvas.clientHeight;
-    if (cssH > 0 && Number.isFinite(controls.distance) && controls.distance > 0) {
-      const worldPerPx = (2 * controls.distance * Math.tan(controls.fovY / 2)) / cssH;
-      const targetPx = 100;
+    if (cssH > 0 && Number.isFinite(measureDist) && measureDist > 0) {
+      const worldPerPx = (2 * measureDist * Math.tan(controls.fovY / 2)) / cssH;
       const u = lengthUnit();
-      const rawVal = units.fromSim(targetPx * worldPerPx, units.LENGTH, sim).to(u);
-      if (Number.isFinite(rawVal) && rawVal > 0) {
-        const nice = niceFloor125(rawVal);
-        scaleBar = { px: (nice / rawVal) * targetPx, label: `${formatNice(nice)} ${u.symbol}` };
+      const dispPerPx = units.fromSim(worldPerPx, units.LENGTH, sim).to(u); // display units / css px
+      if (Number.isFinite(dispPerPx) && dispPerPx > 0) {
+        const majorValue = niceFloor125(dispPerPx * 80);
+        ruler = {
+          majorPx: majorValue / dispPerPx,
+          minorPerMajor: 5,
+          majorValue,
+          unitLabel: u.symbol,
+        };
       }
     }
     overlay.draw({
       right: [wm[0]! / rlen, wm[1]! / rlen, wm[2]! / rlen],
       up: [wm[4]! / ulen, wm[5]! / ulen, wm[6]! / ulen],
       forward: [fx, fy, fz],
-      scaleBar,
+      ruler,
     });
   });
 
@@ -1843,6 +2034,13 @@ export async function run(
       stageConeDeg = state.stageConeDeg ?? stageConeDeg;
       stageRange = state.stageRange ?? stageRange;
       halfRes = state.halfRes ?? halfRes;
+      measurePlaneOn = state.measurePlaneOn ?? measurePlaneOn;
+      measureDepth = state.measureDepth ?? measureDepth;
+      measurePlaneGray = state.measurePlaneGray ?? measurePlaneGray;
+      measurePlaneAlpha = state.measurePlaneAlpha ?? measurePlaneAlpha;
+      equalizeOn = state.equalizeOn ?? equalizeOn;
+      equalizeClip = state.equalizeClip ?? equalizeClip;
+      recomputeEqualize(); // rebuild the remap + displayed histogram from this viewer's own data
       applyTf();
       applyRender();
       rebuildFxStack();

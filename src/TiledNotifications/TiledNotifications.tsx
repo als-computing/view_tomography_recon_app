@@ -15,7 +15,7 @@
 
 import { useEffect, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { fetchTiledContainerChildren, getTiledBaseUrl, TILED_PROCESSED_PATH } from '../utils';
+import { fetchTiledContainerChildren, getTiledBaseUrl, getProcessedPath } from '../utils';
 import { buildZarrUrlForChild } from './buildTiledStreamUrl';
 import { ensureNotificationPermission, showOsNotification } from './osNotifications';
 import { ToastProvider, useToasts } from './ToastProvider';
@@ -71,7 +71,7 @@ const NodeStream = ({
 };
 
 const TiledNotificationsInner = ({
-  parentPath = TILED_PROCESSED_PATH,
+  parentPath = getProcessedPath(),
   onView,
   resolveWatchPaths,
   resolveIntervalMs = 60000,

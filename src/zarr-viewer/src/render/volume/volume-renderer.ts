@@ -143,6 +143,12 @@ export class VolumeRenderer implements Disposable {
   private aoRadius = 0.08;
   private aoIntensity = 0.7;
   private aoSamples = 6;
+  // Measure plane: a camera-linked fronto-parallel grey sheet composited in depth with the volume.
+  private measurePlaneEnabled = false;
+  private measurePlaneDepth = 0; // world units along the view axis (from the eye)
+  private measurePlaneGray = 0.5;
+  private measurePlaneAlpha = 0.35;
+  private measureForward: [number, number, number] = [0, 0, 1];
 
   private pipeline: GPURenderPipeline | undefined;
   private frameUniform: ManagedBuffer | undefined;
@@ -245,6 +251,25 @@ export class VolumeRenderer implements Disposable {
   public setLights(lights: readonly GpuLight[]): void {
     this.lightEnv!.setLights(lights);
     this.numLights = this.lightEnv!.lightCount;
+  }
+
+  /**
+   * Camera-linked measure plane: a fronto-parallel grey sheet composited in depth with the volume.
+   * `depth` is world distance from the eye along `forward` (a unit view-axis vector); `gray`/`alpha` in
+   * [0,1]. Call each frame with the current camera forward so the plane tracks the view.
+   */
+  public setMeasurePlane(params: {
+    enabled: boolean;
+    depth: number;
+    gray: number;
+    alpha: number;
+    forward: readonly [number, number, number];
+  }): void {
+    this.measurePlaneEnabled = params.enabled;
+    this.measurePlaneDepth = params.depth;
+    this.measurePlaneGray = params.gray;
+    this.measurePlaneAlpha = params.alpha;
+    this.measureForward = [params.forward[0], params.forward[1], params.forward[2]];
   }
 
   /** Shadow / AO / master-ambient / specular controls for the multi-light path. */
@@ -487,6 +512,16 @@ export class VolumeRenderer implements Disposable {
     d[69] = this.aoRadius;
     d[70] = this.aoIntensity;
     d[71] = this.aoSamples;
+    // measurePlane: enable, depth (world along view axis), gray, alpha
+    d[72] = this.measurePlaneEnabled ? 1 : 0;
+    d[73] = this.measurePlaneDepth;
+    d[74] = this.measurePlaneGray;
+    d[75] = this.measurePlaneAlpha;
+    // measureFwd: camera forward (world, unit)
+    d[76] = this.measureForward[0];
+    d[77] = this.measureForward[1];
+    d[78] = this.measureForward[2];
+    d[79] = 0;
     this.frameUniform!.write(d);
 
     pass.setPipeline(this.pipeline!);

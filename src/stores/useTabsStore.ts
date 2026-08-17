@@ -16,6 +16,11 @@
  */
 
 import { create } from 'zustand';
+import {
+  getActiveServerId,
+  setActiveServerId,
+  type TiledServerId,
+} from '../tiledServers';
 
 export type PaneSide = 'left' | 'right';
 
@@ -48,6 +53,8 @@ export interface TabsState {
   linkCropping: boolean;
   /** Which volume renderer every viewer uses (app-wide, not per tab). */
   renderer: RendererKind;
+  /** Active Tiled server (Local/Remote), persisted in localStorage via tiledServers.ts. */
+  serverId: TiledServerId;
 
   /** Open a url as a tab in the left pane (focus it if already open) and activate it. */
   openTab: (url: string) => void;
@@ -68,6 +75,11 @@ export interface TabsState {
   setRenderer: (renderer: RendererKind) => void;
   /** Flip the app-wide volume renderer between itk and webgpu. */
   toggleRenderer: () => void;
+  /**
+   * Switch the active Tiled server. Persists the choice and clears all tabs (their URLs point at the
+   * old origin); App re-derives the default scan + re-installs the auth interceptor for the new origin.
+   */
+  setServerId: (id: TiledServerId) => void;
 }
 
 /** Grace period a hidden tab's viewer stays mounted before being disposed. */
@@ -140,6 +152,7 @@ export const useTabsStore = create<TabsState>()((set, get) => {
     linkRendering: true,
     linkCropping: true,
     renderer: 'itk',
+    serverId: getActiveServerId(),
 
     openTab: (url) => {
       const existing = get().tabs.find((t) => t.url === url);
@@ -252,5 +265,19 @@ export const useTabsStore = create<TabsState>()((set, get) => {
     setLinkCropping: (value) => set({ linkCropping: value }),
     setRenderer: (renderer) => set({ renderer }),
     toggleRenderer: () => set((s) => ({ renderer: s.renderer === 'itk' ? 'webgpu' : 'itk' })),
+    setServerId: (id) => {
+      if (id === get().serverId) return;
+      setActiveServerId(id);
+      // Old tabs hold old-origin URLs — drop them all; App opens the new server's default scan.
+      graceTimers.forEach((t) => clearTimeout(t));
+      graceTimers.clear();
+      set({
+        serverId: id,
+        tabs: [],
+        activeLeftId: null,
+        activeRightId: null,
+        liveIds: new Set<string>(),
+      });
+    },
   };
 });
