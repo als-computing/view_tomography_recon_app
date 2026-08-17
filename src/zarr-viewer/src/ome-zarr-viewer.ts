@@ -50,10 +50,27 @@ import {
 import { ensureHudStyles } from "./hud-theme.js";
 import { ViewportOverlay } from "./render/overlay/viewport-overlay.js";
 import { FxPipeline } from "./render/post/fx-pipeline.js";
+import {
+  getLastRendering,
+  setLastRendering,
+  listPresetNames,
+  getPreset,
+  savePreset,
+  deletePreset,
+} from "./rendering-presets.js";
 
 const DEFAULT_ZARR = "/datasets/petiole.zarr";
 
-type PanelId = "data" | "tf" | "render" | "slices" | "crop" | "measure" | "postfx" | "lighting";
+type PanelId =
+  | "data"
+  | "tf"
+  | "render"
+  | "slices"
+  | "crop"
+  | "measure"
+  | "postfx"
+  | "lighting"
+  | "presets";
 
 /** Change events emitted by a {@link WebGpuViewerInstance}. */
 export type WebGpuViewerEvent = "cameraChange" | "renderingChange" | "croppingChange";
@@ -294,6 +311,11 @@ export async function run(
   let cropMax: [number, number, number] = [1, 1, 1];
   const openSections = new Set<PanelId>(["tf", "render"]);
   let loading = false;
+  // One-shot guard: apply the last-used rendering snapshot once, after this viewer's first level (and
+  // thus its histogram) is ready. A ?share= link applied later by the app still wins.
+  let bootRestoreDone = false;
+  // Name currently chosen in the Presets dropdown (drives Apply/Delete; survives HUD rebuilds).
+  let selectedPreset = "";
   let baseStep = 1 / 220;
   let pickMode = false;
   // Measure plane: a camera-linked fronto-parallel reference plane the edge rulers calibrate to. When
@@ -658,7 +680,19 @@ export async function run(
       }
     }
   };
-  const emitRendering = (): void => emit("renderingChange");
+  // Auto-remember the current look as "last used" so a new sample/session inherits it. Debounced so
+  // dragging a slider doesn't hammer localStorage; the trailing write captures the settled value.
+  let lastRenderingSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  const emitRendering = (): void => {
+    emit("renderingChange");
+    if (lastRenderingSaveTimer) clearTimeout(lastRenderingSaveTimer);
+    lastRenderingSaveTimer = setTimeout(() => {
+      setLastRendering(readRendering() as unknown as Record<string, unknown>);
+    }, 400);
+  };
+  session.onDispose(() => {
+    if (lastRenderingSaveTimer) clearTimeout(lastRenderingSaveTimer);
+  });
   const emitCropping = (): void => emit("croppingChange");
   // Baseline for the render-loop camera poll: last pose we announced (or applied from a peer), so the
   // poll only emits on a real delta and never echoes a value pushed in via setCamera().
@@ -863,6 +897,83 @@ export async function run(
     return `${pos.to(u).toFixed(1)} ${u.symbol}`;
   };
 
+  // Apply a (possibly partial) rendering snapshot: every field falls back to the current value, so this
+  // safely restores a saved preset / last-used look, a linked peer's full state, or a Share link. It
+  // deliberately touches only appearance — never camera or cropping. Callers decide whether to emit.
+  const applyRenderingState = (state: Partial<WebGpuRenderingState>): void => {
+    if (state.colorMap !== undefined) colorMap = state.colorMap;
+    if (state.colorLo !== undefined) colorLo = state.colorLo;
+    if (state.colorHi !== undefined) colorHi = state.colorHi;
+    if (state.opacityScale !== undefined) opacityScale = state.opacityScale;
+    if (Array.isArray(state.opacityPoints)) {
+      opacityPoints = state.opacityPoints.map((p) => [p[0], p[1]] as const);
+    }
+    if (state.densityScale !== undefined) densityScale = state.densityScale;
+    if (state.exposure !== undefined) exposure = state.exposure;
+    if (state.sampleDist !== undefined) sampleDist = state.sampleDist;
+    if (state.blendMode !== undefined) blendMode = state.blendMode;
+    if (state.gradOpacity !== undefined) gradOpacity = state.gradOpacity;
+    if (state.gradScale !== undefined) gradScale = state.gradScale;
+    if (state.lighting !== undefined) lighting = state.lighting;
+    if (state.viewMode !== undefined) viewMode = state.viewMode;
+    // FX
+    fxOperator = state.fxOperator ?? fxOperator;
+    fxExposure = state.fxExposure ?? fxExposure;
+    fxBloom = state.fxBloom ?? fxBloom;
+    fxBloomThreshold = state.fxBloomThreshold ?? fxBloomThreshold;
+    fxBloomIntensity = state.fxBloomIntensity ?? fxBloomIntensity;
+    fxFxaa = state.fxFxaa ?? fxFxaa;
+    fxSharpen = state.fxSharpen ?? fxSharpen;
+    fxSharpenAmount = state.fxSharpenAmount ?? fxSharpenAmount;
+    fxVignette = state.fxVignette ?? fxVignette;
+    fxVignetteAmount = state.fxVignetteAmount ?? fxVignetteAmount;
+    // Lighting
+    lightGlobalOn = state.lightGlobalOn ?? lightGlobalOn;
+    lightGlobalColor = state.lightGlobalColor ?? lightGlobalColor;
+    lightGlobalIntensity = state.lightGlobalIntensity ?? lightGlobalIntensity;
+    lightAzimuth = state.lightAzimuth ?? lightAzimuth;
+    lightElevation = state.lightElevation ?? lightElevation;
+    lightFlashOn = state.lightFlashOn ?? lightFlashOn;
+    lightFlashColor = state.lightFlashColor ?? lightFlashColor;
+    lightFlashIntensity = state.lightFlashIntensity ?? lightFlashIntensity;
+    lightStageOn = state.lightStageOn ?? lightStageOn;
+    lightStageColor = state.lightStageColor ?? lightStageColor;
+    lightStageIntensity = state.lightStageIntensity ?? lightStageIntensity;
+    lightAmbient = state.lightAmbient ?? lightAmbient;
+    lightSpecular = state.lightSpecular ?? lightSpecular;
+    lightRoughness = state.lightRoughness ?? lightRoughness;
+    shadowOn = state.shadowOn ?? shadowOn;
+    shadowQuality = state.shadowQuality ?? shadowQuality;
+    shadowStrength = state.shadowStrength ?? shadowStrength;
+    shadowSoftness = state.shadowSoftness ?? shadowSoftness;
+    shadowCastGlobal = state.shadowCastGlobal ?? shadowCastGlobal;
+    shadowCastFlash = state.shadowCastFlash ?? shadowCastFlash;
+    shadowCastStage = state.shadowCastStage ?? shadowCastStage;
+    aoOn = state.aoOn ?? aoOn;
+    aoRadius = state.aoRadius ?? aoRadius;
+    aoIntensity = state.aoIntensity ?? aoIntensity;
+    aoSamples = state.aoSamples ?? aoSamples;
+    flashConeDeg = state.flashConeDeg ?? flashConeDeg;
+    flashRange = state.flashRange ?? flashRange;
+    stageConeDeg = state.stageConeDeg ?? stageConeDeg;
+    stageRange = state.stageRange ?? stageRange;
+    halfRes = state.halfRes ?? halfRes;
+    // Measure plane
+    measurePlaneOn = state.measurePlaneOn ?? measurePlaneOn;
+    measureDepth = state.measureDepth ?? measureDepth;
+    measurePlaneGray = state.measurePlaneGray ?? measurePlaneGray;
+    measurePlaneAlpha = state.measurePlaneAlpha ?? measurePlaneAlpha;
+    // Equalize
+    equalizeOn = state.equalizeOn ?? equalizeOn;
+    equalizeClip = state.equalizeClip ?? equalizeClip;
+    recomputeEqualize(); // rebuild the remap + displayed histogram from this viewer's own data
+    applyTf();
+    applyRender();
+    rebuildFxStack();
+    applyLighting();
+    renderUi();
+  };
+
   // Called by the loader each time a (finer) level's texture becomes ready. Swaps the volume, updates
   // the histogram + ray step for the displayed resolution, and clears "loading" once target is reached.
   const onDisplayedLevel = (result: VolumeLevelResult): void => {
@@ -870,6 +981,19 @@ export async function run(
     volumeRenderer.setVolume(result.texture);
     rawHistogram = result.histogram;
     recomputeEqualize(); // sets `histogram` (equalized when on) + refreshes the remap for this level
+    // First frame with real data: inherit the last-used look so a new sample/session picks up where the
+    // user left off. Runs once; equalize/histogram are ready by now so the restore is faithful.
+    if (!bootRestoreDone) {
+      bootRestoreDone = true;
+      const saved = getLastRendering();
+      if (saved) {
+        try {
+          applyRenderingState(saved as Partial<WebGpuRenderingState>);
+        } catch (err) {
+          console.warn("rendering-presets: boot restore failed:", err);
+        }
+      }
+    }
     if (histogram) curveEditor?.setHistogram(histogram);
     if (equalizeOn) applyTf(); // the remap changed with the new level's distribution
     const [sx, sy, sz] = source.spacingAt(level);
@@ -1019,6 +1143,14 @@ export async function run(
   const colorRow = (id: string, label: string, value: string): string =>
     `<label class="whud__row" style="font-size:11px;align-items:center;gap:8px">${label} ` +
     `<input type="color" data-color="${id}" value="${value}" style="width:32px;height:20px;padding:0;border:none;background:none;cursor:pointer"/></label>`;
+
+  // Escape a user-supplied preset name for safe interpolation into HTML attribute + text contexts.
+  const escAttr = (s: string): string =>
+    s
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
 
   // Dual-thumb [lo, hi] range slider. `group` scopes the pair (e.g. "color", "cropX") so one delegated
   // input handler drives every range: two overlaid range inputs, a visual track/fill, and a value label.
@@ -1236,6 +1368,28 @@ export async function run(
       `<div class="whud__hint">Shadows + AO cast secondary rays per sample. Enable half-res on large volumes to keep it interactive.</div>`,
     ].join("");
 
+    // Presets section — save/apply/delete named looks. Keep the selection valid across HUD rebuilds.
+    const presetNames = listPresetNames();
+    if (selectedPreset && !presetNames.includes(selectedPreset)) selectedPreset = "";
+    if (!selectedPreset && presetNames.length) selectedPreset = presetNames[0]!;
+    const presetOptions = presetNames.length
+      ? presetNames
+          .map(
+            (n) =>
+              `<option value="${escAttr(n)}" ${n === selectedPreset ? "selected" : ""}>${escAttr(n)}</option>`,
+          )
+          .join("")
+      : `<option value="">(no presets saved)</option>`;
+    const presetsBody = [
+      `<label class="whud__row" style="font-size:11px">Preset <select id="presetSelect" class="whud__select">${presetOptions}</select></label>`,
+      `<div class="whud__row" style="gap:6px;margin-top:6px">` +
+        `<button type="button" data-act="applyPreset" class="whud__seg-btn"${presetNames.length ? "" : " disabled"}>Apply</button>` +
+        `<button type="button" data-act="savePreset" class="whud__seg-btn">Save as…</button>` +
+        `<button type="button" data-act="deletePreset" class="whud__seg-btn"${presetNames.length ? "" : " disabled"}>Delete</button>` +
+        `</div>`,
+      `<div class="whud__hint">Saves the current look (colormap, opacity, density/exposure, FX, lighting, measure) to this browser — shared across samples and sessions. Camera and cropping are not included. Your latest look is auto-applied to new samples.</div>`,
+    ].join("");
+
     ui.innerHTML = [
       `<div class="whud__header">` +
         `<span class="whud__title">OME-Zarr viewer</span>` +
@@ -1252,6 +1406,7 @@ export async function run(
       section("crop", "Crop", cropBody),
       section("measure", "Measure", measureBody),
       section("postfx", "Post FX", postfxBody),
+      section("presets", "Presets", presetsBody),
       `<div class="whud__hint">Pan: Space+drag / Shift / middle / right · wheel zooms to cursor · P / Ctrl+click pick · [ ] LOD · O open</div>`,
     ].join("");
 
@@ -1334,6 +1489,38 @@ export async function run(
       }
       return;
     }
+    if (btn.dataset.act === "applyPreset") {
+      const name = ui.querySelector<HTMLSelectElement>("#presetSelect")?.value || selectedPreset;
+      if (name) {
+        const preset = getPreset(name);
+        if (preset) {
+          selectedPreset = name;
+          applyRenderingState(preset as Partial<WebGpuRenderingState>);
+          renderUi();
+          emitRendering(); // propagate to a linked peer + refresh the auto-remembered "last used"
+        }
+      }
+      return;
+    }
+    if (btn.dataset.act === "savePreset") {
+      const suggested = selectedPreset || "My preset";
+      const name = window.prompt("Save current rendering as preset:", suggested)?.trim();
+      if (name) {
+        savePreset(name, readRendering() as unknown as Record<string, unknown>);
+        selectedPreset = name;
+        renderUi();
+      }
+      return;
+    }
+    if (btn.dataset.act === "deletePreset") {
+      const name = ui.querySelector<HTMLSelectElement>("#presetSelect")?.value || selectedPreset;
+      if (name && window.confirm(`Delete preset "${name}"?`)) {
+        deletePreset(name);
+        if (selectedPreset === name) selectedPreset = "";
+        renderUi();
+      }
+      return;
+    }
     if (btn.dataset.act === "clearPick") {
       lastPick = undefined;
       pickStatus = "";
@@ -1356,6 +1543,8 @@ export async function run(
       fxOperator = t.value as ToneMapOperator;
       rebuildFxStack();
       emitRendering();
+    } else if (t.id === "presetSelect") {
+      selectedPreset = t.value;
     }
   });
 
@@ -1978,75 +2167,7 @@ export async function run(
       lastCam = controls.getState();
     },
     getRendering: readRendering,
-    setRendering: (state) => {
-      colorMap = state.colorMap;
-      colorLo = state.colorLo;
-      colorHi = state.colorHi;
-      opacityScale = state.opacityScale;
-      opacityPoints = state.opacityPoints.map((p) => [p[0], p[1]] as const);
-      densityScale = state.densityScale;
-      exposure = state.exposure;
-      sampleDist = state.sampleDist;
-      blendMode = state.blendMode;
-      gradOpacity = state.gradOpacity;
-      gradScale = state.gradScale;
-      lighting = state.lighting;
-      viewMode = state.viewMode;
-      // FX fields are optional on the wire (older peers/links may omit them); fall back to current.
-      fxOperator = state.fxOperator ?? fxOperator;
-      fxExposure = state.fxExposure ?? fxExposure;
-      fxBloom = state.fxBloom ?? fxBloom;
-      fxBloomThreshold = state.fxBloomThreshold ?? fxBloomThreshold;
-      fxBloomIntensity = state.fxBloomIntensity ?? fxBloomIntensity;
-      fxFxaa = state.fxFxaa ?? fxFxaa;
-      fxSharpen = state.fxSharpen ?? fxSharpen;
-      fxSharpenAmount = state.fxSharpenAmount ?? fxSharpenAmount;
-      fxVignette = state.fxVignette ?? fxVignette;
-      fxVignetteAmount = state.fxVignetteAmount ?? fxVignetteAmount;
-      // Lighting fields are optional on the wire (older peers/links may omit them); fall back.
-      lightGlobalOn = state.lightGlobalOn ?? lightGlobalOn;
-      lightGlobalColor = state.lightGlobalColor ?? lightGlobalColor;
-      lightGlobalIntensity = state.lightGlobalIntensity ?? lightGlobalIntensity;
-      lightAzimuth = state.lightAzimuth ?? lightAzimuth;
-      lightElevation = state.lightElevation ?? lightElevation;
-      lightFlashOn = state.lightFlashOn ?? lightFlashOn;
-      lightFlashColor = state.lightFlashColor ?? lightFlashColor;
-      lightFlashIntensity = state.lightFlashIntensity ?? lightFlashIntensity;
-      lightStageOn = state.lightStageOn ?? lightStageOn;
-      lightStageColor = state.lightStageColor ?? lightStageColor;
-      lightStageIntensity = state.lightStageIntensity ?? lightStageIntensity;
-      lightAmbient = state.lightAmbient ?? lightAmbient;
-      lightSpecular = state.lightSpecular ?? lightSpecular;
-      lightRoughness = state.lightRoughness ?? lightRoughness;
-      shadowOn = state.shadowOn ?? shadowOn;
-      shadowQuality = state.shadowQuality ?? shadowQuality;
-      shadowStrength = state.shadowStrength ?? shadowStrength;
-      shadowSoftness = state.shadowSoftness ?? shadowSoftness;
-      shadowCastGlobal = state.shadowCastGlobal ?? shadowCastGlobal;
-      shadowCastFlash = state.shadowCastFlash ?? shadowCastFlash;
-      shadowCastStage = state.shadowCastStage ?? shadowCastStage;
-      aoOn = state.aoOn ?? aoOn;
-      aoRadius = state.aoRadius ?? aoRadius;
-      aoIntensity = state.aoIntensity ?? aoIntensity;
-      aoSamples = state.aoSamples ?? aoSamples;
-      flashConeDeg = state.flashConeDeg ?? flashConeDeg;
-      flashRange = state.flashRange ?? flashRange;
-      stageConeDeg = state.stageConeDeg ?? stageConeDeg;
-      stageRange = state.stageRange ?? stageRange;
-      halfRes = state.halfRes ?? halfRes;
-      measurePlaneOn = state.measurePlaneOn ?? measurePlaneOn;
-      measureDepth = state.measureDepth ?? measureDepth;
-      measurePlaneGray = state.measurePlaneGray ?? measurePlaneGray;
-      measurePlaneAlpha = state.measurePlaneAlpha ?? measurePlaneAlpha;
-      equalizeOn = state.equalizeOn ?? equalizeOn;
-      equalizeClip = state.equalizeClip ?? equalizeClip;
-      recomputeEqualize(); // rebuild the remap + displayed histogram from this viewer's own data
-      applyTf();
-      applyRender();
-      rebuildFxStack();
-      applyLighting();
-      renderUi();
-    },
+    setRendering: applyRenderingState,
     getCropping: readCropping,
     setCropping: (state) => {
       cropMin = [state.cropMin[0], state.cropMin[1], state.cropMin[2]];
