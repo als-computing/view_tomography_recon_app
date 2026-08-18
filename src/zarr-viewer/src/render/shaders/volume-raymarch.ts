@@ -10,7 +10,7 @@
 import { LIGHT_STRUCT_WGSL } from "./lights.js";
 
 /** Byte size of the volume frame uniform block (mat4 + 14 × vec4). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 320;
+export const VOLUME_FRAME_UNIFORM_SIZE = 352;
 
 /** High-quality volume ray-march WGSL (vertex + fragment). */
 export const VOLUME_RAYMARCH_WGSL = /* wgsl */ `
@@ -32,6 +32,8 @@ struct Frame {
   lightCtl2: vec4<f32>,      // x = aoEnable, y = aoRadius (uvw frac), z = aoIntensity, w = aoSamples
   measurePlane: vec4<f32>,   // x = enable, y = depth (world, along view axis), z = gray, w = alpha
   measureFwd: vec4<f32>,     // xyz = camera forward (world, unit); marks the measure plane in depth
+  brickMin: vec4<f32>,       // xyz = ROI brick world min, w = enable (1 = composite fine brick)
+  brickMax: vec4<f32>,       // xyz = ROI brick world max, w = brickBlend fade weight [0,1]
 };
 
 // slices.w bits: 1=xEn, 2=yEn, 4=zEn, 8=showPlanes, 16/32 = viewMode (0 vol, 1 x, 2 y, 3 z) in bits 4-5
@@ -44,6 +46,7 @@ ${LIGHT_STRUCT_WGSL}
 @group(0) @binding(3) var tfTex: texture_2d<f32>;
 @group(0) @binding(4) var tfSampler: sampler;
 @group(0) @binding(5) var<storage, read> lights: array<Light>;
+@group(0) @binding(6) var brickTex: texture_3d<f32>;
 
 struct VSOut {
   @builtin(position) clip: vec4<f32>,
@@ -80,7 +83,21 @@ fn ign(p: vec2<f32>) -> f32 {
 }
 
 fn sampleDensity(uvw: vec3<f32>) -> f32 {
-  return textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r;
+  let coarse = textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r;
+  if (frame.brickMin.w < 0.5) { return coarse; } // no high-res ROI brick
+  // Map the world point (uvw is over the full coarse box) into the ROI brick's [0,1]^3.
+  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
+  let p = uvw * (2.0 * halfExt) - halfExt;
+  let bUvw = (p - frame.brickMin.xyz) / max(frame.brickMax.xyz - frame.brickMin.xyz, vec3<f32>(1e-6));
+  if (any(bUvw < vec3<f32>(0.0)) || any(bUvw > vec3<f32>(1.0))) { return coarse; }
+  let fine = textureSampleLevel(brickTex, volumeSampler, bUvw, 0.0).r;
+  // The brick texture is zero where fine-level chunks are missing/sparse; never let an empty fine
+  // sample overwrite valid coarse data (that produced voids). Gate the blend on the fine having signal.
+  let hasFine = smoothstep(0.0, 0.01, fine);
+  // Feather toward the ROI faces to hide the resolution seam, then blend by the fade weight.
+  let e = min(min(min(bUvw.x, 1.0 - bUvw.x), min(bUvw.y, 1.0 - bUvw.y)), min(bUvw.z, 1.0 - bUvw.z));
+  let w = clamp(frame.brickMax.w, 0.0, 1.0) * smoothstep(0.0, 0.06, e) * hasFine;
+  return mix(coarse, fine, w);
 }
 
 fn sampleTf(density: f32) -> vec4<f32> {

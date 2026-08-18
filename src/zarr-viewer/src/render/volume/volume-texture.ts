@@ -24,6 +24,20 @@ export interface UploadVolumeOptions {
   level?: number;
   /** Texture format / precision (default `"r16float"`). */
   format?: VolumeTextureFormat;
+  /**
+   * ROI voxel offset `(x,y,z)` into the level. With {@link UploadVolumeOptions.size}, uploads only that
+   * sub-box (high-res brick streaming) via `source.readRegion` instead of the whole level.
+   */
+  offset?: readonly [number, number, number];
+  /** ROI voxel size `(x,y,z)`. Defaults to the full level (whole-level upload). */
+  size?: readonly [number, number, number];
+  /** Cancels in-flight region fetches when the ROI is superseded. */
+  signal?: AbortSignal;
+  /**
+   * Progress callback for ROI (brick) uploads, fired as each chunk is written: `loaded` of `total`
+   * chunks. Not called for whole-level uploads (they stream level-by-level elsewhere).
+   */
+  onProgress?: (loaded: number, total: number) => void;
 }
 
 /** Number of bins in the intensity histogram returned by {@link uploadVolume}. */
@@ -50,10 +64,15 @@ export async function uploadVolume(
   options: UploadVolumeOptions = {},
 ): Promise<UploadVolumeResult> {
   const level = options.level ?? 0;
-  const [dx, dy, dz] = source.dimensionsAt(level);
-  const width = dx;
-  const height = dy;
-  const depth = dz;
+  const [ldx, ldy, ldz] = source.dimensionsAt(level);
+  // ROI window into the level; defaults to the whole level (offset 0, size = level dims).
+  const roi = options.offset !== undefined || options.size !== undefined;
+  const ox0 = options.offset?.[0] ?? 0;
+  const oy0 = options.offset?.[1] ?? 0;
+  const oz0 = options.offset?.[2] ?? 0;
+  const width = options.size?.[0] ?? ldx;
+  const height = options.size?.[1] ?? ldy;
+  const depth = options.size?.[2] ?? ldz;
   const maxDim = device.limits.maxTextureDimension3D;
   if (width > maxDim || height > maxDim || depth > maxDim) {
     throw new Error(
@@ -61,12 +80,60 @@ export async function uploadVolume(
     );
   }
 
-  const dens = new Float32Array(width * height * depth);
-  dens.fill(0);
-
   const [vmin, vmax] = source.valueRange;
   const span = vmax - vmin || 1;
+  const format: VolumeTextureFormat = options.format ?? "r16float";
+  const bytesPerElem = volumeFormatBytes(format);
 
+  // Allocate the destination texture up front (size is known) so both paths write into it directly —
+  // the ROI path fills it chunk-by-chunk as fetches land, avoiding a full-volume scratch buffer.
+  const texture = new ManagedTexture(device, {
+    size: [width, height, depth],
+    format,
+    dimension: "3d",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+
+  if (roi) {
+    // High-res brick: stream only the overlapping chunks (bounded-concurrency fetch inside readRegion)
+    // and pack each into ONE brick-sized buffer as it lands — no giant float scratch, no histogram (the
+    // base level feeds the TF editor). We do a single writeTexture at the end (never bind a partially
+    // uploaded texture): the renderer only sees the brick once every chunk is in. Progress per chunk.
+    const roiBox: RoiBox = { ox0, oy0, oz0, width, height, depth };
+    const total = source.regionChunkCount(level, [ox0, oy0, oz0], [ox0 + width, oy0 + height, oz0 + depth]);
+    const bytesPerRow = Math.ceil((width * bytesPerElem) / 256) * 256;
+    const packed = new Uint8Array(bytesPerRow * height * depth);
+    const view = new DataView(packed.buffer);
+    let loaded = 0;
+    options.onProgress?.(0, total);
+    try {
+      for await (const chunk of source.readRegion(
+        level,
+        [ox0, oy0, oz0],
+        [ox0 + width, oy0 + height, oz0 + depth],
+        options.signal,
+      )) {
+        packChunkInto(view, bytesPerRow, chunk, roiBox, source.dtype, format, bytesPerElem, vmin, span);
+        loaded++;
+        options.onProgress?.(loaded, total);
+      }
+    } catch (err) {
+      texture.dispose(); // don't leak the texture on abort/error
+      throw err;
+    }
+    device.queue.writeTexture(
+      { texture: texture.gpu },
+      packed,
+      { bytesPerRow, rowsPerImage: height },
+      { width, height, depthOrArrayLayers: depth },
+    );
+    return { texture, histogram: new Float32Array(HISTOGRAM_BINS) };
+  }
+
+  // Whole-level upload: scatter every chunk into one buffer, build the intensity histogram (for the TF
+  // editor), then upload in a single writeTexture.
+  const dens = new Float32Array(width * height * depth);
+  dens.fill(0);
   for await (const chunk of source.chunks(level)) {
     const [ox, oy, oz] = chunk.origin;
     const [cx, cy, cz] = chunk.shape;
@@ -75,10 +142,10 @@ export async function uploadVolume(
       for (let y = 0; y < cy; y++) {
         for (let x = 0; x < cx; x++) {
           const src = x + y * cx + z * cx * cy;
-          const gx = ox + x;
-          const gy = oy + y;
-          const gz = oz + z;
-          if (gx >= width || gy >= height || gz >= depth) continue;
+          const gx = ox + x - ox0;
+          const gy = oy + y - oy0;
+          const gz = oz + z - oz0;
+          if (gx < 0 || gy < 0 || gz < 0 || gx >= width || gy >= height || gz >= depth) continue;
           const dst = gx + gy * width + gz * width * height;
           dens[dst] = (values[src]! - vmin) / span;
         }
@@ -98,8 +165,6 @@ export async function uploadVolume(
     histogram[b]++;
   }
 
-  const format: VolumeTextureFormat = options.format ?? "r16float";
-  const bytesPerElem = format === "r8unorm" ? 1 : format === "r16float" ? 2 : 4;
   // WebGPU requires bytesPerRow to be a multiple of 256 for writeTexture.
   const bytesPerRow = Math.ceil((width * bytesPerElem) / 256) * 256;
   const packed = new Uint8Array(bytesPerRow * height * depth);
@@ -109,20 +174,10 @@ export async function uploadVolume(
       const row = z * height * bytesPerRow + y * bytesPerRow;
       for (let x = 0; x < width; x++) {
         const v = clamp01(dens[x + y * width + z * width * height]!);
-        const off = row + x * bytesPerElem;
-        if (format === "r8unorm") view.setUint8(off, Math.round(v * 255));
-        else if (format === "r16float") view.setUint16(off, floatToHalf(v), true);
-        else view.setFloat32(off, v, true);
+        encodeVoxel(view, row + x * bytesPerElem, v, format);
       }
     }
   }
-
-  const texture = new ManagedTexture(device, {
-    size: [width, height, depth],
-    format,
-    dimension: "3d",
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-  });
 
   device.queue.writeTexture(
     { texture: texture.gpu },
@@ -132,6 +187,72 @@ export async function uploadVolume(
   );
 
   return { texture, histogram };
+}
+
+/** ROI window (voxel offset + size) a brick upload fills. */
+interface RoiBox {
+  ox0: number;
+  oy0: number;
+  oz0: number;
+  width: number;
+  height: number;
+  depth: number;
+}
+
+/** Encode a normalized `[0,1]` density into the packed buffer at `off` for `format`. */
+function encodeVoxel(view: DataView, off: number, v01: number, format: VolumeTextureFormat): void {
+  if (format === "r8unorm") view.setUint8(off, Math.round(v01 * 255));
+  else if (format === "r16float") view.setUint16(off, floatToHalf(v01), true);
+  else view.setFloat32(off, v01, true);
+}
+
+/**
+ * Pack the overlap of one chunk with the ROI box directly into the brick's single packed buffer at the
+ * chunk's offset (`bytesPerRow`/`height` are the whole brick's). Chunks may straddle the ROI edges, so
+ * we clip to the intersection. The buffer is uploaded once (a single writeTexture) after every chunk is
+ * packed, so the renderer never binds a partially-filled texture.
+ */
+function packChunkInto(
+  view: DataView,
+  bytesPerRow: number,
+  chunk: { origin: readonly [number, number, number]; shape: readonly [number, number, number]; data: ArrayBufferView },
+  roi: RoiBox,
+  dtype: VolumeSource["dtype"],
+  format: VolumeTextureFormat,
+  bytesPerElem: number,
+  vmin: number,
+  span: number,
+): void {
+  const [ox, oy, oz] = chunk.origin;
+  const [cx, cy, cz] = chunk.shape;
+  const gx0 = Math.max(ox, roi.ox0);
+  const gy0 = Math.max(oy, roi.oy0);
+  const gz0 = Math.max(oz, roi.oz0);
+  const gx1 = Math.min(ox + cx, roi.ox0 + roi.width);
+  const gy1 = Math.min(oy + cy, roi.oy0 + roi.height);
+  const gz1 = Math.min(oz + cz, roi.oz0 + roi.depth);
+  const ow = gx1 - gx0;
+  const oh = gy1 - gy0;
+  const od = gz1 - gz0;
+  if (ow <= 0 || oh <= 0 || od <= 0) return; // no overlap (shouldn't happen — readRegion clips already)
+
+  const values = asFloatSamples(chunk.data, dtype);
+  const rowsPerImage = roi.height;
+  for (let z = 0; z < od; z++) {
+    const sz = gz0 - oz + z;
+    const dz = gz0 - roi.oz0 + z;
+    for (let y = 0; y < oh; y++) {
+      const sy = gy0 - oy + y;
+      const dy = gy0 - roi.oy0 + y;
+      const rowBase = (dz * rowsPerImage + dy) * bytesPerRow;
+      for (let x = 0; x < ow; x++) {
+        const sx = gx0 - ox + x;
+        const dx = gx0 - roi.ox0 + x;
+        const v = clamp01((values[sx + sy * cx + sz * cx * cy]! - vmin) / span);
+        encodeVoxel(view, rowBase + dx * bytesPerElem, v, format);
+      }
+    }
+  }
 }
 
 function clamp01(v: number): number {

@@ -157,6 +157,12 @@ export class VolumeRenderer implements Disposable {
   private tfTex: ManagedTexture | undefined;
   private volumeSampler: GPUSampler | undefined;
   private tfSampler: GPUSampler | undefined;
+  // High-res ROI brick composited over the coarse volume (null = none; coarse tex is bound as a dummy).
+  private brickTex: ManagedTexture | undefined;
+  private brickEnabled = false;
+  private brickBlend = 1; // fade weight [0,1] for smooth zoom-out
+  private brickMin: [number, number, number] = [0, 0, 0];
+  private brickMax: [number, number, number] = [0, 0, 0];
 
   private readonly frameData = new Float32Array(VOLUME_FRAME_UNIFORM_SIZE / 4);
   private readonly invViewProj = new Mat4();
@@ -198,6 +204,30 @@ export class VolumeRenderer implements Disposable {
   public setVolume(texture: ManagedTexture): void {
     this.volumeTex = texture;
     this.bindGroup = undefined;
+  }
+
+  /**
+   * Set (or clear with `null`) the high-res ROI brick composited over the coarse volume. `worldMin`/
+   * `worldMax` are the world (sim-unit) box the brick texture's `[0,1]³` maps onto. When cleared, the
+   * coarse texture is bound as a dummy for binding 6 and compositing is disabled.
+   */
+  public setBrick(
+    texture: ManagedTexture | null,
+    worldMin?: readonly [number, number, number],
+    worldMax?: readonly [number, number, number],
+  ): void {
+    this.brickTex = texture ?? undefined;
+    this.brickEnabled = texture !== null;
+    if (worldMin && worldMax) {
+      this.brickMin = [worldMin[0], worldMin[1], worldMin[2]];
+      this.brickMax = [worldMax[0], worldMax[1], worldMax[2]];
+    }
+    this.bindGroup = undefined; // texture binding changed
+  }
+
+  /** Fade weight [0,1] for the brick (drives smooth zoom-out); no bind-group rebuild. */
+  public setBrickBlend(weight: number): void {
+    this.brickBlend = Math.min(1, Math.max(0, weight));
   }
 
   public setBoxHalfSize(x: number, y: number, z: number): void {
@@ -421,7 +451,8 @@ export class VolumeRenderer implements Disposable {
     options: { clear?: boolean } = {},
   ): void {
     if (!this.volumeTex || !this.tfTex) {
-      throw new Error("VolumeRenderer: call setVolume and setTransferFunction before render()");
+      // Not ready yet (volume/TF still uploading) — skip this frame instead of throwing every tick.
+      return;
     }
     this.ensurePipeline();
     this.ensureBindGroup();
@@ -522,6 +553,16 @@ export class VolumeRenderer implements Disposable {
     d[77] = this.measureForward[1];
     d[78] = this.measureForward[2];
     d[79] = 0;
+    // brickMin: ROI brick world min, w = enable
+    d[80] = this.brickMin[0];
+    d[81] = this.brickMin[1];
+    d[82] = this.brickMin[2];
+    d[83] = this.brickEnabled ? 1 : 0;
+    // brickMax: ROI brick world max, w = brickBlend fade weight
+    d[84] = this.brickMax[0];
+    d[85] = this.brickMax[1];
+    d[86] = this.brickMax[2];
+    d[87] = this.brickBlend;
     this.frameUniform!.write(d);
 
     pass.setPipeline(this.pipeline!);
@@ -603,6 +644,11 @@ export class VolumeRenderer implements Disposable {
         { binding: 3, resource: this.tfTex!.createView({ dimension: "2d" }) },
         { binding: 4, resource: this.tfSampler! },
         { binding: 5, resource: { buffer: this.lightEnv!.gpu } },
+        // Brick texture (binding 6); when there's no brick, bind the coarse texture as a valid dummy.
+        {
+          binding: 6,
+          resource: (this.brickTex ?? this.volumeTex!).createView({ dimension: "3d" }),
+        },
       ],
     });
   }

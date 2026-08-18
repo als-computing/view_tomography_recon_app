@@ -24,6 +24,9 @@ import {
   createContext,
   VolumeLoader,
   type VolumeLevelResult,
+  BrickLoader,
+  chooseBrickRegion,
+  type BrickResult,
   VolumeRenderer,
   composeTransferFunction,
   OpacityCurveEditor,
@@ -317,6 +320,11 @@ export async function run(
   // Name currently chosen in the Presets dropdown (drives Apply/Delete; survives HUD rebuilds).
   let selectedPreset = "";
   let baseStep = 1 / 220;
+  // Finer march step (world units) tied to a resident high-res ROI brick's voxel size. `baseStep` is
+  // sized for the COARSE displayed level, so when zoomed into an L0/L1 brick the coarse step
+  // under-samples it — the empty-space skip then steps right over thin fine structures and the region
+  // looks sparse/blank. While a brick is up we march at its (floored) Nyquist step instead.
+  let brickStep: number | undefined;
   let pickMode = false;
   // Measure plane: a camera-linked fronto-parallel reference plane the edge rulers calibrate to. When
   // off, the rulers use the orbit-pivot depth (exact at the volume center). When on, they use
@@ -420,7 +428,11 @@ export async function run(
     dispose: () => handle.dispose(),
   });
 
-  let store: Store = httpStore(options?.zarrUrl ?? zarrUrlFromQuery());
+  const resolvedZarrUrl = options?.zarrUrl ?? zarrUrlFromQuery();
+  // Identity for per-sample last-used rendering memory: switching back to a tab restores this sample's
+  // own look rather than whatever another tab touched most recently (tabs are 1:1 with their Zarr URL).
+  const sampleKey = resolvedZarrUrl;
+  let store: Store = httpStore(resolvedZarrUrl);
   let source: VolumeSource;
   try {
     source = await openOmeZarr(store, { skipRangeEstimate: true, valueRange });
@@ -651,6 +663,245 @@ export async function run(
   let targetLevel = level;
   let frameExtent = 1;
 
+  // High-res ROI brick: stream + composite a fine sub-volume over the coarse base when zoomed in (or a
+  // crop ROI is set), and fade it out / discard on zoom-out (see BrickLoader + the shader composite).
+  const brickLoader = new BrickLoader(ctx.device, {
+    supportsFloat32Filtering: ctx.supportsFloat32Filtering,
+  });
+  session.onDispose(() => brickLoader.dispose());
+  let roiEnabled = false;
+  let brickBlendCurrent = 0;
+  let brickBlendTarget = 0;
+  let brickLevel: number | undefined;
+  let lastRoiKey = "";
+  let lastRegion:
+    | { level: number; voxelMin: [number, number, number]; voxelMax: [number, number, number] }
+    | null = null;
+  let roiIdle = 0;
+  let roiRequestInFlight = false; // a brick request is streaming (drives the reset guard + progress bar)
+  let roiReqSeq = 0; // monotonic id so a superseded request's finally() can't clobber a newer one
+  let prevRoiCam = controls.getState();
+  const ROI_LOAD_T = 1.5; // stream when distance/frameExtent < this (zoomed in)
+  const ROI_CLEAR_T = 1.9; // clear when > this (hysteresis avoids flicker at the boundary)
+  const ROI_SETTLE = 0.15; // seconds of camera stillness before (re)streaming
+
+  // ROI stream progress for the HUD bar. Updated per chunk; the bar's DOM is patched directly (rAF-
+  // throttled) so per-chunk progress never triggers a full HUD rebuild.
+  let roiProgress: { loaded: number; total: number } | null = null;
+  let roiProgressPaintQueued = false;
+  const paintRoiProgress = (): void => {
+    if (roiProgressPaintQueued) return;
+    roiProgressPaintQueued = true;
+    requestAnimationFrame(() => {
+      roiProgressPaintQueued = false;
+      const wrap = ui.querySelector<HTMLElement>("#roiProgressWrap");
+      if (!wrap) return;
+      if (!roiProgress) {
+        wrap.style.display = "none";
+        return;
+      }
+      wrap.style.display = "";
+      const pct = roiProgress.total ? Math.round((roiProgress.loaded / roiProgress.total) * 100) : 0;
+      const fill = ui.querySelector<HTMLElement>("#roiProgressFill");
+      const label = ui.querySelector<HTMLElement>("#roiProgressLabel");
+      if (fill) fill.style.width = `${pct}%`;
+      if (label) label.textContent = `${roiProgress.loaded}/${roiProgress.total} chunks`;
+    });
+  };
+
+  brickLoader.onBrick((b: BrickResult) => {
+    volumeRenderer.setBrick(b.texture, b.worldMin, b.worldMax);
+    brickLevel = b.level;
+    // March at the brick's voxel size (floored so the step count stays well under maxSteps and the ray
+    // still reaches the far face) instead of the coarse level's — otherwise the fine brick is
+    // under-sampled and looks sparse/blank when zoomed in.
+    const [bsx, bsy, bsz] = source.spacingAt(b.level);
+    brickStep = Math.max(
+      Math.max(
+        units.toSim(new units.Quantity(bsx, units.LENGTH), sim),
+        units.toSim(new units.Quantity(bsy, units.LENGTH), sim),
+        units.toSim(new units.Quantity(bsz, units.LENGTH), sim),
+      ) * 0.55,
+      frameExtent / 2000,
+      // Perf cap: never shrink the GLOBAL step more than ~2.9× vs coarse (the fine step is marched
+      // across the whole ray, so an unbounded fine step explodes the step count).
+      baseStep * 0.35,
+    );
+    applyRender();
+    brickBlendTarget = 1;
+    renderUi();
+  });
+  brickLoader.onClear(() => {
+    volumeRenderer.setBrick(null);
+    brickLevel = undefined;
+    brickStep = undefined;
+    applyRender();
+    roiProgress = null;
+    paintRoiProgress();
+    renderUi();
+  });
+  brickLoader.onProgress((loaded, total) => {
+    roiProgress = { loaded, total };
+    paintRoiProgress();
+  });
+
+  const cropIsSet = (): boolean =>
+    cropMin[0] > 0.001 ||
+    cropMin[1] > 0.001 ||
+    cropMin[2] > 0.001 ||
+    cropMax[0] < 0.999 ||
+    cropMax[1] < 0.999 ||
+    cropMax[2] < 0.999;
+
+  // Slab-intersect the ray with the volume box [-h, h]; returns [tNear, tFar] or null.
+  const intersectRoiBox = (
+    ox: number, oy: number, oz: number, dx: number, dy: number, dz: number,
+    hx: number, hy: number, hz: number,
+  ): [number, number] | null => {
+    const invx = 1 / (dx === 0 ? 1e-20 : dx);
+    const invy = 1 / (dy === 0 ? 1e-20 : dy);
+    const invz = 1 / (dz === 0 ? 1e-20 : dz);
+    let a0 = (-hx - ox) * invx; let a1 = (hx - ox) * invx; if (a0 > a1) [a0, a1] = [a1, a0];
+    let b0 = (-hy - oy) * invy; let b1 = (hy - oy) * invy; if (b0 > b1) [b0, b1] = [b1, b0];
+    let c0 = (-hz - oz) * invz; let c1 = (hz - oz) * invz; if (c0 > c1) [c0, c1] = [c1, c0];
+    const tN = Math.max(a0, b0, c0);
+    const tF = Math.min(a1, b1, c1);
+    if (tN > tF || tF < 0) return null;
+    return [tN, tF];
+  };
+
+  // Visible-region AABB in UVW [0,1] from the camera frustum ∩ volume box (4 corner rays' entry/exit).
+  const frustumRoiUvw = ():
+    | { min: [number, number, number]; max: [number, number, number] }
+    | null => {
+    invViewProj.copy(lastViewProj);
+    if (!invViewProj.invert()) return null;
+    const hx = sizeSim.x * 0.5, hy = sizeSim.y * 0.5, hz = sizeSim.z * 0.5;
+    const eye = camera.position;
+    let mnx = Infinity, mny = Infinity, mnz = Infinity;
+    let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
+    let any = false;
+    for (const [u, v] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) {
+      const nearH = mulMat4Vec4(invViewProj, u * 2 - 1, (1 - v) * 2 - 1, 0, 1);
+      const farH = mulMat4Vec4(invViewProj, u * 2 - 1, (1 - v) * 2 - 1, 1, 1);
+      const nx = nearH[0] / nearH[3], ny = nearH[1] / nearH[3], nz = nearH[2] / nearH[3];
+      const fx2 = farH[0] / farH[3], fy2 = farH[1] / farH[3], fz2 = farH[2] / farH[3];
+      let dx = fx2 - nx, dy = fy2 - ny, dz = fz2 - nz;
+      const dl = Math.hypot(dx, dy, dz) || 1; dx /= dl; dy /= dl; dz /= dl;
+      const t = intersectRoiBox(eye.x, eye.y, eye.z, dx, dy, dz, hx, hy, hz);
+      if (!t) continue;
+      const t0 = Math.max(t[0], 0);
+      if (t[1] < t0) continue;
+      for (const tt of [t0, t[1]]) {
+        const px = eye.x + dx * tt, py = eye.y + dy * tt, pz = eye.z + dz * tt;
+        mnx = Math.min(mnx, px); mny = Math.min(mny, py); mnz = Math.min(mnz, pz);
+        mxx = Math.max(mxx, px); mxy = Math.max(mxy, py); mxz = Math.max(mxz, pz);
+        any = true;
+      }
+    }
+    if (!any) return null;
+    const toU = (val: number, h: number): number => Math.min(1, Math.max(0, (val + h) / (2 * h)));
+    return {
+      min: [toU(mnx, hx), toU(mny, hy), toU(mnz, hz)],
+      max: [toU(mxx, hx), toU(mxy, hy), toU(mxz, hz)],
+    };
+  };
+
+  // Per-frame ROI update: derive the region (crop override, else frustum when zoomed in), pick the
+  // finest fitting level, and (debounced) request the brick; hysteresis + fade drive smooth zoom-out.
+  const updateRoi = (dt: number): void => {
+    const cs = controls.getState();
+    if (!camsEqual(cs, prevRoiCam)) { roiIdle = 0; prevRoiCam = cs; } else { roiIdle += dt; }
+
+    let want = 0; // brick blend target this frame (a loaded brick is on screen)
+    let desired = false; // we intend to keep a high-res brick this frame (a finer region applies)
+    if (roiEnabled) {
+      const cropSet = cropIsSet();
+      const zoomRatio = controls.distance / Math.max(frameExtent, 1e-6);
+      let roi: { min: [number, number, number]; max: [number, number, number] } | null = null;
+      if (cropSet) {
+        roi = {
+          min: [cropMin[0], cropMin[1], cropMin[2]],
+          max: [cropMax[0], cropMax[1], cropMax[2]],
+        };
+      } else if (zoomRatio < ROI_LOAD_T) {
+        roi = frustumRoiUvw();
+      }
+      const keepStreaming = !!roi && (cropSet || zoomRatio < ROI_CLEAR_T);
+      if (keepStreaming && roi) {
+        const region = chooseBrickRegion(source, roi.min, roi.max, { maxTextureDimension: maxTex });
+        // Only worthwhile if the brick is finer than the coarse level on screen.
+        if (region && region.level < level) {
+          desired = true; // a finer region applies → hold onto its request key across the load
+          const dims = source.dimensionsAt(region.level);
+          // Snap the voxel box to a grid so sub-voxel camera drift doesn't re-request (and abort) the
+          // brick every frame; the ROI only changes when it moves by ≥ Q voxels.
+          const Q = 32;
+          const voxelMin: [number, number, number] = [0, 0, 0];
+          const voxelMax: [number, number, number] = [0, 0, 0];
+          for (let a = 0; a < 3; a++) {
+            const d = dims[a]!;
+            voxelMin[a] = Math.max(0, Math.floor(region.voxelMin[a]! / Q) * Q);
+            voxelMax[a] = Math.min(d, Math.max(voxelMin[a] + Q, Math.ceil(region.voxelMax[a]! / Q) * Q));
+          }
+          // Skip if the resident brick (same level) already covers this box — small moves reuse it.
+          const covered =
+            lastRegion !== null &&
+            lastRegion.level === region.level &&
+            voxelMin[0] >= lastRegion.voxelMin[0] && voxelMin[1] >= lastRegion.voxelMin[1] &&
+            voxelMin[2] >= lastRegion.voxelMin[2] && voxelMax[0] <= lastRegion.voxelMax[0] &&
+            voxelMax[1] <= lastRegion.voxelMax[1] && voxelMax[2] <= lastRegion.voxelMax[2];
+          const key = `${region.level}:${voxelMin.join(",")}:${voxelMax.join(",")}`;
+          // (Re)stream a genuinely new, settled region. A newer region SUPERSEDES an in-flight one
+          // (request() aborts the stale fetch), so the brick for where the user actually is loads
+          // promptly instead of waiting out the old load. Finishing the stale brick first is what made
+          // the high-res ROI briefly drop to coarse / go blank when moving mid-load. Same-key requests
+          // are still blocked (key === lastRoiKey) and ROI_SETTLE debounces motion, so this can't flood.
+          if (!covered && key !== lastRoiKey && roiIdle >= ROI_SETTLE) {
+            lastRoiKey = key;
+            lastRegion = { level: region.level, voxelMin, voxelMax };
+            const half = [sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5];
+            const full = [sizeSim.x, sizeSim.y, sizeSim.z];
+            const wmin: [number, number, number] = [0, 0, 0];
+            const wmax: [number, number, number] = [0, 0, 0];
+            for (let a = 0; a < 3; a++) {
+              wmin[a] = -half[a]! + (voxelMin[a] / dims[a]!) * full[a]!;
+              wmax[a] = -half[a]! + (voxelMax[a] / dims[a]!) * full[a]!;
+            }
+            const reqId = ++roiReqSeq;
+            roiRequestInFlight = true;
+            void brickLoader
+              .request({ source, level: region.level, voxelMin, voxelMax, worldMin: wmin, worldMax: wmax })
+              .finally(() => {
+                if (reqId !== roiReqSeq) return; // superseded — the newer request owns the flag + bar
+                roiRequestInFlight = false;
+                roiProgress = null; // hide the bar once the latest stream settles (loaded / failed)
+                paintRoiProgress();
+              });
+          }
+          if (brickLoader.currentBrick) want = 1;
+        }
+      }
+    }
+    // Forget the resident request key only when no brick is desired (ROI off / zoomed out) and nothing
+    // is mid-flight — NOT merely because the brick isn't visible yet. Resetting while a request was in
+    // flight made the loader re-request the same box on the frame it finished (and endlessly retry a
+    // failed/aborted fetch), flooding the network and never settling on higher-res detail.
+    if (!desired && !roiRequestInFlight) {
+      lastRoiKey = "";
+      lastRegion = null;
+    }
+    brickBlendTarget = want;
+
+    // Fade the brick weight toward the target (~150 ms); clear once fully faded out.
+    const diff = brickBlendTarget - brickBlendCurrent;
+    brickBlendCurrent += Math.sign(diff) * Math.min(Math.abs(diff), 6 * dt);
+    volumeRenderer.setBrickBlend(brickBlendCurrent);
+    if (brickBlendCurrent <= 0.001 && brickBlendTarget === 0 && brickLoader.currentBrick) {
+      brickLoader.clear();
+    }
+  };
+
   ensureHudStyles();
   const docked = options?.hudMount != null;
   const ui = document.createElement("div");
@@ -687,7 +938,7 @@ export async function run(
     emit("renderingChange");
     if (lastRenderingSaveTimer) clearTimeout(lastRenderingSaveTimer);
     lastRenderingSaveTimer = setTimeout(() => {
-      setLastRendering(readRendering() as unknown as Record<string, unknown>);
+      setLastRendering(readRendering() as unknown as Record<string, unknown>, sampleKey);
     }, 400);
   };
   session.onDispose(() => {
@@ -817,7 +1068,7 @@ export async function run(
     volumeRenderer.setParams({
       densityScale,
       exposure,
-      stepSize: baseStep * sampleDist,
+      stepSize: Math.min(brickStep ?? baseStep, baseStep) * sampleDist,
       blendMode,
       gradientOpacity: gradOpacity,
       gradientOpacityScale: gradScale,
@@ -985,10 +1236,14 @@ export async function run(
     // user left off. Runs once; equalize/histogram are ready by now so the restore is faithful.
     if (!bootRestoreDone) {
       bootRestoreDone = true;
-      const saved = getLastRendering();
+      const saved = getLastRendering(sampleKey);
       if (saved) {
         try {
           applyRenderingState(saved as Partial<WebGpuRenderingState>);
+          // Pin the restored look as this sample's own memory immediately, so a later remount (after the
+          // keep-alive grace expires) restores what this tab showed — even if another tab has since
+          // changed the shared/global snapshot.
+          setLastRendering(readRendering() as unknown as Record<string, unknown>, sampleKey);
         } catch (err) {
           console.warn("rendering-presets: boot restore failed:", err);
         }
@@ -1365,6 +1620,18 @@ export async function run(
       slider("aoIntensity", "AO intensity", aoIntensity, 0, 1, 0.02),
       slider("aoSamples", "AO samples", aoSamples, 1, 16, 1),
       `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${halfRes ? "checked" : ""}/> Half resolution</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="roiEnabled" ${roiEnabled ? "checked" : ""}/> High-res ROI (stream visible detail)</label>`,
+      `<div id="roiProgressWrap" style="margin-top:6px;${roiProgress ? "" : "display:none"}">` +
+        `<div style="display:flex;justify-content:space-between;font-size:10px;opacity:0.85">` +
+        `<span>Streaming ROI…</span>` +
+        `<span id="roiProgressLabel">${roiProgress ? `${roiProgress.loaded}/${roiProgress.total} chunks` : ""}</span>` +
+        `</div>` +
+        `<div style="height:4px;margin-top:2px;background:rgba(255,255,255,0.15);border-radius:2px;overflow:hidden">` +
+        `<div id="roiProgressFill" style="height:100%;background:#5b9dd9;transition:width 0.1s linear;width:${
+          roiProgress && roiProgress.total ? Math.round((roiProgress.loaded / roiProgress.total) * 100) : 0
+        }%"></div>` +
+        `</div>` +
+        `</div>`,
       `<div class="whud__hint">Shadows + AO cast secondary rays per sample. Enable half-res on large volumes to keep it interactive.</div>`,
     ].join("");
 
@@ -1397,7 +1664,7 @@ export async function run(
         `title="${collapsed ? "Expand panel" : "Collapse panel"}" ` +
         `aria-label="${collapsed ? "Expand panel" : "Collapse panel"}">${collapsed ? "\u2039" : "\u203A"}</button>` +
         `</div>`,
-      `<div class="whud__status">L${level} · ${dx}×${dy}×${dz}${loading ? " · loading…" : ""}${pickMode ? " · PICK" : ""}</div>`,
+      `<div class="whud__status">L${level} · ${dx}×${dy}×${dz}${loading ? " · loading…" : ""}${pickMode ? " · PICK" : ""}${brickLevel !== undefined ? ` · ROI L${brickLevel}` : ""}</div>`,
       section("data", "Data", dataBody),
       section("tf", "Transfer Function", tfBody),
       section("render", "Render", renderBody),
@@ -1634,6 +1901,10 @@ export async function run(
       if (t.dataset.chk === "measurePlaneOn") {
         measurePlaneOn = on; // the render loop reads this live; just emit for links/share
         emitRendering();
+        return;
+      }
+      if (t.dataset.chk === "roiEnabled") {
+        roiEnabled = on; // the render loop reads this live (updateRoi); toggling off fades + discards
         return;
       }
       if (
@@ -1991,6 +2262,9 @@ export async function run(
         lastPick = undefined;
         pickStatus = "";
         loaderOpened = false; // new dataset → reopen the loader (drops old resident textures)
+        brickLoader.clear(); // drop the old dataset's ROI brick
+        lastRoiKey = "";
+        lastRegion = null;
         if (levels.length) applyLevel(finestTargetLevel(), true);
       } else if (e.code === "KeyE") {
         cropMin = [0, 0, 0];
@@ -2099,6 +2373,8 @@ export async function run(
     const backDepth = Math.max(centerDepth + halfDepth, frontDepth + 1e-6);
     const planeT = Math.min(1, Math.max(0, measureDepth));
     const planeDepth = frontDepth + planeT * (backDepth - frontDepth);
+    // High-res ROI brick: derive/stream the visible sub-volume + advance the fade. Before recordInto.
+    updateRoi(dt);
     // Measure plane: depth-composited grey sheet at `planeDepth` along the view axis. Must run before
     // recordInto (writes the frame uniform).
     volumeRenderer.setMeasurePlane({

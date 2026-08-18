@@ -7,6 +7,7 @@
 import type { Store } from "./store.js";
 import { readArrayMeta, type ZarrArrayMeta } from "./metadata.js";
 import { codecFromCompressor } from "./codecs.js";
+import { DecodedChunkCache } from "../chunk-cache.js";
 import {
   dtypeByteSize,
   type VolumeChunk,
@@ -28,6 +29,45 @@ export interface OpenZarrArrayOptions {
 function chunkKey(meta: ZarrArrayMeta, indices: number[]): string {
   const body = indices.join(meta.dimensionSeparator);
   return meta.path ? `${meta.path}/${body}` : body;
+}
+
+/** Max concurrent chunk fetches for ROI region reads (bounded so we don't flood the store). */
+const READ_REGION_CONCURRENCY = 16;
+
+/**
+ * Bounded-concurrency async map: runs `fn` over `items` with at most `concurrency` in flight, yielding
+ * each result as it settles (completion order — the ROI upload scatters by chunk origin, so order is
+ * irrelevant). Rejections propagate to the consumer; any still-in-flight promises are silenced on early
+ * exit (abort/error) so they don't surface as unhandled rejections.
+ */
+async function* pooledMap<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): AsyncGenerator<R> {
+  type Entry = { promise: Promise<Entry>; value: R };
+  const executing = new Set<Promise<Entry>>();
+  let i = 0;
+  const startOne = (): void => {
+    const item = items[i++]!;
+    const entry = {} as Entry;
+    entry.promise = fn(item).then((value) => {
+      entry.value = value;
+      return entry;
+    });
+    executing.add(entry.promise);
+  };
+  try {
+    while (i < items.length && executing.size < concurrency) startOne();
+    while (executing.size > 0) {
+      const entry = await Promise.race(executing);
+      executing.delete(entry.promise);
+      if (i < items.length) startOne();
+      yield entry.value;
+    }
+  } finally {
+    for (const p of executing) void p.catch(() => {});
+  }
 }
 
 function typedView(buf: ArrayBuffer, dtype: VolumeDType, littleEndian: boolean): ArrayBufferView {
@@ -183,6 +223,8 @@ class ZarrArraySource implements VolumeSource {
   private readonly store: Store;
   private readonly axisToXyz: readonly [number, number, number];
   private readonly codec;
+  /** Decoded-chunk LRU so ROI reads / panning reuse chunks instead of re-fetching + re-decoding. */
+  private readonly chunkCache = new DecodedChunkCache();
 
   public constructor(
     store: Store,
@@ -229,9 +271,83 @@ class ZarrArraySource implements VolumeSource {
     return this.readDiskChunk(ci);
   }
 
-  private async readDiskChunk(chunkIndices: number[]): Promise<VolumeChunk> {
+  /** Intersecting disk-chunk index range `[cLo, cHi]` (inclusive) for an xyz voxel box. */
+  private regionChunkRange(
+    voxelMin: readonly [number, number, number],
+    voxelMax: readonly [number, number, number],
+  ): { cLo: number[]; cHi: number[] } {
+    // Map the xyz voxel box → disk-axis voxel box, then to the intersecting disk chunk range.
+    const diskMin = [0, 0, 0];
+    const diskMax = [0, 0, 0];
+    for (let i = 0; i < 3; i++) {
+      const ax = this.axisToXyz[i]!;
+      diskMin[ax] = voxelMin[i]!;
+      diskMax[ax] = voxelMax[i]!;
+    }
+    const counts = this.diskChunkCounts();
+    const cLo = [0, 0, 0];
+    const cHi = [0, 0, 0];
+    for (let ax = 0; ax < 3; ax++) {
+      const chunk = this.meta.chunks[ax]!;
+      cLo[ax] = Math.max(0, Math.floor(diskMin[ax]! / chunk));
+      cHi[ax] = Math.min((counts[ax] ?? 1) - 1, Math.floor((Math.max(diskMax[ax]!, diskMin[ax]! + 1) - 1) / chunk));
+    }
+    return { cLo, cHi };
+  }
+
+  private regionChunkIndices(
+    voxelMin: readonly [number, number, number],
+    voxelMax: readonly [number, number, number],
+  ): number[][] {
+    const { cLo, cHi } = this.regionChunkRange(voxelMin, voxelMax);
+    const out: number[][] = [];
+    for (let c0 = cLo[0]!; c0 <= cHi[0]!; c0++) {
+      for (let c1 = cLo[1]!; c1 <= cHi[1]!; c1++) {
+        for (let c2 = cLo[2]!; c2 <= cHi[2]!; c2++) {
+          out.push([c0, c1, c2]);
+        }
+      }
+    }
+    return out;
+  }
+
+  public regionChunkCount(
+    level: number,
+    voxelMin: readonly [number, number, number],
+    voxelMax: readonly [number, number, number],
+  ): number {
+    if (level !== 0) throw new Error("ZarrArraySource has only level 0");
+    const { cLo, cHi } = this.regionChunkRange(voxelMin, voxelMax);
+    return (
+      Math.max(0, cHi[0]! - cLo[0]! + 1) *
+      Math.max(0, cHi[1]! - cLo[1]! + 1) *
+      Math.max(0, cHi[2]! - cLo[2]! + 1)
+    );
+  }
+
+  public readRegion(
+    level: number,
+    voxelMin: readonly [number, number, number],
+    voxelMax: readonly [number, number, number],
+    signal?: AbortSignal,
+  ): AsyncIterable<VolumeChunk> {
+    if (level !== 0) throw new Error("ZarrArraySource has only level 0");
+    // Fetch the intersecting chunks with bounded concurrency instead of one-at-a-time: on a remote
+    // store the brick's wall-clock is dominated by fetch latency × chunk count, so N parallel fetches
+    // cut it ~N×. Results are yielded as they land (order-independent — the caller scatters by origin).
+    const indices = this.regionChunkIndices(voxelMin, voxelMax);
+    const concurrency = Math.max(1, Math.min(READ_REGION_CONCURRENCY, indices.length));
+    return pooledMap(indices, concurrency, (ci) => {
+      if (signal?.aborted) return Promise.reject(new DOMException("readRegion aborted", "AbortError"));
+      return this.readDiskChunk(ci, signal);
+    });
+  }
+
+  private async readDiskChunk(chunkIndices: number[], signal?: AbortSignal): Promise<VolumeChunk> {
     const key = chunkKey(this.meta, chunkIndices);
-    const compressed = await this.store.get(key);
+    const cached = this.chunkCache.get(key);
+    if (cached) return cached;
+    const compressed = await this.store.get(key, signal ? { signal } : undefined);
     const fullShape: [number, number, number] = [
       this.meta.chunks[0]!,
       this.meta.chunks[1]!,
@@ -282,7 +398,9 @@ class ZarrArraySource implements VolumeSource {
       originDisk[this.axisToXyz[1]]!,
       originDisk[this.axisToXyz[2]]!,
     ];
-    return { origin, shape, data };
+    const chunk: VolumeChunk = { origin, shape, data };
+    this.chunkCache.set(chunkKey(this.meta, chunkIndices), chunk);
+    return chunk;
   }
 
   public async *chunks(level: number): AsyncIterable<VolumeChunk> {

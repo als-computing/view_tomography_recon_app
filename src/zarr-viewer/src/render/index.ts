@@ -11,6 +11,8 @@ export { uploadVolume, chooseVolumeFormat, volumeFormatBytes } from "./volume/vo
 export type { UploadVolumeOptions, VolumeTextureFormat } from "./volume/volume-texture.js";
 export { VolumeLoader } from "./volume/volume-loader.js";
 export type { VolumeLevelResult, VolumeLoaderOptions } from "./volume/volume-loader.js";
+export { BrickLoader, chooseBrickRegion } from "./volume/brick-loader.js";
+export type { BrickResult, BrickRequest, BrickLoaderOptions } from "./volume/brick-loader.js";
 
 export { VolumeRenderer } from "./volume/volume-renderer.js";
 export type {

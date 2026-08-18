@@ -5,10 +5,16 @@
  * @packageDocumentation
  */
 
+/** Options for a store fetch. */
+export interface StoreGetOptions {
+  /** Cancels the fetch when the caller supersedes it (e.g. a new ROI). */
+  signal?: AbortSignal;
+}
+
 /** A key-value byte store (keys are POSIX-like paths within the Zarr hierarchy). */
 export interface Store {
   /** Fetch the bytes for `key`, or `undefined` if absent. */
-  get(key: string): Promise<Uint8Array | undefined>;
+  get(key: string, opts?: StoreGetOptions): Promise<Uint8Array | undefined>;
   /** Whether `key` exists. */
   has(key: string): Promise<boolean>;
 }
@@ -28,9 +34,9 @@ function joinUrl(base: string, key: string): string {
 export function httpStore(baseUrl: string): Store {
   const base = baseUrl.replace(/\/+$/, "");
   return {
-    async get(key: string): Promise<Uint8Array | undefined> {
+    async get(key: string, opts?: StoreGetOptions): Promise<Uint8Array | undefined> {
       const url = joinUrl(base, key);
-      const res = await fetch(url);
+      const res = await fetch(url, opts?.signal ? { signal: opts.signal } : undefined);
       if (res.status === 404) return undefined;
       if (!res.ok) throw new Error(`httpStore GET ${url}: ${res.status} ${res.statusText}`);
       // Guard against HTML/JS error pages being treated as chunk bytes.

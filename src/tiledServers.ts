@@ -22,6 +22,11 @@ export interface TiledServer {
   defaultFileId: string;
   /** OIDC redirect back to this app after login. Usually the app's own URL (same for both servers). */
   oidcRedirectUrl: string;
+  /**
+   * Whether this server exposes the live-notification WebSocket stream (`/api/v1/stream/...`). Local
+   * static/0.2.11 Tiled doesn't, so we skip opening the socket (avoids console connection errors).
+   */
+  supportsStream: boolean;
 }
 
 export const TILED_SERVERS: readonly TiledServer[] = [
@@ -32,6 +37,7 @@ export const TILED_SERVERS: readonly TiledServer[] = [
     processedPath: '',
     defaultFileId: 'scans/petiole22',
     oidcRedirectUrl: 'http://tiled-test:5174/tomo_viewer/',
+    supportsStream: false,
   },
   {
     id: 'staging',
@@ -40,6 +46,7 @@ export const TILED_SERVERS: readonly TiledServer[] = [
     processedPath: 'beamlines/bl832/processed',
     defaultFileId: '',
     oidcRedirectUrl: 'http://tiled-test:5174/tomo_viewer/',
+    supportsStream: true,
   },
 ];
 

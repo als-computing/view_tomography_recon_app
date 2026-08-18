@@ -2,8 +2,11 @@
  * Lightweight, localStorage-backed persistence for the WebGPU viewer's rendering settings.
  *
  * Two independent things live here:
- *  - The *last-used* snapshot (one per browser), auto-remembered as the user tweaks controls and
- *    auto-applied to every new sample/session so a look carries over without any manual step.
+ *  - The *last-used* snapshot, auto-remembered as the user tweaks controls and auto-applied on boot so
+ *    a look carries over without any manual step. It's stored *per sample* (keyed by the sample id,
+ *    i.e. the Zarr URL) so switching back to a tab restores that tab's own look — not whatever another
+ *    tab touched most recently. A single global snapshot is also kept as the *seed* applied to a
+ *    never-before-seen sample, so a brand-new tab still inherits the last look you were working with.
  *  - *Named presets* (a map of name → snapshot) the user saves/applies/deletes explicitly.
  *
  * A "snapshot" is just the serializable rendering state produced by the viewer's `getRendering()`
@@ -25,12 +28,16 @@ function storage(): Storage | null {
   }
 }
 
-/** The rendering snapshot the user last had active, or `null` if none was ever stored. */
-export function getLastRendering(): RenderingSnapshot | null {
+/** Per-sample storage key for `sampleKey`, or the shared global key when no sample is given. */
+function lastKeyFor(sampleKey?: string): string {
+  return sampleKey ? `${LAST_KEY}:${sampleKey}` : LAST_KEY;
+}
+
+function readSnapshotAt(key: string): RenderingSnapshot | null {
   const s = storage();
   if (!s) return null;
   try {
-    const raw = s.getItem(LAST_KEY);
+    const raw = s.getItem(key);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as unknown;
     return isSnapshot(parsed) ? parsed : null;
@@ -39,12 +46,31 @@ export function getLastRendering(): RenderingSnapshot | null {
   }
 }
 
-/** Remember `snapshot` as the last-used rendering (called debounced as the user edits controls). */
-export function setLastRendering(snapshot: RenderingSnapshot): void {
+/**
+ * The rendering snapshot to restore on boot. With a `sampleKey`, returns that sample's own last-used
+ * look, falling back to the shared global snapshot when this sample has never been seen (so a new tab
+ * still inherits the last look). Returns `null` if nothing was ever stored.
+ */
+export function getLastRendering(sampleKey?: string): RenderingSnapshot | null {
+  if (sampleKey) {
+    const own = readSnapshotAt(lastKeyFor(sampleKey));
+    if (own) return own;
+  }
+  return readSnapshotAt(LAST_KEY);
+}
+
+/**
+ * Remember `snapshot` as the last-used rendering (called debounced as the user edits controls). Writes
+ * the shared global snapshot always, and — when a `sampleKey` is given — that sample's own snapshot too,
+ * so each tab keeps an independent memory.
+ */
+export function setLastRendering(snapshot: RenderingSnapshot, sampleKey?: string): void {
   const s = storage();
   if (!s) return;
   try {
-    s.setItem(LAST_KEY, JSON.stringify(snapshot));
+    const json = JSON.stringify(snapshot);
+    s.setItem(LAST_KEY, json);
+    if (sampleKey) s.setItem(lastKeyFor(sampleKey), json);
   } catch (err) {
     console.warn("rendering-presets: failed to persist last rendering:", err);
   }

@@ -17,6 +17,7 @@ import { Header } from './Header';
 import './App.css';
 
 import { getDefaultZarrFileUrl, getTiledBaseUrl, getProcessedPath } from './utils';
+import { getActiveServer } from './tiledServers';
 import { installTiledTokenBridge } from './tiledTokenBridge';
 import { installTiledFetchInterceptor } from './ItkVtkNative/tiledAuth';
 import ItkVktNative from './ItkVtkNative/ItkVtkNative';
@@ -307,7 +308,12 @@ function App() {
         )}
       </div>
       {/* Live "new reconstruction ready" toasts (+ OS notification) for the signed-in user's ESAFs. */}
-      <TiledNotifications key={serverId} parentPath={getProcessedPath()} onView={openTab} />
+      <TiledNotifications
+        key={serverId}
+        parentPath={getProcessedPath()}
+        onView={openTab}
+        enabled={getActiveServer().supportsStream}
+      />
     </div>
   );
 }

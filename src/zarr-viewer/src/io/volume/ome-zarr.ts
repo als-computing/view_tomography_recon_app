@@ -113,6 +113,23 @@ class OmeZarrVolumeSource implements VolumeSource {
   public chunks(level: number): AsyncIterable<VolumeChunk> {
     return this.level(level).source.chunks(0);
   }
+
+  public readRegion(
+    level: number,
+    voxelMin: readonly [number, number, number],
+    voxelMax: readonly [number, number, number],
+    signal?: AbortSignal,
+  ): AsyncIterable<VolumeChunk> {
+    return this.level(level).source.readRegion(0, voxelMin, voxelMax, signal);
+  }
+
+  public regionChunkCount(
+    level: number,
+    voxelMin: readonly [number, number, number],
+    voxelMax: readonly [number, number, number],
+  ): number {
+    return this.level(level).source.regionChunkCount(0, voxelMin, voxelMax);
+  }
 }
 
 /**

@@ -66,6 +66,31 @@ export interface VolumeSource {
 
   /** Async-iterate all chunks at a resolution `level`. */
   chunks(level: number): AsyncIterable<VolumeChunk>;
+
+  /**
+   * Async-iterate only the chunks overlapping the half-open voxel box `[voxelMin, voxelMax)` at a
+   * resolution `level` — the ROI read for high-res brick streaming. Only the intersecting chunks are
+   * fetched (unlike {@link chunks}, which reads the whole level). Pass a `signal` to cancel in-flight
+   * fetches when the region is superseded. Yielded chunks carry their true full-chunk `origin`/`shape`
+   * (the caller clips/offsets into its ROI texture).
+   */
+  readRegion(
+    level: number,
+    voxelMin: readonly [number, number, number],
+    voxelMax: readonly [number, number, number],
+    signal?: AbortSignal,
+  ): AsyncIterable<VolumeChunk>;
+
+  /**
+   * Number of chunks that {@link readRegion} will stream for the half-open voxel box `[voxelMin,
+   * voxelMax)` at a resolution `level`. Pure integer math over the chunk grid (no I/O) — used to size a
+   * progress bar and to know up front how many writes a brick upload will take.
+   */
+  regionChunkCount(
+    level: number,
+    voxelMin: readonly [number, number, number],
+    voxelMax: readonly [number, number, number],
+  ): number;
 }
 
 /** Bytes per element for a {@link VolumeDType}. */
