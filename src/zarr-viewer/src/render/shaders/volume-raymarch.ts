@@ -91,13 +91,12 @@ fn sampleDensity(uvw: vec3<f32>) -> f32 {
   let bUvw = (p - frame.brickMin.xyz) / max(frame.brickMax.xyz - frame.brickMin.xyz, vec3<f32>(1e-6));
   if (any(bUvw < vec3<f32>(0.0)) || any(bUvw > vec3<f32>(1.0))) { return coarse; }
   let fine = textureSampleLevel(brickTex, volumeSampler, bUvw, 0.0).r;
-  // The brick texture is zero where fine-level chunks are missing/sparse; never let an empty fine
-  // sample overwrite valid coarse data (that produced voids). Gate the blend on the fine having signal.
-  let hasFine = smoothstep(0.0, 0.01, fine);
-  // Feather toward the ROI faces to hide the resolution seam, then blend by the fade weight.
+  // Overlay only: never punch holes in the coarse volume (empty / noisy L0 voxels) and never fill
+  // empty space with fine-level reconstruction noise (that fogged out the sample when the brick
+  // spanned a large Z fraction of a tomography pancake). Sharpen where coarse already has signal.
   let e = min(min(min(bUvw.x, 1.0 - bUvw.x), min(bUvw.y, 1.0 - bUvw.y)), min(bUvw.z, 1.0 - bUvw.z));
-  let w = clamp(frame.brickMax.w, 0.0, 1.0) * smoothstep(0.0, 0.06, e) * hasFine;
-  return mix(coarse, fine, w);
+  let w = clamp(frame.brickMax.w, 0.0, 1.0) * smoothstep(0.0, 0.06, e) * smoothstep(0.02, 0.08, coarse);
+  return mix(coarse, max(coarse, fine), w);
 }
 
 fn sampleTf(density: f32) -> vec4<f32> {

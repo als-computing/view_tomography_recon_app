@@ -680,10 +680,16 @@ export async function run(
   let roiIdle = 0;
   let roiRequestInFlight = false; // a brick request is streaming (drives the reset guard + progress bar)
   let roiReqSeq = 0; // monotonic id so a superseded request's finally() can't clobber a newer one
+  let roiDbg = 0; // throttle for the [ROI] diagnostic log (seconds countdown)
   let prevRoiCam = controls.getState();
-  const ROI_LOAD_T = 1.5; // stream when distance/frameExtent < this (zoomed in)
-  const ROI_CLEAR_T = 1.9; // clear when > this (hysteresis avoids flicker at the boundary)
-  const ROI_SETTLE = 0.15; // seconds of camera stillness before (re)streaming
+  // ROI brick sizing (UVW [0,1]). The on-screen frustum at the first-hit is only ~10% of XY when
+  // zoomed in — too small a patch. We widen the frustum, extrude into the volume, and pad; if the
+  // box no longer fits L0, chooseBrickRegion drops to L1.
+  const ROI_VIEW_SCALE = 1.75; // NDC corner scale (>1 fetches around the viewport)
+  const ROI_DEPTH_UVW = 0.38; // UVW-length into the volume from the near face along the view
+  const ROI_PAD = 0.35; // extra fraction of the AABB on each side
+  const ROI_MIN_SPAN = 0.18; // minimum UVW span per axis
+  const ROI_SETTLE = 0.2; // seconds of camera stillness before (re)streaming
 
   // ROI stream progress for the HUD bar. Updated per chunk; the bar's DOM is patched directly (rAF-
   // throttled) so per-chunk progress never triggers a full HUD rebuild.
@@ -753,7 +759,7 @@ export async function run(
     cropMax[1] < 0.999 ||
     cropMax[2] < 0.999;
 
-  // Slab-intersect the ray with the volume box [-h, h]; returns [tNear, tFar] or null.
+  // Ray ∩ volume box [-h,h]; returns [tNear, tFar] or null.
   const intersectRoiBox = (
     ox: number, oy: number, oz: number, dx: number, dy: number, dz: number,
     hx: number, hy: number, hz: number,
@@ -770,40 +776,75 @@ export async function run(
     return [tN, tF];
   };
 
-  // Visible-region AABB in UVW [0,1] from the camera frustum ∩ volume box (4 corner rays' entry/exit).
-  const frustumRoiUvw = ():
+  // Ray direction (world, normalized) through NDC (nx, ny) using the current inverse view-proj.
+  const rayDir = (nx: number, ny: number): [number, number, number] => {
+    const nearH = mulMat4Vec4(invViewProj, nx, ny, 0, 1);
+    const farH = mulMat4Vec4(invViewProj, nx, ny, 1, 1);
+    const ax = nearH[0] / nearH[3], ay = nearH[1] / nearH[3], az = nearH[2] / nearH[3];
+    const bx = farH[0] / farH[3], by = farH[1] / farH[3], bz = farH[2] / farH[3];
+    let dx = bx - ax, dy = by - ay, dz = bz - az;
+    const dl = Math.hypot(dx, dy, dz) || 1;
+    return [dx / dl, dy / dl, dz / dl];
+  };
+
+  // Focal-region AABB in UVW [0,1]. Starts at the volume ENTRY along the view (closest to the
+  // camera) and extrudes inward. Probe-centered placement put the near face inside the sample, so
+  // the high-res region started too far from the camera. If the generous box is too big for a finer
+  // level, updateRoi shrinks it. No view-ray hit → no ROI.
+  const focalRoiUvw = ():
     | { min: [number, number, number]; max: [number, number, number] }
     | null => {
     invViewProj.copy(lastViewProj);
     if (!invViewProj.invert()) return null;
     const hx = sizeSim.x * 0.5, hy = sizeSim.y * 0.5, hz = sizeSim.z * 0.5;
     const eye = camera.position;
-    let mnx = Infinity, mny = Infinity, mnz = Infinity;
-    let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
-    let any = false;
-    for (const [u, v] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) {
-      const nearH = mulMat4Vec4(invViewProj, u * 2 - 1, (1 - v) * 2 - 1, 0, 1);
-      const farH = mulMat4Vec4(invViewProj, u * 2 - 1, (1 - v) * 2 - 1, 1, 1);
-      const nx = nearH[0] / nearH[3], ny = nearH[1] / nearH[3], nz = nearH[2] / nearH[3];
-      const fx2 = farH[0] / farH[3], fy2 = farH[1] / farH[3], fz2 = farH[2] / farH[3];
-      let dx = fx2 - nx, dy = fy2 - ny, dz = fz2 - nz;
-      const dl = Math.hypot(dx, dy, dz) || 1; dx /= dl; dy /= dl; dz /= dl;
-      const t = intersectRoiBox(eye.x, eye.y, eye.z, dx, dy, dz, hx, hy, hz);
-      if (!t) continue;
-      const t0 = Math.max(t[0], 0);
-      if (t[1] < t0) continue;
-      for (const tt of [t0, t[1]]) {
-        const px = eye.x + dx * tt, py = eye.y + dy * tt, pz = eye.z + dz * tt;
-        mnx = Math.min(mnx, px); mny = Math.min(mny, py); mnz = Math.min(mnz, pz);
-        mxx = Math.max(mxx, px); mxy = Math.max(mxy, py); mxz = Math.max(mxz, pz);
-        any = true;
+    const [ccx, ccy, ccz] = rayDir(0, 0);
+    const hit = intersectRoiBox(eye.x, eye.y, eye.z, ccx, ccy, ccz, hx, hy, hz);
+    if (!hit) return null;
+    const tNear = Math.max(hit[0], 0);
+    const tFar = hit[1];
+    if (tFar < tNear) return null;
+
+    const toU = (val: number, h: number): number => Math.min(1, Math.max(0, (val + h) / (2 * h)));
+    const vu = ccx / (2 * hx), vv = ccy / (2 * hy), vw = ccz / (2 * hz);
+    const vLen = Math.hypot(vu, vv, vw) || 1;
+    const tStart = tNear;
+    const tEnd = Math.min(tFar, tStart + ROI_DEPTH_UVW / vLen);
+    const tMid = (tStart + tEnd) * 0.5;
+    const fx = Math.min(hx, Math.max(-hx, eye.x + ccx * tMid));
+    const fy = Math.min(hy, Math.max(-hy, eye.y + ccy * tMid));
+    const fz = Math.min(hz, Math.max(-hz, eye.z + ccz * tMid));
+
+    let mnu = 1, mnv = 1, mnw = 1;
+    let mxu = 0, mxv = 0, mxw = 0;
+    const add = (x: number, y: number, z: number): void => {
+      const u = toU(x, hx), v = toU(y, hy), w = toU(z, hz);
+      mnu = Math.min(mnu, u); mxu = Math.max(mxu, u);
+      mnv = Math.min(mnv, v); mxv = Math.max(mxv, v);
+      mnw = Math.min(mnw, w); mxw = Math.max(mxw, w);
+    };
+    add(fx, fy, fz);
+    for (const t of [tStart, tMid, tEnd]) {
+      for (const [su, sv] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) {
+        const [dx, dy, dz] = rayDir((su * 2 - 1) * ROI_VIEW_SCALE, ((1 - sv) * 2 - 1) * ROI_VIEW_SCALE);
+        add(eye.x + dx * t, eye.y + dy * t, eye.z + dz * t);
       }
     }
-    if (!any) return null;
-    const toU = (val: number, h: number): number => Math.min(1, Math.max(0, (val + h) / (2 * h)));
+    const padU = (mxu - mnu) * ROI_PAD, padV = (mxv - mnv) * ROI_PAD, padW = (mxw - mnw) * ROI_PAD;
+    mnu -= padU; mxu += padU;
+    mnv -= padV; mxv += padV;
+    mnw -= padW; mxw += padW;
+    const fu = toU(fx, hx), fv = toU(fy, hy), fw = toU(fz, hz);
+    const grow = (mn: number, mx: number, f: number): [number, number] => {
+      if (mx - mn >= ROI_MIN_SPAN) return [mn, mx];
+      return [f - ROI_MIN_SPAN * 0.5, f + ROI_MIN_SPAN * 0.5];
+    };
+    [mnu, mxu] = grow(mnu, mxu, fu);
+    [mnv, mxv] = grow(mnv, mxv, fv);
+    [mnw, mxw] = grow(mnw, mxw, fw);
     return {
-      min: [toU(mnx, hx), toU(mny, hy), toU(mnz, hz)],
-      max: [toU(mxx, hx), toU(mxy, hy), toU(mxz, hz)],
+      min: [Math.max(0, mnu), Math.max(0, mnv), Math.max(0, mnw)],
+      max: [Math.min(1, mxu), Math.min(1, mxv), Math.min(1, mxw)],
     };
   };
 
@@ -815,22 +856,39 @@ export async function run(
 
     let want = 0; // brick blend target this frame (a loaded brick is on screen)
     let desired = false; // we intend to keep a high-res brick this frame (a finer region applies)
+    let dbgRegionLevel = -1; // diagnostics: level chooseBrickRegion returned (-1 = none/no roi)
+    let dbgRoi: { min: [number, number, number]; max: [number, number, number] } | null = null;
     if (roiEnabled) {
       const cropSet = cropIsSet();
-      const zoomRatio = controls.distance / Math.max(frameExtent, 1e-6);
-      let roi: { min: [number, number, number]; max: [number, number, number] } | null = null;
-      if (cropSet) {
-        roi = {
-          min: [cropMin[0], cropMin[1], cropMin[2]],
-          max: [cropMax[0], cropMax[1], cropMax[2]],
-        };
-      } else if (zoomRatio < ROI_LOAD_T) {
-        roi = frustumRoiUvw();
-      }
-      const keepStreaming = !!roi && (cropSet || zoomRatio < ROI_CLEAR_T);
-      if (keepStreaming && roi) {
-        const region = chooseBrickRegion(source, roi.min, roi.max, { maxTextureDimension: maxTex });
-        // Only worthwhile if the brick is finer than the coarse level on screen.
+      // Crop box overrides the focal box; otherwise use the depth-bounded frustum slab.
+      const roi: { min: [number, number, number]; max: [number, number, number] } | null = cropSet
+        ? { min: [cropMin[0], cropMin[1], cropMin[2]], max: [cropMax[0], cropMax[1], cropMax[2]] }
+        : focalRoiUvw();
+      dbgRoi = roi;
+      if (roi) {
+        const regionOpts = { maxTextureDimension: maxTex };
+        let region = chooseBrickRegion(source, roi.min, roi.max, regionOpts);
+        // If the generous box is too big for a finer-than-displayed level (typical when the far
+        // frustum inflates from one viewing side), shrink toward the box center until one fits.
+        if (!(region && region.level < level)) {
+          const cu: [number, number, number] = [
+            (roi.min[0] + roi.max[0]) * 0.5,
+            (roi.min[1] + roi.max[1]) * 0.5,
+            (roi.min[2] + roi.max[2]) * 0.5,
+          ];
+          let mn: [number, number, number] = [roi.min[0], roi.min[1], roi.min[2]];
+          let mx: [number, number, number] = [roi.max[0], roi.max[1], roi.max[2]];
+          for (let k = 0; k < 8 && !(region && region.level < level); k++) {
+            for (let a = 0; a < 3; a++) {
+              mn[a] = cu[a]! + (mn[a]! - cu[a]!) * 0.7;
+              mx[a] = cu[a]! + (mx[a]! - cu[a]!) * 0.7;
+            }
+            region = chooseBrickRegion(source, mn, mx, regionOpts);
+          }
+        }
+        dbgRegionLevel = region ? region.level : -2;
+        // Engage whenever a finer-than-displayed level fits the focal box (no zoom threshold — the
+        // depth-bounded box only admits a finer level once you're zoomed in enough for it to fit).
         if (region && region.level < level) {
           desired = true; // a finer region applies → hold onto its request key across the load
           const dims = source.dimensionsAt(region.level);
@@ -899,6 +957,21 @@ export async function run(
     volumeRenderer.setBrickBlend(brickBlendCurrent);
     if (brickBlendCurrent <= 0.001 && brickBlendTarget === 0 && brickLoader.currentBrick) {
       brickLoader.clear();
+    }
+
+    // --- Diagnostics (throttled ~1 Hz). Remove once ROI engagement is verified. -------------------
+    roiDbg -= dt;
+    if (roiEnabled && roiDbg <= 0) {
+      roiDbg = 1;
+      const f = volumeRenderer.getFocalPoint();
+      const box = dbgRoi
+        ? `[${dbgRoi.min.map((n) => n.toFixed(2)).join(",")}]..[${dbgRoi.max.map((n) => n.toFixed(2)).join(",")}]`
+        : "null";
+      console.log(
+        `[ROI] dist=${controls.distance.toFixed(2)} focal=${f ? `(${f.map((n) => n.toFixed(1)).join(",")})` : "MISS"} ` +
+          `coarseLvl=${level} regionLvl=${dbgRegionLevel} desired=${desired} want=${want} ` +
+          `blend=${brickBlendCurrent.toFixed(2)} brick=${brickLoader.currentBrick ? "Y" : "n"} inflight=${roiRequestInFlight} roi=${box}`,
+      );
     }
   };
 
@@ -2373,7 +2446,9 @@ export async function run(
     const backDepth = Math.max(centerDepth + halfDepth, frontDepth + 1e-6);
     const planeT = Math.min(1, Math.max(0, measureDepth));
     const planeDepth = frontDepth + planeT * (backDepth - frontDepth);
-    // High-res ROI brick: derive/stream the visible sub-volume + advance the fade. Before recordInto.
+    // Probe the visible-surface depth along the view center (async readback) so the ROI can center its
+    // high-res slab on what's actually on screen. Then derive/stream the sub-volume + advance the fade.
+    volumeRenderer.runProbe(viewProj, camera.position);
     updateRoi(dt);
     // Measure plane: depth-composited grey sheet at `planeDepth` along the view axis. Must run before
     // recordInto (writes the frame uniform).
