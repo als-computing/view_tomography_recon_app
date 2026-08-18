@@ -167,20 +167,6 @@ export class VolumeRenderer implements Disposable {
   private readonly frameData = new Float32Array(VOLUME_FRAME_UNIFORM_SIZE / 4);
   private readonly invViewProj = new Mat4();
 
-  // Center-ray depth probe: a 1-thread compute pass marches the view-center ray through the coarse
-  // volume + TF and writes the world position where accumulated opacity first crosses a threshold — i.e.
-  // the surface the user is looking at. Read back async (1-frame latency) so the ROI can center its
-  // high-res brick on what's actually visible instead of guessing depth from camera geometry.
-  private probePipeline: GPUComputePipeline | undefined;
-  private probeBindGroup: GPUBindGroup | undefined;
-  private probeUniform: GPUBuffer | undefined;
-  private probeOut: GPUBuffer | undefined;
-  private probeRead: GPUBuffer | undefined;
-  private probeMapping = false;
-  private probeFocal: [number, number, number] | null = null;
-  private readonly probeInvVP = new Mat4();
-  private readonly probeData = new Float32Array(36);
-
   public constructor(
     public readonly ctx: GpuContext,
     options: VolumeRendererOptions = {},
@@ -218,7 +204,6 @@ export class VolumeRenderer implements Disposable {
   public setVolume(texture: ManagedTexture): void {
     this.volumeTex = texture;
     this.bindGroup = undefined;
-    this.probeBindGroup = undefined; // rebind the probe against the new coarse texture
   }
 
   /**
@@ -268,7 +253,6 @@ export class VolumeRenderer implements Disposable {
       { width: lutSize, height: 1, depthOrArrayLayers: 1 },
     );
     this.bindGroup = undefined;
-    this.probeBindGroup = undefined; // TF texture was recreated
   }
 
   /**
@@ -600,122 +584,6 @@ export class VolumeRenderer implements Disposable {
     this.volumeTex = undefined;
     this.pipeline = undefined;
     this.bindGroup = undefined;
-    this.probeUniform?.destroy();
-    this.probeOut?.destroy();
-    if (this.probeRead && !this.probeMapping) this.probeRead.destroy();
-    this.probeUniform = undefined;
-    this.probeOut = undefined;
-    this.probeRead = undefined;
-    this.probePipeline = undefined;
-    this.probeBindGroup = undefined;
-  }
-
-  /**
-   * Run the center-ray depth probe for this camera (see {@link probeFocal}). Cheap (one workgroup, one
-   * thread); records its own encoder + submit and kicks an async readback. At most one readback is in
-   * flight — frames while a map is pending are skipped. Safe to call every frame; a no-op until a
-   * volume + transfer function are set. Read the result via {@link getFocalPoint}.
-   */
-  public runProbe(viewProj: Mat4, eye: { x: number; y: number; z: number }): void {
-    if (!this.volumeTex || !this.tfTex || this.probeMapping) return;
-    this.ensurePipeline(); // creates samplers + main pipeline (idempotent, cached)
-    this.ensureProbe();
-    this.ensureProbeBindGroup();
-    this.probeInvVP.copy(viewProj);
-    if (!this.probeInvVP.invert()) return;
-
-    const diagonal = 2 * Math.hypot(this.boxHalf[0], this.boxHalf[1], this.boxHalf[2]);
-    const probeStep = Math.max(diagonal / 512, 5e-4); // ~512 samples across the box: fast, crosses fully
-    const pd = this.probeData;
-    this.probeInvVP.toArray(pd, 0);
-    pd[16] = eye.x; pd[17] = eye.y; pd[18] = eye.z; pd[19] = 0;
-    pd[20] = this.boxHalf[0]; pd[21] = this.boxHalf[1]; pd[22] = this.boxHalf[2]; pd[23] = probeStep;
-    pd[24] = this.cropMin[0]; pd[25] = this.cropMin[1]; pd[26] = this.cropMin[2]; pd[27] = this.densityScale;
-    pd[28] = this.cropMax[0]; pd[29] = this.cropMax[1]; pd[30] = this.cropMax[2]; pd[31] = 1024; // step cap
-    pd[32] = 0.03; pd[33] = 0; pd[34] = 0; pd[35] = 0; // first-visible opacity; low so faint tomo surfaces still hit
-    const device = this.ctx.device;
-    device.queue.writeBuffer(this.probeUniform!, 0, pd);
-
-    const enc = device.createCommandEncoder({ label: "center-depth-probe" });
-    const cp = enc.beginComputePass();
-    cp.setPipeline(this.probePipeline!);
-    cp.setBindGroup(0, this.probeBindGroup!);
-    cp.dispatchWorkgroups(1);
-    cp.end();
-    enc.copyBufferToBuffer(this.probeOut!, 0, this.probeRead!, 0, 16);
-    device.queue.submit([enc.finish()]);
-
-    this.probeMapping = true;
-    const read = this.probeRead!;
-    read
-      .mapAsync(GPUMapMode.READ)
-      .then(() => {
-        const a = new Float32Array(read.getMappedRange().slice(0));
-        read.unmap();
-        this.probeFocal = a[3]! > 0.5 ? [a[0]!, a[1]!, a[2]!] : null;
-        this.probeMapping = false;
-      })
-      .catch(() => {
-        this.probeMapping = false;
-      });
-  }
-
-  /** Latest probed focal point (world sim-units) — the visible surface along the view center, or null. */
-  public getFocalPoint(): [number, number, number] | null {
-    return this.probeFocal;
-  }
-
-  private ensureProbe(): void {
-    if (this.probePipeline) return;
-    const device = this.ctx.device;
-    device.pushErrorScope("validation");
-    const module = device.createShaderModule({
-      label: "center-depth-probe",
-      code: CENTER_DEPTH_PROBE_WGSL,
-    });
-    void module.getCompilationInfo?.().then((info) => {
-      for (const m of info.messages) {
-        if (m.type === "error") {
-          console.error(`[probe WGSL] ${m.lineNum}:${m.linePos} ${m.message}`);
-        }
-      }
-    });
-    this.probePipeline = device.createComputePipeline({
-      label: "center-depth-probe",
-      layout: "auto",
-      compute: { module, entryPoint: "main" },
-    });
-    void device.popErrorScope().then((err) => {
-      if (err) console.error("[probe pipeline]", err.message);
-    });
-    this.probeUniform = device.createBuffer({
-      size: 144,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.probeOut = device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    });
-    this.probeRead = device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-  }
-
-  private ensureProbeBindGroup(): void {
-    if (this.probeBindGroup) return;
-    this.probeBindGroup = this.ctx.device.createBindGroup({
-      label: "center-depth-probe",
-      layout: this.probePipeline!.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.probeUniform! } },
-        { binding: 1, resource: this.volumeTex!.createView({ dimension: "3d" }) },
-        { binding: 2, resource: this.volumeSampler! },
-        { binding: 3, resource: this.tfTex!.createView({ dimension: "2d" }) },
-        { binding: 4, resource: this.tfSampler! },
-        { binding: 5, resource: { buffer: this.probeOut! } },
-      ],
-    });
   }
 
   private ensurePipeline(): void {
@@ -793,78 +661,3 @@ export class VolumeRenderer implements Disposable {
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
-
-// Center-ray depth probe (see VolumeRenderer.runProbe). Marches only the view-center ray through the
-// coarse volume + TF and writes the world position where accumulated front-to-back opacity first
-// crosses `params.x` — the visible surface under the crosshair — into a storage buffer (world.w = 1 on
-// hit, 0 on miss).
-const CENTER_DEPTH_PROBE_WGSL = /* wgsl */ `
-struct Probe {
-  invVP: mat4x4<f32>,
-  eye: vec4<f32>,
-  boxHalf: vec4<f32>,   // xyz half-extents, w = step
-  cropMin: vec4<f32>,   // xyz crop min, w = densityScale
-  cropMax: vec4<f32>,   // xyz crop max, w = maxSteps
-  params: vec4<f32>,    // x = opacity threshold
-};
-struct Hit { world: vec4<f32>, };
-@group(0) @binding(0) var<uniform> P: Probe;
-@group(0) @binding(1) var volTex: texture_3d<f32>;
-@group(0) @binding(2) var volSamp: sampler;
-@group(0) @binding(3) var tfTex: texture_2d<f32>;
-@group(0) @binding(4) var tfSamp: sampler;
-@group(0) @binding(5) var<storage, read_write> outHit: Hit;
-
-fn intersectAabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
-  let inv = 1.0 / rd;
-  let t0 = (bmin - ro) * inv;
-  let t1 = (bmax - ro) * inv;
-  let tsm = min(t0, t1);
-  let tbg = max(t0, t1);
-  let tn = max(max(tsm.x, tsm.y), tsm.z);
-  let tf = min(min(tbg.x, tbg.y), tbg.z);
-  return vec2<f32>(tn, tf);
-}
-
-@compute @workgroup_size(1)
-fn main() {
-  let nearH = P.invVP * vec4<f32>(0.0, 0.0, 0.0, 1.0);
-  let farH = P.invVP * vec4<f32>(0.0, 0.0, 1.0, 1.0);
-  let nearW = nearH.xyz / nearH.w;
-  let farW = farH.xyz / farH.w;
-  let ro = P.eye.xyz;
-  let rd = normalize(farW - nearW);
-  let h = max(P.boxHalf.xyz, vec3<f32>(1e-6));
-  let hit = intersectAabb(ro, rd, -h, h);
-  var result = vec4<f32>(0.0);
-  if (hit.x <= hit.y && hit.y >= 0.0) {
-    let step = max(P.boxHalf.w, 5e-4);
-    let dScale = P.cropMin.w;
-    let maxSteps = i32(P.cropMax.w);
-    let thresh = P.params.x;
-    let cmin = P.cropMin.xyz;
-    let cmax = P.cropMax.xyz;
-    var t = max(hit.x, 0.0);
-    var acc = 0.0;
-    var i = 0;
-    loop {
-      if (i >= maxSteps || t > hit.y) { break; }
-      let p = ro + rd * t;
-      let uvw = clamp((p + h) / (2.0 * h), vec3<f32>(0.0), vec3<f32>(1.0));
-      if (all(uvw >= cmin) && all(uvw <= cmax)) {
-        let dens = textureSampleLevel(volTex, volSamp, uvw, 0.0).r;
-        let a = textureSampleLevel(tfTex, tfSamp, vec2<f32>(dens, 0.5), 0.0).a;
-        let sigma = a * dScale * 12.0;
-        acc = acc + (1.0 - acc) * (1.0 - exp(-sigma * step));
-        if (acc >= thresh) {
-          result = vec4<f32>(p, 1.0);
-          break;
-        }
-      }
-      t = t + step;
-      i = i + 1;
-    }
-  }
-  outHit.world = result;
-}
-`;

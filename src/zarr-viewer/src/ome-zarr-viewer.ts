@@ -680,7 +680,6 @@ export async function run(
   let roiIdle = 0;
   let roiRequestInFlight = false; // a brick request is streaming (drives the reset guard + progress bar)
   let roiReqSeq = 0; // monotonic id so a superseded request's finally() can't clobber a newer one
-  let roiDbg = 0; // throttle for the [ROI] diagnostic log (seconds countdown)
   let prevRoiCam = controls.getState();
   // ROI brick sizing (UVW [0,1]). The on-screen frustum at the first-hit is only ~10% of XY when
   // zoomed in — too small a patch. We widen the frustum, extrude into the volume, and pad; if the
@@ -856,15 +855,12 @@ export async function run(
 
     let want = 0; // brick blend target this frame (a loaded brick is on screen)
     let desired = false; // we intend to keep a high-res brick this frame (a finer region applies)
-    let dbgRegionLevel = -1; // diagnostics: level chooseBrickRegion returned (-1 = none/no roi)
-    let dbgRoi: { min: [number, number, number]; max: [number, number, number] } | null = null;
     if (roiEnabled) {
       const cropSet = cropIsSet();
       // Crop box overrides the focal box; otherwise use the depth-bounded frustum slab.
       const roi: { min: [number, number, number]; max: [number, number, number] } | null = cropSet
         ? { min: [cropMin[0], cropMin[1], cropMin[2]], max: [cropMax[0], cropMax[1], cropMax[2]] }
         : focalRoiUvw();
-      dbgRoi = roi;
       if (roi) {
         const regionOpts = { maxTextureDimension: maxTex };
         let region = chooseBrickRegion(source, roi.min, roi.max, regionOpts);
@@ -886,7 +882,6 @@ export async function run(
             region = chooseBrickRegion(source, mn, mx, regionOpts);
           }
         }
-        dbgRegionLevel = region ? region.level : -2;
         // Engage whenever a finer-than-displayed level fits the focal box (no zoom threshold — the
         // depth-bounded box only admits a finer level once you're zoomed in enough for it to fit).
         if (region && region.level < level) {
@@ -957,21 +952,6 @@ export async function run(
     volumeRenderer.setBrickBlend(brickBlendCurrent);
     if (brickBlendCurrent <= 0.001 && brickBlendTarget === 0 && brickLoader.currentBrick) {
       brickLoader.clear();
-    }
-
-    // --- Diagnostics (throttled ~1 Hz). Remove once ROI engagement is verified. -------------------
-    roiDbg -= dt;
-    if (roiEnabled && roiDbg <= 0) {
-      roiDbg = 1;
-      const f = volumeRenderer.getFocalPoint();
-      const box = dbgRoi
-        ? `[${dbgRoi.min.map((n) => n.toFixed(2)).join(",")}]..[${dbgRoi.max.map((n) => n.toFixed(2)).join(",")}]`
-        : "null";
-      console.log(
-        `[ROI] dist=${controls.distance.toFixed(2)} focal=${f ? `(${f.map((n) => n.toFixed(1)).join(",")})` : "MISS"} ` +
-          `coarseLvl=${level} regionLvl=${dbgRegionLevel} desired=${desired} want=${want} ` +
-          `blend=${brickBlendCurrent.toFixed(2)} brick=${brickLoader.currentBrick ? "Y" : "n"} inflight=${roiRequestInFlight} roi=${box}`,
-      );
     }
   };
 
@@ -2446,9 +2426,6 @@ export async function run(
     const backDepth = Math.max(centerDepth + halfDepth, frontDepth + 1e-6);
     const planeT = Math.min(1, Math.max(0, measureDepth));
     const planeDepth = frontDepth + planeT * (backDepth - frontDepth);
-    // Probe the visible-surface depth along the view center (async readback) so the ROI can center its
-    // high-res slab on what's actually on screen. Then derive/stream the sub-volume + advance the fade.
-    volumeRenderer.runProbe(viewProj, camera.position);
     updateRoi(dt);
     // Measure plane: depth-composited grey sheet at `planeDepth` along the view axis. Must run before
     // recordInto (writes the frame uniform).
