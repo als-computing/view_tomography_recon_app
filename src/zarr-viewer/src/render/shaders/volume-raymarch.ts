@@ -9,8 +9,8 @@
 
 import { LIGHT_STRUCT_WGSL } from "./lights.js";
 
-/** Byte size of the volume frame uniform block (mat4 + 21 × vec4). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 400;
+/** Byte size of the volume frame uniform block (mat4 + 21 × vec4 + shadow mat4 + shadowCtl vec4). */
+export const VOLUME_FRAME_UNIFORM_SIZE = 480;
 
 /** Compile-time specialization for {@link volumeRaymarchWgsl}. */
 export interface VolumeRaymarchSpec {
@@ -71,6 +71,8 @@ struct Frame {
   accelOcc: vec4<f32>,       // xyz = occupancy macrocell grid, w unused
   visGrid: vec4<f32>,        // xyz = vis-bin grid, w = visEnable (1 = accumulate)
   screen: vec4<f32>,         // xy = internal pixels, z = tile size
+  worldToLight: mat4x4<f32>, // world → light-space UVW for the opacity shadow map (Milestone 7.1)
+  shadowCtl: vec4<f32>,      // x = shadowMapEnable (1 = sample the map instead of marching a shadow ray)
 };
 
 struct OccCell { dmin: f32, dmax: f32, dist: f32, occupied: f32 }
@@ -95,6 +97,8 @@ ${LIGHT_STRUCT_WGSL}
 // transfer function alpha (density units). Kept f32 (the ratio form is cancellation-prone). One entry
 // per TF LUT bin; a 2-entry dummy is bound when PRE_INTEGRATE is off.
 @group(0) @binding(11) var<storage, read> tPreint: array<f32>;
+// Light-space opacity shadow map (Milestone 7.1): .r = optical depth τ from the light to each point.
+@group(0) @binding(12) var shadowTex: texture_3d<f32>;
 
 struct VSOut {
   @builtin(position) clip: vec4<f32>,
@@ -341,6 +345,16 @@ fn ambientOcclusion(pWorld: vec3<f32>, n: vec3<f32>, seed: f32) -> f32 {
   return clamp(occ, 0.0, 1.0);
 }
 
+// Milestone 7.1: sample the precomputed light-space opacity map (optical depth τ from the light) with a
+// single trilinear fetch, instead of marching a secondary shadow ray. Points outside the map are unlit-
+// shadowed (T = 1). Applies the same shadowStrength (lightCtl1.z) as the brute-march path.
+fn shadowMapT(worldP: vec3<f32>) -> f32 {
+  let lc = (frame.worldToLight * vec4<f32>(worldP, 1.0)).xyz;
+  if (any(lc < vec3<f32>(0.0)) || any(lc > vec3<f32>(1.0))) { return 1.0; }
+  let tau = textureSampleLevel(shadowTex, volumeSampler, lc, 0.0).r;
+  return mix(1.0, exp(-tau), clamp(frame.lightCtl1.z, 0.0, 1.0));
+}
+
 // seed is a per-sample hash for shadow/AO jitter. heavy gates the expensive secondary rays
 // (shadow + AO) to samples that actually contribute to the image (front-of-volume, not yet opaque);
 // low-contribution samples still get cheap diffuse/spec so the look is unchanged.
@@ -407,7 +421,11 @@ fn shadeSample(
     // Only shadow-casting lights (spotRect.z flag, set per light on the CPU) cast, and only for
     // contributing samples (heavy) -- clamps the biggest cost while matching the visible result.
     if (shadowOn && heavy && Lgt.spotRect.z > 0.5) {
-      shadow = shadowTransmittance(pWorld, ldir, densityScale, maxDist, seed);
+      if (frame.shadowCtl.x > 0.5) {
+        shadow = shadowMapT(pWorld); // precomputed light-space opacity map (Milestone 7.1)
+      } else {
+        shadow = shadowTransmittance(pWorld, ldir, densityScale, maxDist, seed);
+      }
     }
     let ndotl = max(dot(n, ldir), 0.0);
     let H = normalize(ldir + viewDir);

@@ -352,6 +352,15 @@ export async function run(
   // viewProj still drives ROI/overlay). Reused each frame to avoid per-frame allocation.
   const jitterProj = new Mat4();
   const jitterViewProj = new Mat4();
+  // Render-on-demand budget (see the frame loop). Any interaction / still-converging process tops it up;
+  // at zero with a still camera the loop skips the expensive volume march and the last frame persists.
+  let renderFrames = 3;
+  let lastRenderCam: WebGpuCameraState | null = null;
+  let lastRenderW = 0;
+  let lastRenderH = 0;
+  const requestRender = (): void => {
+    renderFrames = Math.max(renderFrames, 3);
+  };
 
   // Snapshot the rendering / cropping groups from the live closure state. Defined up here so the
   // early error-path instances (below) can expose them too.
@@ -537,6 +546,7 @@ export async function run(
   // Push the (non-per-frame) lighting params to the renderer + set the half-res lever. Called on any
   // Lighting-panel change; the light *positions* themselves are rebuilt per frame (below).
   const applyLighting = (): void => {
+    requestRender();
     taau.reset(); // lighting changed → restart temporal accumulation
     volumeRenderer.setLightingParams({
       masterAmbient: lightAmbient,
@@ -1112,6 +1122,7 @@ export async function run(
       intensityRemap: equalizeOn ? equalizeRemap : undefined,
     });
     volumeRenderer.setTransferFunction(tf, 512);
+    requestRender();
     taau.reset(); // transfer function / colormap changed → restart temporal accumulation
     curveEditor?.setColorMap(colorMap);
     curveEditor?.setPoints(opacityPoints);
@@ -1197,6 +1208,7 @@ export async function run(
   };
 
   const applyRender = (): void => {
+    requestRender();
     taau.reset(); // any render-setting change → restart temporal accumulation
     volumeRenderer.setParams({
       densityScale,
@@ -1290,6 +1302,7 @@ export async function run(
   // safely restores a saved preset / last-used look, a linked peer's full state, or a Share link. It
   // deliberately touches only appearance — never camera or cropping. Callers decide whether to emit.
   const applyRenderingState = (state: Partial<WebGpuRenderingState>): void => {
+    requestRender();
     if (state.colorMap !== undefined) colorMap = state.colorMap;
     if (state.colorLo !== undefined) colorLo = state.colorLo;
     if (state.colorHi !== undefined) colorHi = state.colorHi;
@@ -1567,6 +1580,7 @@ export async function run(
     `<div class="whud__range-labels"><span>${label}</span><span data-range-vals>${fmt(lo)} – ${fmt(hi)}</span></div>`;
 
   const renderUi = (): void => {
+    requestRender(); // catch-all: any HUD interaction that rebuilds the panel also repaints the canvas
     curveEditor?.dispose();
     curveEditor = undefined;
 
@@ -2374,6 +2388,17 @@ export async function run(
   canvas.addEventListener("wheel", onSliceWheel, { passive: false });
   session.onDispose(() => canvas.removeEventListener("wheel", onSliceWheel));
 
+  // Render-on-demand safety net: any direct canvas interaction (camera drag start, pick, wheel scrub)
+  // tops up the render budget even if it doesn't route through the HUD chokepoints. Camera drags then
+  // sustain themselves via the per-frame camera-moved check.
+  const bumpRender = (): void => requestRender();
+  canvas.addEventListener("pointerdown", bumpRender, { passive: true });
+  canvas.addEventListener("wheel", bumpRender, { passive: true });
+  session.onDispose(() => {
+    canvas.removeEventListener("pointerdown", bumpRender);
+    canvas.removeEventListener("wheel", bumpRender);
+  });
+
   // Auto-stream coarsest→level 2 (progressive hi-res, capped so full-res levels don't blow up the GPU).
   applyLevel(finestTargetLevel(), true);
   applyTf();
@@ -2480,15 +2505,20 @@ export async function run(
   session.loop((dt) => {
     resizeDemoCanvas(canvas);
     controls.update(dt);
-    // Announce orbit/pan/zoom to linked panes. Poll (rather than hook into the controls' input) so
-    // we also catch damped motion; guarded by the listener count so it's free when nothing's linked.
-    if (viewerListeners.cameraChange.size > 0) {
-      const cur = controls.getState();
-      if (!camsEqual(cur, lastCam)) {
-        lastCam = cur;
-        emit("cameraChange");
-      }
+    // Render on demand: the volume ray-march is expensive, so re-render only while something is actually
+    // changing — otherwise a continuous 60 fps march saturates the GPU and janks the whole browser
+    // (scrolling included). `renderFrames` is a small budget any interaction or still-converging process
+    // (camera motion, settings change, TAAU accumulation, adaptive refine, ROI brick fade, resize) tops
+    // up; when it hits zero and the camera is still, we skip the frame and the last image persists.
+    const camNow = controls.getState();
+    if (viewerListeners.cameraChange.size > 0 && !camsEqual(camNow, lastCam)) {
+      lastCam = camNow;
+      emit("cameraChange");
     }
+    if (!camsEqual(camNow, lastRenderCam)) requestRender();
+    if (canvas.width !== lastRenderW || canvas.height !== lastRenderH) requestRender();
+    if (renderFrames <= 0) return;
+    renderFrames -= 1;
     const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
     // Near/far bracket the volume CENTER's depth ALONG THE VIEW AXIS (the box is centered at the world
     // origin), plus the bounding-sphere radius. We project the center onto the actual view direction
@@ -2536,6 +2566,23 @@ export async function run(
         extent,
       ),
     );
+    // Milestone 7.1: point the opacity shadow map at the primary shadow-casting light (a directional
+    // approximation). Global = its fixed sun direction; flashlight = toward the eye; stage = -forward.
+    // The map replaces the per-sample shadow march whenever shadows + a caster are active.
+    let shadowDir: [number, number, number] | null = null;
+    if (shadowOn) {
+      if (lightGlobalOn && shadowCastGlobal) {
+        const el = (lightElevation * Math.PI) / 180;
+        const az = (lightAzimuth * Math.PI) / 180;
+        shadowDir = [Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)];
+      } else if (lightFlashOn && shadowCastFlash) {
+        const l = Math.hypot(camera.position.x, camera.position.y, camera.position.z) || 1;
+        shadowDir = [camera.position.x / l, camera.position.y / l, camera.position.z / l];
+      } else if (lightStageOn && shadowCastStage) {
+        shadowDir = [-fx, -fy, -fz];
+      }
+    }
+    volumeRenderer.setShadowMap(shadowDir !== null, shadowDir ?? [0.45, 0.85, 0.35]);
     // Measure plane depth in world units along the view axis. `measureDepth` is a 0..1 fraction across
     // the volume's actual depth footprint (0 = front face nearest the camera, 1 = back face), so the
     // plane and its calibrated ruler track zoom instead of a fixed multiple of the extent. The AABB is
@@ -2655,6 +2702,17 @@ export async function run(
       ruler,
       banner: volumeRenderer.approximateShadingBanner(),
     });
+
+    // Record what we just rendered, and keep the budget alive while anything is still converging so the
+    // image finishes refining after the camera stops (adaptive step easing, TAAU accumulating, ROI brick
+    // fading in) — then it naturally goes idle.
+    lastRenderCam = camNow;
+    lastRenderW = canvas.width;
+    lastRenderH = canvas.height;
+    const adaptiveEasing = Math.abs(navSampleDist - sampleDist) > 0.005;
+    const taauConverging = temporalAA && taau.sampleCount < taau.maxAccum;
+    const brickFading = brickBlendCurrent !== brickBlendTarget;
+    if (adaptiveEasing || taauConverging || brickFading) requestRender();
   });
 
   session.onDispose(() => {

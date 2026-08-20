@@ -37,6 +37,7 @@ import {
 } from "../occupancy.js";
 import { dilateTileFlags } from "../tiles.js";
 import { halton } from "../taau.js";
+import { shadowTransform } from "../shadow-map.js";
 import { meanFlip, solidRgba, syntheticVolume32 } from "../flip.js";
 import { FLIP_CONFIGS, flipConfigToLut } from "../flip-configs.js";
 
@@ -341,6 +342,43 @@ describe("TAAU jitter (Milestone 5)", () => {
     expect(Math.min(...xs)).toBeLessThan(0);
     expect(Math.max(...ys)).toBeGreaterThan(0);
     expect(Math.min(...ys)).toBeLessThan(0);
+  });
+});
+
+describe("shadow map transform (Milestone 7.1)", () => {
+  // Apply the column-major worldToLightUvw matrix (the same math the ray-march samples with).
+  const applyM = (m: Float32Array, p: readonly [number, number, number]): [number, number, number] => {
+    const r = (i: number): number => m[i]! * p[0] + m[4 + i]! * p[1] + m[8 + i]! * p[2] + m[12 + i]!;
+    return [r(0), r(1), r(2)];
+  };
+  const dot = (a: readonly number[], b: readonly number[]): number => a[0]! * b[0]! + a[1]! * b[1]! + a[2]! * b[2]!;
+
+  it("maps the volume center to the light-UVW center and every corner into [0,1]", () => {
+    const H: [number, number, number] = [1, 2, 1.5];
+    const t = shadowTransform([0.3, 0.8, 0.5], H);
+    const c = applyM(t.worldToLightUvw, [0, 0, 0]);
+    expect(c[0]).toBeCloseTo(0.5, 5);
+    expect(c[1]).toBeCloseTo(0.5, 5);
+    expect(c[2]).toBeCloseTo(0.5, 5);
+    for (const sx of [-1, 1])
+      for (const sy of [-1, 1])
+        for (const sz of [-1, 1]) {
+          const lc = applyM(t.worldToLightUvw, [sx * H[0], sy * H[1], sz * H[2]]);
+          for (const v of lc) {
+            expect(v).toBeGreaterThanOrEqual(-1e-5);
+            expect(v).toBeLessThanOrEqual(1 + 1e-5);
+          }
+        }
+  });
+
+  it("builds an orthonormal basis with fwd opposing the light direction", () => {
+    const t = shadowTransform([0.3, 0.8, 0.5], [1, 1, 1]);
+    expect(dot(t.right, t.up)).toBeCloseTo(0, 5);
+    expect(dot(t.right, t.fwd)).toBeCloseTo(0, 5);
+    expect(dot(t.up, t.fwd)).toBeCloseTo(0, 5);
+    const l = Math.hypot(0.3, 0.8, 0.5);
+    expect(t.fwd[0]).toBeCloseTo(-0.3 / l, 5);
+    expect(t.fwd[1]).toBeCloseTo(-0.8 / l, 5);
   });
 });
 

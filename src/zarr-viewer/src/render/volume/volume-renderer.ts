@@ -29,6 +29,7 @@ import { hashTransferFunction, type RenderProvenance } from "../accel/provenance
 import { VisibilityFeedback, VIS_GRID_DEFAULT } from "../accel/visibility.js";
 import { OccupancyGrid } from "../accel/occupancy.js";
 import { TileCompactor, TILE_SIZE } from "../accel/tiles.js";
+import { ShadowMap } from "../accel/shadow-map.js";
 
 /** Volume blend / compositing mode (itk-vtk `setImageBlendMode`). */
 export type VolumeBlendMode = "composite" | "mip" | "minip" | "average";
@@ -163,6 +164,13 @@ export class VolumeRenderer implements Disposable {
   // Milestone 3.1 pre-integration: cumulative-extinction LUT (rebuilt with the TF); dummy when unused.
   private tPreintBuffer: ManagedBuffer | undefined;
   private dummyPreint: ManagedBuffer;
+  // Milestone 7.1: light-space opacity shadow map (rebuilt on demand from TF / density / light dir).
+  private readonly shadowMap: ShadowMap;
+  private shadowMapEnabled = false;
+  private shadowMapBuilt = false;
+  private dirtyShadow = true;
+  private shadowLightDir: [number, number, number] = [0.45, 0.85, 0.35];
+  private readonly worldToLight = new Float32Array(16);
 
   // Multi-light shading (prism lighting library). The light list is rebuilt per frame by the viewer
   // (global / camera flashlight / stage) and uploaded to this storage buffer; the control params
@@ -252,6 +260,7 @@ export class VolumeRenderer implements Disposable {
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       8,
     );
+    this.shadowMap = new ShadowMap(ctx.device);
   }
 
   public setVolume(texture: ManagedTexture): void {
@@ -269,6 +278,22 @@ export class VolumeRenderer implements Disposable {
     }
     this.dirtyOccMinMax = true;
     this.dirtyOccTf = true;
+    this.dirtyShadow = true;
+  }
+
+  /**
+   * Enable/point the opacity shadow map (Milestone 7.1). `lightDir` is a unit vector toward the primary
+   * shadow-casting light. A meaningful change of direction (or the enable) marks the map dirty so it
+   * rebuilds on the next pre-pass; unchanged inputs cost nothing.
+   */
+  public setShadowMap(enabled: boolean, lightDir: readonly [number, number, number]): void {
+    const dot =
+      lightDir[0] * this.shadowLightDir[0] +
+      lightDir[1] * this.shadowLightDir[1] +
+      lightDir[2] * this.shadowLightDir[2];
+    if (enabled !== this.shadowMapEnabled || dot < 0.9995) this.dirtyShadow = true;
+    this.shadowMapEnabled = enabled;
+    this.shadowLightDir = [lightDir[0], lightDir[1], lightDir[2]];
   }
 
   /**
@@ -321,6 +346,7 @@ export class VolumeRenderer implements Disposable {
     this.lastLutSize = lutSize;
     this.tfHash = hashTransferFunction(lut);
     this.dirtyOccTf = true;
+    this.dirtyShadow = true;
     // Milestone 3.1: cumulative extinction LUT T(d) = ∫₀^d α(x) dx (trapezoidal), kept f32 for the
     // cancellation-prone ratio form. Rebuilt with the TF; consumed by the quality shader's pre-integration.
     const tCurve = new Float32Array(lutSize);
@@ -485,6 +511,26 @@ export class VolumeRenderer implements Disposable {
       );
       if (rebuilt) this.bindGroup = undefined;
     }
+    // Milestone 7.1: rebuild the opacity shadow map only when dirty (TF / density / light dir changed)
+    // and shadows are on. Render-on-demand keeps this off the idle path.
+    if (
+      this.shadowMapEnabled &&
+      this.shadowEnable &&
+      this.dirtyShadow &&
+      this.volumeTex &&
+      this.tfTex &&
+      this.tfSampler
+    ) {
+      const t = this.shadowMap.rebuild(encoder, this.volumeTex, this.tfTex, this.tfSampler, {
+        lightDir: this.shadowLightDir,
+        boxHalf: this.boxHalf,
+        densityScale: this.densityScale,
+        sigmaMul: 12,
+      });
+      this.worldToLight.set(t.worldToLightUvw);
+      this.shadowMapBuilt = true;
+      this.dirtyShadow = false;
+    }
     this.vis.recordCopy(encoder);
   }
 
@@ -573,7 +619,10 @@ export class VolumeRenderer implements Disposable {
     >,
   ): void {
     if (params.stepSize !== undefined) this.stepSize = params.stepSize;
-    if (params.densityScale !== undefined) this.densityScale = params.densityScale;
+    if (params.densityScale !== undefined && params.densityScale !== this.densityScale) {
+      this.densityScale = params.densityScale;
+      this.dirtyShadow = true; // τ scales with density → the shadow map must rebuild
+    }
     if (params.maxSteps !== undefined) this.maxSteps = params.maxSteps;
     if (params.exposure !== undefined) this.exposure = params.exposure;
     if (params.ambient !== undefined) this.ambient = params.ambient;
@@ -781,6 +830,12 @@ export class VolumeRenderer implements Disposable {
     d[97] = this.internalHeight;
     d[98] = TILE_SIZE;
     d[99] = 0;
+    // worldToLight mat4 (Milestone 7.1) at floats 100..115, then shadowCtl at 116.
+    for (let k = 0; k < 16; k++) d[100 + k] = this.worldToLight[k]!;
+    d[116] = this.shadowMapEnabled && this.shadowMapBuilt ? 1 : 0;
+    d[117] = 0;
+    d[118] = 0;
+    d[119] = 0;
     this.frameUniform!.write(d);
   }
 
@@ -796,6 +851,7 @@ export class VolumeRenderer implements Disposable {
     this.dummyTiles.dispose();
     this.tPreintBuffer?.dispose();
     this.dummyPreint.dispose();
+    this.shadowMap.dispose();
     this.frameUniform = undefined;
     this.tfTex = undefined;
     this.lightEnv = undefined;
@@ -824,6 +880,7 @@ export class VolumeRenderer implements Disposable {
           { binding: 9, visibility: visFrag, buffer: { type: "read-only-storage" } },
           { binding: 10, visibility: visVert | visFrag, buffer: { type: "read-only-storage" } },
           { binding: 11, visibility: visFrag, buffer: { type: "read-only-storage" } },
+          { binding: 12, visibility: visFrag, texture: { sampleType: "float", viewDimension: "3d" } },
         ],
       });
       this.pipelineLayout = this.ctx.device.createPipelineLayout({
@@ -955,6 +1012,7 @@ export class VolumeRenderer implements Disposable {
         { binding: 9, resource: { buffer: prefixBuf } },
         { binding: 10, resource: { buffer: tileBuf } },
         { binding: 11, resource: { buffer: (this.tPreintBuffer ?? this.dummyPreint).gpu } },
+        { binding: 12, resource: this.shadowMap.texture.createView({ dimension: "3d" }) },
       ],
     });
   }
