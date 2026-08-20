@@ -704,6 +704,7 @@ export async function run(
   const NAV_SAMPLE_DIST = 1.5; // coarse step multiplier held during navigation
   const NAV_SETTLE = 0.15; // seconds of camera stillness before refining back to the configured value
   let navSampleDist = 1;
+  let taauPrevSettled = false; // tracks the moving↔settled edge so TAAU reseeds fine detail on settle
   let roiRequestInFlight = false; // a brick request is streaming (drives the reset guard + progress bar)
   let roiReqSeq = 0; // monotonic id so a superseded request's finally() can't clobber a newer one
   let prevRoiCam = controls.getState();
@@ -2575,10 +2576,26 @@ export async function run(
     // resets the history so a moving view shows the live frame with no ghosting. When accumulating, jitter
     // the projection sub-pixel so successive converged frames supersample; the un-jittered viewProj still
     // drives ROI/overlay.
-    const taauSettled =
-      temporalAA && roiIdle >= NAV_SETTLE && Math.abs(navSampleDist - sampleDist) < 0.02;
     let renderViewProj = viewProj;
-    if (taauSettled) {
+    if (temporalAA) {
+      // "Settled" = camera stopped AND the adaptive step has finished refining. On the moving→settled
+      // edge, reseed accumulation so the sharp frames replace the coarse in-motion history; a moving view
+      // keeps converging via reprojection rather than resetting.
+      const settled = roiIdle >= NAV_SETTLE && Math.abs(navSampleDist - sampleDist) < 0.02;
+      if (settled && !taauPrevSettled) taau.reset();
+      taauPrevSettled = settled;
+      // Reprojection inputs use the UN-jittered matrices (jitter is only for the render's sub-pixel
+      // supersampling). While moving, reproject history at the orbit-pivot depth; when settled, plain avg.
+      invViewProj.copy(viewProj);
+      if (invViewProj.invert()) {
+        taau.setReprojection(
+          invViewProj.elements,
+          viewProj.elements,
+          [camera.position.x, camera.position.y, camera.position.z],
+          Math.max(1e-3, controls.distance),
+          !settled,
+        );
+      }
       const [jx, jy] = taau.jitterPixels();
       jitterProj.copy(proj);
       jitterProj.elements[8]! += (2 * jx) / rw;

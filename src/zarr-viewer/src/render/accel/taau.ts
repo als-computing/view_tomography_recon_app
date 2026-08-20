@@ -30,7 +30,12 @@ export function halton(index: number, base: number): number {
 const HDR_FORMAT: GPUTextureFormat = "rgba16float";
 
 const BLEND_WGSL = /* wgsl */ `
-struct Params { weight: f32 }
+struct Params {
+  invViewProj: mat4x4<f32>,   // current frame: reconstruct a world ray from a screen uv
+  prevViewProj: mat4x4<f32>,  // previous frame: project a world point into history uv
+  eyePivot: vec4<f32>,        // xyz = camera eye, w = planar reprojection depth (orbit pivot distance)
+  misc: vec4<f32>,            // x = blend weight, y = reproject enable, zw = (1/width, 1/height)
+}
 @group(0) @binding(0) var curTex: texture_2d<f32>;
 @group(0) @binding(1) var histTex: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -47,14 +52,56 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
   return out;
 }
 
+// World ray direction through the sampling uv (suv), using this frame's inverse view-projection. suv is
+// the texture-sampling uv; ndc = suv*2-1 (the convention the volume shader reconstructs rays with).
+fn worldRay(suv: vec2<f32>) -> vec3<f32> {
+  let ndc = suv * 2.0 - vec2<f32>(1.0);
+  let nh = params.invViewProj * vec4<f32>(ndc, 0.0, 1.0);
+  let fh = params.invViewProj * vec4<f32>(ndc, 1.0, 1.0);
+  return normalize(fh.xyz / fh.w - nh.xyz / nh.w);
+}
+
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-  let uv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
-  let cur = textureSampleLevel(curTex, samp, uv, 0.0);
-  let hist = textureSampleLevel(histTex, samp, uv, 0.0);
-  // weight = 1/(n+1): a running average up to the cap, then an exponential tail. weight == 1 on the
-  // reset frame ⇒ output is the live frame and history is (re)seeded, so stale history never leaks in.
-  return mix(hist, cur, clamp(params.weight, 0.0, 1.0));
+  let suv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
+  let cur = textureSampleLevel(curTex, samp, suv, 0.0);
+  let weight = clamp(params.misc.x, 0.0, 1.0);
+
+  if (params.misc.y < 0.5) {
+    // Still camera: straight running average (weight = 1/(n+1)); weight == 1 reseeds history.
+    let hist = textureSampleLevel(histTex, samp, suv, 0.0);
+    return vec4<f32>(mix(hist.rgb, cur.rgb, weight), 1.0);
+  }
+
+  // Moving camera — planar reprojection: assume this pixel's content lies on the plane at the orbit-pivot
+  // depth, find where that world point sat in the previous frame, and sample history there. Off-pivot
+  // parallax is corrected by the variance clip below rather than per-pixel depth (a later increment).
+  let rd = worldRay(suv);
+  let worldP = params.eyePivot.xyz + rd * params.eyePivot.w;
+  let pc = params.prevViewProj * vec4<f32>(worldP, 1.0);
+  if (pc.w <= 0.0) { return vec4<f32>(cur.rgb, 1.0); }
+  let puv = pc.xy / pc.w * 0.5 + vec2<f32>(0.5);
+  if (any(puv < vec2<f32>(0.0)) || any(puv > vec2<f32>(1.0))) {
+    return vec4<f32>(cur.rgb, 1.0); // reprojected off-screen (disoccluded) → take the live frame
+  }
+  let hist = textureSampleLevel(histTex, samp, puv, 0.0).rgb;
+
+  // Neighborhood variance clip: clamp the reprojected history to the 3×3 colour AABB of the current
+  // frame. This is what suppresses ghosting when the planar reprojection is wrong (parallax / occlusion)
+  // — mismatched history is pulled back to the local colour range instead of smearing.
+  let tx = params.misc.z;
+  let ty = params.misc.w;
+  var cmin = cur.rgb;
+  var cmax = cur.rgb;
+  for (var dy = -1; dy <= 1; dy = dy + 1) {
+    for (var dx = -1; dx <= 1; dx = dx + 1) {
+      let s = textureSampleLevel(curTex, samp, suv + vec2<f32>(f32(dx) * tx, f32(dy) * ty), 0.0).rgb;
+      cmin = min(cmin, s);
+      cmax = max(cmax, s);
+    }
+  }
+  let histClamped = clamp(hist, cmin, cmax);
+  return vec4<f32>(mix(histClamped, cur.rgb, weight), 1.0);
 }
 `;
 
@@ -72,14 +119,43 @@ export class TemporalAccumulator {
   readonly #cache: PipelineCache;
   #pipeline: GPURenderPipeline | undefined;
   #layout: GPUBindGroupLayout | undefined;
+  // Reprojection state (set per frame by the viewer; used while the camera moves).
+  #reproject = false;
+  #pivot = 1;
+  #eye: [number, number, number] = [0, 0, 0];
+  readonly #curInvVP = new Float32Array(16);
+  readonly #curVP = new Float32Array(16);
+  readonly #prevVP = new Float32Array(16);
+  #hasPrev = false;
 
   /** Cap on the running average before it becomes exponential (keeps responding to subtle changes). */
   public maxAccum = 64;
+  /** History never exceeds this fraction while the camera moves — keeps reprojected motion responsive. */
+  public motionWeightFloor = 0.12;
 
   public constructor(private readonly device: GPUDevice) {
     this.#cache = new PipelineCache(device);
-    this.#params = new ManagedBuffer(device, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, 16);
+    this.#params = new ManagedBuffer(device, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, 160);
     this.#sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
+  }
+
+  /**
+   * Per-frame reprojection inputs. `invViewProj` (current) reconstructs world rays; `viewProj` (current)
+   * is stored to become next frame's `prevViewProj`. `pivotDepth` is the planar reprojection distance
+   * (orbit pivot). `enable` turns on motion reprojection (off = plain still accumulation).
+   */
+  public setReprojection(
+    invViewProj: ArrayLike<number>,
+    viewProj: ArrayLike<number>,
+    eye: readonly [number, number, number],
+    pivotDepth: number,
+    enable: boolean,
+  ): void {
+    this.#curInvVP.set(invViewProj);
+    this.#curVP.set(viewProj);
+    this.#eye = [eye[0], eye[1], eye[2]];
+    this.#pivot = pivotDepth;
+    this.#reproject = enable;
   }
 
   public get enabled(): boolean {
@@ -121,8 +197,26 @@ export class TemporalAccumulator {
     this.#ensurePipeline();
     const prev = this.#readA ? this.#historyA! : this.#historyB!;
     const next = this.#readA ? this.#historyB! : this.#historyA!;
-    const weight = 1 / (this.#n + 1);
-    this.#params.write(new Float32Array([weight, 0, 0, 0]));
+    const base = 1 / (this.#n + 1);
+    const reproject = this.#reproject && this.#hasPrev;
+    const weight = reproject ? Math.max(base, this.motionWeightFloor) : base;
+
+    // Uniform: invViewProj(16) | prevViewProj(16) | eyePivot(4) | misc(4). Use current viewProj as the
+    // "prev" on the first frame (identity reprojection) so nothing garbage is sampled.
+    const u = new Float32Array(40);
+    u.set(this.#curInvVP, 0);
+    u.set(reproject ? this.#prevVP : this.#curVP, 16);
+    u[32] = this.#eye[0];
+    u[33] = this.#eye[1];
+    u[34] = this.#eye[2];
+    u[35] = this.#pivot;
+    u[36] = weight;
+    u[37] = reproject ? 1 : 0;
+    u[38] = 1 / Math.max(1, w);
+    u[39] = 1 / Math.max(1, h);
+    this.#params.write(u);
+    this.#prevVP.set(this.#curVP);
+    this.#hasPrev = true;
 
     const curH = current;
     const prevH = graph.importTexture(prev, "taau-hist-prev", HDR_FORMAT);
