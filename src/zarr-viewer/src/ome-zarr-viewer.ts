@@ -39,6 +39,10 @@ import {
   type OpacityPoint,
   type VolumeBlendMode,
   type VolumeViewMode,
+  type ShaderConfigName,
+  rankVisibilityBins,
+  visBinUvwBox,
+  stampCanvasPng,
 } from "@zarr-viewer/render";
 import { Scene, Node } from "@zarr-viewer/scene";
 import { OrbitControls } from "@zarr-viewer/controls";
@@ -53,6 +57,7 @@ import {
 import { ensureHudStyles } from "./hud-theme.js";
 import { ViewportOverlay } from "./render/overlay/viewport-overlay.js";
 import { FxPipeline } from "./render/post/fx-pipeline.js";
+import { TemporalAccumulator } from "./render/accel/taau.js";
 import {
   getLastRendering,
   setLastRendering,
@@ -148,6 +153,8 @@ export interface WebGpuRenderingState {
   stageConeDeg: number;
   stageRange: number;
   halfRes: boolean;
+  temporalAA: boolean;
+  shaderConfig: ShaderConfigName;
   measurePlaneOn: boolean;
   measureDepth: number;
   measurePlaneGray: number;
@@ -293,6 +300,9 @@ export async function run(
   let aoIntensity = 0.7;
   let aoSamples = 6;
   let halfRes = false;
+  let temporalAA = false; // Milestone 5: accumulate a clean supersampled image while the camera is still
+  /** Named shader specialization; occupancy/tiles compile in fast/quality. Default baseline. */
+  let shaderConfig: ShaderConfigName = "baseline";
   // Spot cone (outer half-angle, degrees) + range (× volume extent) for the flashlight / stage lights.
   // The inner cone is derived at 0.7× the outer for a soft edge.
   let flashConeDeg = 79;
@@ -338,6 +348,10 @@ export async function run(
   let pickStatus = "";
   const invViewProj = new Mat4();
   const lastViewProj = new Mat4();
+  // Scratch for the TAAU sub-pixel-jittered projection used only for the volume render (the un-jittered
+  // viewProj still drives ROI/overlay). Reused each frame to avoid per-frame allocation.
+  const jitterProj = new Mat4();
+  const jitterViewProj = new Mat4();
 
   // Snapshot the rendering / cropping groups from the live closure state. Defined up here so the
   // early error-path instances (below) can expose them too.
@@ -397,6 +411,8 @@ export async function run(
     stageConeDeg,
     stageRange,
     halfRes,
+    temporalAA,
+    shaderConfig,
     measurePlaneOn,
     measureDepth,
     measurePlaneGray,
@@ -488,6 +504,9 @@ export async function run(
 
   // Post-processing driver: volume → linear HDR → bloom/tonemap/fxaa/sharpen/vignette → swapchain.
   const fxPipeline = new FxPipeline(ctx);
+  // Milestone 5: progressive temporal accumulation (still-camera supersampling/denoise). Default off.
+  const taau = new TemporalAccumulator(ctx.device);
+  session.onDispose(() => taau.dispose());
   const rebuildFxStack = (): void => {
     const effects: Effect[] = [];
     // HDR-space effects first (bloom operates on linear HDR), then the mandatory tonemap maps
@@ -518,6 +537,7 @@ export async function run(
   // Push the (non-per-frame) lighting params to the renderer + set the half-res lever. Called on any
   // Lighting-panel change; the light *positions* themselves are rebuilt per frame (below).
   const applyLighting = (): void => {
+    taau.reset(); // lighting changed → restart temporal accumulation
     volumeRenderer.setLightingParams({
       masterAmbient: lightAmbient,
       specStrength: lightSpecular,
@@ -678,6 +698,12 @@ export async function run(
     | { level: number; voxelMin: [number, number, number]; voxelMax: [number, number, number] }
     | null = null;
   let roiIdle = 0;
+  // Adaptive sampling: while the camera moves, coarsen the ray step (≥ NAV_SAMPLE_DIST) for a smooth
+  // framerate, then ease back to the configured `sampleDist` once settled. `navSampleDist` is the
+  // eased, currently-applied multiplier.
+  const NAV_SAMPLE_DIST = 1.5; // coarse step multiplier held during navigation
+  const NAV_SETTLE = 0.15; // seconds of camera stillness before refining back to the configured value
+  let navSampleDist = 1;
   let roiRequestInFlight = false; // a brick request is streaming (drives the reset guard + progress bar)
   let roiReqSeq = 0; // monotonic id so a superseded request's finally() can't clobber a newer one
   let prevRoiCam = controls.getState();
@@ -862,18 +888,69 @@ export async function run(
         ? { min: [cropMin[0], cropMin[1], cropMin[2]], max: [cropMax[0], cropMax[1], cropMax[2]] }
         : focalRoiUvw();
       if (roi) {
+        const vis = volumeRenderer.visibility;
+        let visHint: { min: [number, number, number]; max: [number, number, number] } | undefined;
+        if (roiEnabled && vis.enabled) {
+          const ranked = rankVisibilityBins(vis.lastQuantized, vis.grid, {
+            levelCount: source.levelCount,
+            boxExtent: Math.max(sizeSim.x, sizeSim.y, sizeSim.z),
+            eye: [camera.position.x, camera.position.y, camera.position.z],
+            boxHalf: [sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5],
+            residentLevelOf: (x, y, z) => {
+              const box = visBinUvwBox(x, y, z, vis.grid);
+              const cx = (box.min[0] + box.max[0]) * 0.5;
+              const cy = (box.min[1] + box.max[1]) * 0.5;
+              const cz = (box.min[2] + box.max[2]) * 0.5;
+              const brick = brickLoader.currentBrick;
+              if (brick) {
+                const wx = cx * sizeSim.x - sizeSim.x * 0.5;
+                const wy = cy * sizeSim.y - sizeSim.y * 0.5;
+                const wz = cz * sizeSim.z - sizeSim.z * 0.5;
+                if (
+                  wx >= brick.worldMin[0] && wx <= brick.worldMax[0] &&
+                  wy >= brick.worldMin[1] && wy <= brick.worldMax[1] &&
+                  wz >= brick.worldMin[2] && wz <= brick.worldMax[2]
+                ) {
+                  return brick.level;
+                }
+              }
+              return level;
+            },
+          });
+          const top = ranked[0];
+          if (top && top.priority > 0) {
+            const box = visBinUvwBox(top.x, top.y, top.z, vis.grid);
+            const pad = 0.05;
+            visHint = {
+              min: [
+                Math.max(0, box.min[0] - pad),
+                Math.max(0, box.min[1] - pad),
+                Math.max(0, box.min[2] - pad),
+              ],
+              max: [
+                Math.min(1, box.max[0] + pad),
+                Math.min(1, box.max[1] + pad),
+                Math.min(1, box.max[2] + pad),
+              ],
+            };
+          }
+        }
+        // Region to stream. `visHint` (Milestone 1 ray-guided streaming) would fetch the highest-priority
+        // visible-but-under-resolved bin, but the vis feedback is currently disabled (its hint thrashed the
+        // target — see setVisibilityFeedback note), so this falls back to the stable frustum/crop box.
+        const regionBox = visHint ?? roi;
         const regionOpts = { maxTextureDimension: maxTex };
-        let region = chooseBrickRegion(source, roi.min, roi.max, regionOpts);
+        let region = chooseBrickRegion(source, regionBox.min, regionBox.max, regionOpts);
         // If the generous box is too big for a finer-than-displayed level (typical when the far
         // frustum inflates from one viewing side), shrink toward the box center until one fits.
         if (!(region && region.level < level)) {
           const cu: [number, number, number] = [
-            (roi.min[0] + roi.max[0]) * 0.5,
-            (roi.min[1] + roi.max[1]) * 0.5,
-            (roi.min[2] + roi.max[2]) * 0.5,
+            (regionBox.min[0] + regionBox.max[0]) * 0.5,
+            (regionBox.min[1] + regionBox.max[1]) * 0.5,
+            (regionBox.min[2] + regionBox.max[2]) * 0.5,
           ];
-          let mn: [number, number, number] = [roi.min[0], roi.min[1], roi.min[2]];
-          let mx: [number, number, number] = [roi.max[0], roi.max[1], roi.max[2]];
+          let mn: [number, number, number] = [regionBox.min[0], regionBox.min[1], regionBox.min[2]];
+          let mx: [number, number, number] = [regionBox.max[0], regionBox.max[1], regionBox.max[2]];
           for (let k = 0; k < 8 && !(region && region.level < level); k++) {
             for (let a = 0; a < 3; a++) {
               mn[a] = cu[a]! + (mn[a]! - cu[a]!) * 0.7;
@@ -1034,6 +1111,7 @@ export async function run(
       intensityRemap: equalizeOn ? equalizeRemap : undefined,
     });
     volumeRenderer.setTransferFunction(tf, 512);
+    taau.reset(); // transfer function / colormap changed → restart temporal accumulation
     curveEditor?.setColorMap(colorMap);
     curveEditor?.setPoints(opacityPoints);
     curveEditor?.setColorRange([colorLo, colorHi]);
@@ -1118,6 +1196,7 @@ export async function run(
   };
 
   const applyRender = (): void => {
+    taau.reset(); // any render-setting change → restart temporal accumulation
     volumeRenderer.setParams({
       densityScale,
       exposure,
@@ -1134,6 +1213,11 @@ export async function run(
     volumeRenderer.setSliceEnabled("z", enZ);
     volumeRenderer.setSlicePlanesVisible(showPlanes);
     volumeRenderer.setCrop(cropMin, cropMax);
+    volumeRenderer.setShaderConfig(shaderConfig);
+    // Visibility-feedback (Milestone 1 ray-guided streaming) is disabled: its readback-derived hint
+    // shifts every readback cycle, so using it as the brick region made the ROI target thrash and never
+    // settle. Re-enable only with a debounced/stable hint. ROI uses the stable frustum/crop box below.
+    volumeRenderer.setVisibilityFeedback(false);
   };
 
   /** Frame camera looking along the active slice normal (itk-vtk style). */
@@ -1262,6 +1346,11 @@ export async function run(
     stageConeDeg = state.stageConeDeg ?? stageConeDeg;
     stageRange = state.stageRange ?? stageRange;
     halfRes = state.halfRes ?? halfRes;
+    temporalAA = state.temporalAA ?? temporalAA;
+    taau.setEnabled(temporalAA);
+    if (state.shaderConfig === "baseline" || state.shaderConfig === "fast" || state.shaderConfig === "quality") {
+      shaderConfig = state.shaderConfig;
+    }
     // Measure plane
     measurePlaneOn = state.measurePlaneOn ?? measurePlaneOn;
     measureDepth = state.measureDepth ?? measureDepth;
@@ -1535,6 +1624,12 @@ export async function run(
       .join("");
     const renderBody = [
       `<div class="whud__seg">${blendBtns}</div>`,
+      `<div class="whud__hint" style="margin-top:6px">Shader config</div>`,
+      `<div class="whud__seg">${(["baseline", "fast", "quality"] as const)
+        .map((c) => segBtn("data-shader", c, c, shaderConfig === c))
+        .join("")}</div>`,
+      `<div class="whud__hint">baseline = plain march. fast/quality = empty-space leap + tiled draw (faster on data with air margins). quality adds cinematic shading (multi-scatter / ambient) — arriving with M7; identical to fast until then.</div>`,
+      `<button type="button" data-act="exportPng" class="whud__seg-btn" style="margin-top:6px">Export PNG (stamped)</button>`,
       slider("sampleDist", "Sample dist", sampleDist, 0.35, 3, 0.05),
       slider("density", "Density", densityScale, 0.2, 4, 0.05),
       slider("exposure", "Exposure", exposure, 0.2, 4, 0.05),
@@ -1673,6 +1768,7 @@ export async function run(
       slider("aoIntensity", "AO intensity", aoIntensity, 0, 1, 0.02),
       slider("aoSamples", "AO samples", aoSamples, 1, 16, 1),
       `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${halfRes ? "checked" : ""}/> Half resolution</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="temporalAA" ${temporalAA ? "checked" : ""}/> Temporal AA (accumulate when still)</label>`,
       `<label class="whud__check"><input type="checkbox" data-chk="roiEnabled" ${roiEnabled ? "checked" : ""}/> High-res ROI (stream visible detail)</label>`,
       `<div id="roiProgressWrap" style="margin-top:6px;${roiProgress ? "" : "display:none"}">` +
         `<div style="display:flex;justify-content:space-between;font-size:10px;opacity:0.85">` +
@@ -1776,6 +1872,28 @@ export async function run(
       applyRender();
       renderUi();
       emitRendering();
+      return;
+    }
+    if (btn.dataset.shader) {
+      shaderConfig = btn.dataset.shader as ShaderConfigName;
+      applyRender();
+      renderUi();
+      emitRendering();
+      return;
+    }
+    if (btn.dataset.act === "exportPng") {
+      void (async () => {
+        const blob = await stampCanvasPng(
+          canvas,
+          volumeRenderer.provenance(fxPipeline.renderScale),
+        );
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `tomo-${shaderConfig}.png`;
+        a.click();
+        URL.revokeObjectURL(url);
+      })();
       return;
     }
     if (btn.dataset.view) {
@@ -1958,6 +2076,7 @@ export async function run(
       }
       if (t.dataset.chk === "roiEnabled") {
         roiEnabled = on; // the render loop reads this live (updateRoi); toggling off fades + discards
+        volumeRenderer.setVisibilityFeedback(false); // see applyRender note: hint thrash disabled for now
         return;
       }
       if (
@@ -1967,6 +2086,7 @@ export async function run(
         t.dataset.chk === "shadowOn" ||
         t.dataset.chk === "aoOn" ||
         t.dataset.chk === "halfRes" ||
+        t.dataset.chk === "temporalAA" ||
         t.dataset.chk === "shadowCastGlobal" ||
         t.dataset.chk === "shadowCastFlash" ||
         t.dataset.chk === "shadowCastStage"
@@ -1977,6 +2097,7 @@ export async function run(
         else if (t.dataset.chk === "shadowOn") shadowOn = on;
         else if (t.dataset.chk === "aoOn") aoOn = on;
         else if (t.dataset.chk === "halfRes") halfRes = on;
+        else if (t.dataset.chk === "temporalAA") { temporalAA = on; taau.setEnabled(on); }
         else if (t.dataset.chk === "shadowCastGlobal") shadowCastGlobal = on;
         else if (t.dataset.chk === "shadowCastFlash") shadowCastFlash = on;
         else if (t.dataset.chk === "shadowCastStage") shadowCastStage = on;
@@ -2427,6 +2548,14 @@ export async function run(
     const planeT = Math.min(1, Math.max(0, measureDepth));
     const planeDepth = frontDepth + planeT * (backDepth - frontDepth);
     updateRoi(dt);
+    // Adaptive sampling: coarsen the ray step while navigating (camera moving) for a smooth framerate,
+    // then refine once settled. `roiIdle` is seconds since the camera last moved (updated in updateRoi).
+    // Coarsen instantly for responsiveness; ease back to the configured `sampleDist` over ~0.4 s so the
+    // sharpening isn't a visible pop. max(NAV_SAMPLE_DIST, sampleDist) keeps a coarse slider still coarse.
+    const navTarget = roiIdle < NAV_SETTLE ? Math.max(NAV_SAMPLE_DIST, sampleDist) : sampleDist;
+    if (navTarget > navSampleDist) navSampleDist = navTarget;
+    else navSampleDist += (navTarget - navSampleDist) * Math.min(1, dt * 8);
+    volumeRenderer.setParams({ stepSize: Math.min(brickStep ?? baseStep, baseStep) * navSampleDist });
     // Measure plane: depth-composited grey sheet at `planeDepth` along the view axis. Must run before
     // recordInto (writes the frame uniform).
     volumeRenderer.setMeasurePlane({
@@ -2438,9 +2567,38 @@ export async function run(
     });
     // Volume → linear HDR, then the post stack to the swapchain (one encoder / one submit). The DOM
     // overlay (gizmo + scale bar) draws to a separate canvas and is unaffected.
-    fxPipeline.render({ r: 0.015, g: 0.02, b: 0.035, a: 1 }, (pass) => {
-      volumeRenderer.recordInto(pass, viewProj, camera.position);
-    });
+    const rw = Math.max(1, Math.round(canvas.width * fxPipeline.renderScale));
+    const rh = Math.max(1, Math.round(canvas.height * fxPipeline.renderScale));
+    volumeRenderer.setInternalSize(rw, rh);
+    // Milestone 5: accumulate only once fully settled — the camera stopped AND the adaptive step has
+    // finished refining (else we'd blend coarse-in-motion frames with the sharp ones). Anything else
+    // resets the history so a moving view shows the live frame with no ghosting. When accumulating, jitter
+    // the projection sub-pixel so successive converged frames supersample; the un-jittered viewProj still
+    // drives ROI/overlay.
+    const taauSettled =
+      temporalAA && roiIdle >= NAV_SETTLE && Math.abs(navSampleDist - sampleDist) < 0.02;
+    let renderViewProj = viewProj;
+    if (taauSettled) {
+      const [jx, jy] = taau.jitterPixels();
+      jitterProj.copy(proj);
+      jitterProj.elements[8]! += (2 * jx) / rw;
+      jitterProj.elements[9]! += (2 * jy) / rh;
+      jitterViewProj.multiplyMatrices(jitterProj, view);
+      renderViewProj = jitterViewProj;
+    } else {
+      taau.reset();
+    }
+    fxPipeline.render(
+      { r: 0.015, g: 0.02, b: 0.035, a: 1 },
+      (pass) => {
+        volumeRenderer.recordInto(pass, renderViewProj, camera.position);
+      },
+      (encoder) => {
+        volumeRenderer.recordPrePasses(encoder, renderViewProj, camera.position);
+      },
+      taau,
+    );
+    volumeRenderer.afterSubmit();
 
     // Bottom-left overlay: axis gizmo (camera world basis) + physical scale bar. The gizmo uses the
     // world right/up/forward columns of the camera; forward (fx,fy,fz) is already unit-normalized above.
@@ -2478,6 +2636,7 @@ export async function run(
       up: [wm[4]! / ulen, wm[5]! / ulen, wm[6]! / ulen],
       forward: [fx, fy, fz],
       ruler,
+      banner: volumeRenderer.approximateShadingBanner(),
     });
   });
 

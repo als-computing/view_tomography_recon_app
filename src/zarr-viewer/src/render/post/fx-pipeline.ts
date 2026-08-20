@@ -14,6 +14,8 @@
 import type { GpuContext } from "../device/context.js";
 import { RenderGraph } from "../graph/render-graph.js";
 import { PostStack, type Effect } from "@prism/fx";
+import { GpuTimer } from "../accel/gpu-timer.js";
+import type { TemporalAccumulator } from "../accel/taau.js";
 
 /** RENDER_ATTACHMENT | TEXTURE_BINDING — the HDR target must be both drawn to and sampled. */
 const HDR_USAGE = 0x10 | 0x04;
@@ -30,11 +32,25 @@ export class FxPipeline {
    * upscales the result to the full-res swapchain.
    */
   #renderScale = 1;
+  readonly #timer: GpuTimer;
+
+  /**
+   * Fraction of the swapchain resolution the volume + post chain runs at (1 = full).
+   */
+  public get renderScale(): number {
+    return this.#renderScale;
+  }
+
+  /** Last resolved GPU time for the volume pass, if timestamp-query is available. */
+  public get lastGpuMs(): number | undefined {
+    return this.#timer.lastSample?.ms;
+  }
 
   public constructor(ctx: GpuContext) {
     this.#ctx = ctx;
     this.#graph = new RenderGraph(ctx.device);
     this.#stack = new PostStack([]);
+    this.#timer = new GpuTimer(ctx.device);
   }
 
   /** Set the internal render resolution as a fraction (0, 1] of the swapchain size. */
@@ -53,27 +69,29 @@ export class FxPipeline {
   }
 
   /**
-   * Render one frame: draw the volume into a linear-HDR transient (via `recordVolume`, which should
-   * call `VolumeRenderer.recordInto` on the passed render pass), then run the post stack to the
-   * swapchain.
+   * Render one frame: optional compute prepare (occupancy / tiles / vis copy), draw the volume into
+   * a linear-HDR transient, then run the post stack to the swapchain.
    */
   public render(
     clearValue: GPUColor,
     recordVolume: (pass: GPURenderPassEncoder) => void,
+    prepare?: (encoder: GPUCommandEncoder) => void,
+    taau?: TemporalAccumulator,
   ): void {
     const { canvasContext, canvas, format } = this.#ctx;
     const w = Math.max(1, canvas.width);
     const h = Math.max(1, canvas.height);
-    // Internal render size (volume + post chain). The final post pass upscales to the full swapchain.
     const rw = Math.max(1, Math.round(w * this.#renderScale));
     const rh = Math.max(1, Math.round(h * this.#renderScale));
     const graph = this.#graph.reset();
+    const timer = this.#timer;
 
     const hdr = graph.createTexture({ size: [rw, rh, 1], format: HDR_FORMAT, usage: HDR_USAGE });
     graph.addPass({
       name: "volume",
       writes: [hdr],
       execute(ctx): void {
+        prepare?.(ctx.encoder);
         const pass = ctx.encoder.beginRenderPass({
           label: "volume-raymarch",
           colorAttachments: [
@@ -84,20 +102,28 @@ export class FxPipeline {
               storeOp: "store",
             },
           ],
+          timestampWrites: timer.timestampWrites("volume"),
         });
         recordVolume(pass);
         pass.end();
+        timer.resolve(ctx.encoder);
       },
     });
 
+    // Milestone 5: temporally accumulate the jittered volume frame into persistent history (still camera
+    // only) before the post stack. When disabled this is a no-op and the raw frame feeds post directly.
+    const sceneColor = taau && taau.enabled ? taau.resolve(graph, hdr, rw, rh) : hdr;
+
     const out = graph.importTexture(canvasContext.getCurrentTexture(), "swap", format);
-    this.#stack.build(graph, hdr, { size: [rw, rh, 1], format: HDR_FORMAT, output: out });
+    this.#stack.build(graph, sceneColor, { size: [rw, rh, 1], format: HDR_FORMAT, output: out });
     graph.execute();
+    timer.afterSubmit();
   }
 
   /** Release the post stack's cached passes and the graph's pooled textures. */
   public dispose(): void {
     this.#stack.dispose();
     this.#graph.dispose();
+    this.#timer.dispose();
   }
 }

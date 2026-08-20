@@ -16,9 +16,19 @@ import { toGpuColor } from "../color.js";
 import { TransferFunction } from "./transfer-function.js";
 import {
   VOLUME_FRAME_UNIFORM_SIZE,
-  VOLUME_RAYMARCH_WGSL,
+  VOLUME_BACKGROUND_WGSL,
+  volumeRaymarchWgsl,
 } from "../shaders/volume-raymarch.js";
 import { LightingEnvironment, type GpuLight } from "../lighting/index.js";
+import {
+  type ShaderConfigName,
+  specializationFor,
+  approximateShadingLabel,
+} from "../accel/shader-config.js";
+import { hashTransferFunction, type RenderProvenance } from "../accel/provenance.js";
+import { VisibilityFeedback, VIS_GRID_DEFAULT } from "../accel/visibility.js";
+import { OccupancyGrid } from "../accel/occupancy.js";
+import { TileCompactor, TILE_SIZE } from "../accel/tiles.js";
 
 /** Volume blend / compositing mode (itk-vtk `setImageBlendMode`). */
 export type VolumeBlendMode = "composite" | "mip" | "minip" | "average";
@@ -85,6 +95,10 @@ export interface VolumeRendererOptions {
    * once. Default `false`. Set `true` alongside an HDR `colorFormat` for the render-graph path.
    */
   linearOutput?: boolean;
+  /** Named shader config (default `"baseline"`). Occupancy/tiles compile in `"fast"` / `"quality"`. */
+  shaderConfig?: ShaderConfigName;
+  /** Early-ray-termination alpha threshold (default `0.995`). */
+  earlyRayTermination?: number;
 }
 
 /**
@@ -126,6 +140,29 @@ export class VolumeRenderer implements Disposable {
   private showSlicePlanes = false;
   private viewMode: VolumeViewMode = "volume";
   private frameIndex = 0;
+  private shaderConfig: ShaderConfigName = "baseline";
+  private earlyRayTermination = 0.995;
+  private visEnabled = false;
+  private internalWidth = 1;
+  private internalHeight = 1;
+  private lastLut: Uint8Array | undefined;
+  private lastLutSize = 512;
+  private tfHash = "lut:00000000";
+  private dirtyOccMinMax = true;
+  private dirtyOccTf = true;
+  private bindGroupLayout: GPUBindGroupLayout | undefined;
+  private pipelineLayout: GPUPipelineLayout | undefined;
+  private bgPipeline: GPURenderPipeline | undefined;
+  private bgBindGroup: GPUBindGroup | undefined;
+  private occupancy: OccupancyGrid | undefined;
+  private readonly vis: VisibilityFeedback;
+  private readonly tiles: TileCompactor;
+  private dummyOcc: ManagedBuffer;
+  private dummyPrefix: ManagedBuffer;
+  private dummyTiles: ManagedBuffer;
+  // Milestone 3.1 pre-integration: cumulative-extinction LUT (rebuilt with the TF); dummy when unused.
+  private tPreintBuffer: ManagedBuffer | undefined;
+  private dummyPreint: ManagedBuffer;
 
   // Multi-light shading (prism lighting library). The light list is rebuilt per frame by the viewer
   // (global / camera flashlight / stage) and uploaded to this storage buffer; the control params
@@ -175,6 +212,8 @@ export class VolumeRenderer implements Disposable {
     this.clearColor = toGpuColor(options.clearColor ?? [0.02, 0.03, 0.05, 1]);
     this.colorFormat = options.colorFormat ?? ctx.format;
     this.linearOutput = options.linearOutput ?? false;
+    this.shaderConfig = options.shaderConfig ?? "baseline";
+    this.earlyRayTermination = options.earlyRayTermination ?? 0.995;
     this.stepSize = options.stepSize ?? 1 / 260;
     this.densityScale = options.densityScale ?? 1.35;
     // Hard safety cap on ray-march iterations. The per-frame step count is derived from the box
@@ -199,11 +238,37 @@ export class VolumeRenderer implements Disposable {
     // ~6 procedural lights (1 global + 1 flashlight + 4 stage).
     this.lightEnv = new LightingEnvironment(ctx.device, 16);
     if (options.liquidShading) this.setLiquidShading(options.liquidShading);
+    this.vis = new VisibilityFeedback(ctx.device, [
+      VIS_GRID_DEFAULT,
+      VIS_GRID_DEFAULT,
+      VIS_GRID_DEFAULT,
+    ]);
+    this.tiles = new TileCompactor(ctx.device);
+    this.dummyOcc = OccupancyGrid.dummy(ctx.device);
+    this.dummyPrefix = OccupancyGrid.dummyPrefix(ctx.device);
+    this.dummyTiles = TileCompactor.dummyTiles(ctx.device);
+    this.dummyPreint = new ManagedBuffer(
+      ctx.device,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      8,
+    );
   }
 
   public setVolume(texture: ManagedTexture): void {
     this.volumeTex = texture;
     this.bindGroup = undefined;
+    const size = texture.desc.size;
+    const same =
+      this.occupancy &&
+      this.occupancy.grid[0] === Math.max(1, Math.ceil(size[0] / this.occupancy.cellSize)) &&
+      this.occupancy.grid[1] === Math.max(1, Math.ceil(size[1] / this.occupancy.cellSize)) &&
+      this.occupancy.grid[2] === Math.max(1, Math.ceil(size[2] / this.occupancy.cellSize));
+    if (!same) {
+      this.occupancy?.dispose();
+      this.occupancy = new OccupancyGrid(this.ctx.device, size);
+    }
+    this.dirtyOccMinMax = true;
+    this.dirtyOccTf = true;
   }
 
   /**
@@ -252,6 +317,24 @@ export class VolumeRenderer implements Disposable {
       { bytesPerRow, rowsPerImage: 1 },
       { width: lutSize, height: 1, depthOrArrayLayers: 1 },
     );
+    this.lastLut = lut;
+    this.lastLutSize = lutSize;
+    this.tfHash = hashTransferFunction(lut);
+    this.dirtyOccTf = true;
+    // Milestone 3.1: cumulative extinction LUT T(d) = ∫₀^d α(x) dx (trapezoidal), kept f32 for the
+    // cancellation-prone ratio form. Rebuilt with the TF; consumed by the quality shader's pre-integration.
+    const tCurve = new Float32Array(lutSize);
+    const dd = 1 / Math.max(1, lutSize - 1);
+    let acc = 0;
+    let prevA = (lut[3] ?? 0) / 255;
+    for (let i = 1; i < lutSize; i++) {
+      const a = (lut[i * 4 + 3] ?? 0) / 255;
+      acc += 0.5 * (prevA + a) * dd;
+      tCurve[i] = acc;
+      prevA = a;
+    }
+    this.tPreintBuffer?.dispose();
+    this.tPreintBuffer = ManagedBuffer.fromData(this.ctx.device, GPUBufferUsage.STORAGE, tCurve);
     this.bindGroup = undefined;
   }
 
@@ -331,6 +414,102 @@ export class VolumeRenderer implements Disposable {
 
   public setBlendMode(mode: VolumeBlendMode): void {
     this.blendMode = mode;
+  }
+
+  /** Named shader config. `"baseline"` (default) has occupancy/tiles compiled out. */
+  public setShaderConfig(name: ShaderConfigName): void {
+    if (this.shaderConfig === name) return;
+    this.shaderConfig = name;
+    this.pipeline = undefined;
+    this.bindGroup = undefined;
+  }
+
+  public getShaderConfig(): ShaderConfigName {
+    return this.shaderConfig;
+  }
+
+  /** Enable ray-guided vis-bin accumulation (default off). */
+  public setVisibilityFeedback(enabled: boolean): void {
+    this.visEnabled = enabled;
+    this.vis.enabled = enabled;
+  }
+
+  /** Latest decoded vis-bin weights, or `undefined` before the first readback. */
+  public get visibility(): VisibilityFeedback {
+    return this.vis;
+  }
+
+  /** Early-ray-termination alpha threshold in `(0, 1]` (default `0.995`). */
+  public setEarlyRayTermination(threshold: number): void {
+    this.earlyRayTermination = Math.min(1, Math.max(0.5, threshold));
+  }
+
+  /** Internal HDR size the volume pass renders into (for tile compaction). */
+  public setInternalSize(width: number, height: number): void {
+    this.internalWidth = Math.max(1, width);
+    this.internalHeight = Math.max(1, height);
+  }
+
+  /**
+   * Occupancy rebuild + tile classify + vis-bin copy. Call on the same encoder, before the volume
+   * render pass, when the current shader config uses those structures.
+   */
+  public recordPrePasses(
+    encoder: GPUCommandEncoder,
+    viewProj: Mat4,
+    eye: { x: number; y: number; z: number },
+  ): void {
+    const spec = specializationFor(this.shaderConfig);
+    this.ensurePipeline();
+    this.writeUniforms(viewProj, eye, { clear: true });
+    if (spec.occupancy && this.occupancy && this.volumeTex) {
+      if (this.dirtyOccMinMax) {
+        this.occupancy.rebuildMinMax(encoder, this.volumeTex);
+        this.dirtyOccMinMax = false;
+        this.dirtyOccTf = true;
+      }
+      if (this.dirtyOccTf && this.lastLut) {
+        this.occupancy.rebuildForTransferFunction(encoder, this.lastLut, this.lastLutSize);
+        this.dirtyOccTf = false;
+        this.bindGroup = undefined;
+      }
+    }
+    if (spec.tiles && this.frameUniform) {
+      const rebuilt = this.tiles.record(
+        encoder,
+        this.frameUniform.gpu,
+        spec.occupancy ? this.occupancy : undefined,
+        this.dummyOcc.gpu,
+        this.internalWidth,
+        this.internalHeight,
+      );
+      if (rebuilt) this.bindGroup = undefined;
+    }
+    this.vis.recordCopy(encoder);
+  }
+
+  /** Map pending vis-bin readback. Must run after the encoder that copied it has been submitted. */
+  public afterSubmit(): void {
+    this.vis.afterSubmit();
+  }
+
+  /** Provenance block for PNG export / screenshot stamping. */
+  public provenance(renderScale: number, extras?: Partial<RenderProvenance>): RenderProvenance {
+    const spec = specializationFor(this.shaderConfig);
+    return {
+      shaderConfig: this.shaderConfig,
+      multiScatterOctaves: spec.multiScatterOctaves,
+      taauFrames: 0,
+      shadowMode: this.shadowEnable ? "macrocell-sweep" : "none",
+      transferFunction: this.tfHash,
+      renderScale,
+      ...extras,
+    };
+  }
+
+  /** Visible approximate-shading banner, or `null` when none is active. */
+  public approximateShadingBanner(): string | null {
+    return approximateShadingLabel(specializationFor(this.shaderConfig));
   }
 
   public setViewMode(mode: VolumeViewMode): void {
@@ -455,8 +634,30 @@ export class VolumeRenderer implements Disposable {
       return;
     }
     this.ensurePipeline();
+    this.frameIndex++;
+    this.writeUniforms(viewProj, eye, options);
     this.ensureBindGroup();
 
+    const spec = specializationFor(this.shaderConfig);
+    if (spec.tiles && this.bgPipeline && this.bgBindGroup) {
+      pass.setPipeline(this.bgPipeline);
+      pass.setBindGroup(0, this.bgBindGroup);
+      pass.draw(3);
+    }
+    pass.setPipeline(this.pipeline!);
+    pass.setBindGroup(0, this.bindGroup!);
+    if (spec.tiles) {
+      pass.drawIndirect(this.tiles.drawIndirectBuffer, 0);
+    } else {
+      pass.draw(3);
+    }
+  }
+
+  private writeUniforms(
+    viewProj: Mat4,
+    eye: { x: number; y: number; z: number },
+    options: { clear?: boolean } = {},
+  ): void {
     this.invViewProj.copy(viewProj);
     if (!this.invViewProj.invert()) return;
 
@@ -481,7 +682,7 @@ export class VolumeRenderer implements Disposable {
     d[16] = eye.x;
     d[17] = eye.y;
     d[18] = eye.z;
-    d[19] = this.frameIndex++;
+    d[19] = this.frameIndex;
     // Never let the step be so fine that the hard iteration cap can't cross the volume — otherwise the
     // far side is left unsampled and the volume appears to vanish. Floor the step at the budget-limited
     // minimum (diagonal / usable steps) so the ray always reaches the far face; a requested step finer
@@ -530,7 +731,7 @@ export class VolumeRenderer implements Disposable {
     d[55] = this.liquidAbsorptionScale;
     d[56] = alphaComposite;
     d[57] = this.linearOutput ? 1 : 0; // Frame.composite.y → linear-HDR output flag
-    d[58] = 0;
+    d[58] = this.earlyRayTermination;
     d[59] = 0;
     // lightCtl0: numLights, masterAmbient, specStrength, roughness
     d[60] = this.numLights;
@@ -567,80 +768,177 @@ export class VolumeRenderer implements Disposable {
     d[85] = this.brickMax[1];
     d[86] = this.brickMax[2];
     d[87] = this.brickBlend;
+    const occ = this.occupancy?.grid ?? [1, 1, 1];
+    d[88] = occ[0]!;
+    d[89] = occ[1]!;
+    d[90] = occ[2]!;
+    d[91] = 0;
+    d[92] = this.vis.grid[0];
+    d[93] = this.vis.grid[1];
+    d[94] = this.vis.grid[2];
+    d[95] = this.visEnabled ? 1 : 0;
+    d[96] = this.internalWidth;
+    d[97] = this.internalHeight;
+    d[98] = TILE_SIZE;
+    d[99] = 0;
     this.frameUniform!.write(d);
-
-    pass.setPipeline(this.pipeline!);
-    pass.setBindGroup(0, this.bindGroup!);
-    pass.draw(3);
   }
 
   public dispose(): void {
     this.frameUniform?.dispose();
     this.tfTex?.dispose();
     this.lightEnv?.dispose();
+    this.occupancy?.dispose();
+    this.vis.dispose();
+    this.tiles.dispose();
+    this.dummyOcc.dispose();
+    this.dummyPrefix.dispose();
+    this.dummyTiles.dispose();
+    this.tPreintBuffer?.dispose();
+    this.dummyPreint.dispose();
     this.frameUniform = undefined;
     this.tfTex = undefined;
     this.lightEnv = undefined;
     this.volumeTex = undefined;
     this.pipeline = undefined;
     this.bindGroup = undefined;
+    this.occupancy = undefined;
   }
 
   private ensurePipeline(): void {
+    if (!this.bindGroupLayout) {
+      const visFrag = GPUShaderStage.FRAGMENT;
+      const visVert = GPUShaderStage.VERTEX;
+      this.bindGroupLayout = this.ctx.device.createBindGroupLayout({
+        label: "volume-raymarch",
+        entries: [
+          { binding: 0, visibility: visVert | visFrag, buffer: { type: "uniform" } },
+          { binding: 1, visibility: visFrag, texture: { sampleType: "float", viewDimension: "3d" } },
+          { binding: 2, visibility: visFrag, sampler: { type: "filtering" } },
+          { binding: 3, visibility: visFrag, texture: { sampleType: "float", viewDimension: "2d" } },
+          { binding: 4, visibility: visFrag, sampler: { type: "filtering" } },
+          { binding: 5, visibility: visFrag, buffer: { type: "read-only-storage" } },
+          { binding: 6, visibility: visFrag, texture: { sampleType: "float", viewDimension: "3d" } },
+          { binding: 7, visibility: visFrag, buffer: { type: "storage" } },
+          { binding: 8, visibility: visVert | visFrag, buffer: { type: "read-only-storage" } },
+          { binding: 9, visibility: visFrag, buffer: { type: "read-only-storage" } },
+          { binding: 10, visibility: visVert | visFrag, buffer: { type: "read-only-storage" } },
+          { binding: 11, visibility: visFrag, buffer: { type: "read-only-storage" } },
+        ],
+      });
+      this.pipelineLayout = this.ctx.device.createPipelineLayout({
+        bindGroupLayouts: [this.bindGroupLayout],
+      });
+    }
+    if (!this.frameUniform) {
+      this.frameUniform = new ManagedBuffer(
+        this.ctx.device,
+        GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        VOLUME_FRAME_UNIFORM_SIZE,
+      );
+    }
+    if (!this.volumeSampler) {
+      this.volumeSampler = this.ctx.device.createSampler({
+        magFilter: "linear",
+        minFilter: "linear",
+        addressModeU: "clamp-to-edge",
+        addressModeV: "clamp-to-edge",
+        addressModeW: "clamp-to-edge",
+      });
+    }
+    if (!this.tfSampler) {
+      this.tfSampler = this.ctx.device.createSampler({
+        magFilter: "linear",
+        minFilter: "linear",
+        addressModeU: "clamp-to-edge",
+        addressModeV: "clamp-to-edge",
+      });
+    }
+    if (!this.bgPipeline) {
+      const bgLayout = this.ctx.device.createBindGroupLayout({
+        label: "volume-bg",
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        ],
+      });
+      const bgMod = this.cache.getModule("volume-background", VOLUME_BACKGROUND_WGSL);
+      this.bgPipeline = this.cache.getRenderPipeline({
+        label: "volume-background",
+        layout: this.ctx.device.createPipelineLayout({ bindGroupLayouts: [bgLayout] }),
+        vertex: { module: bgMod, entryPoint: "vs_main" },
+        fragment: {
+          module: bgMod,
+          entryPoint: "fs_main",
+          targets: [{ format: this.colorFormat }],
+        },
+        primitive: { topology: "triangle-list" },
+      });
+      this.bgBindGroup = this.ctx.device.createBindGroup({
+        layout: bgLayout,
+        entries: [{ binding: 0, resource: { buffer: this.frameUniform.gpu } }],
+      });
+    }
     if (this.pipeline) return;
-    const module = this.cache.getModule("volume-raymarch-hq-v6", VOLUME_RAYMARCH_WGSL);
+    const spec = specializationFor(this.shaderConfig);
+    const key = `volume-raymarch-${this.shaderConfig}`;
+    const wgsl = volumeRaymarchWgsl(spec);
+    const module = this.cache.getModule(key, wgsl);
+    const blend = {
+      color: {
+        srcFactor: "src-alpha" as GPUBlendFactor,
+        dstFactor: "one-minus-src-alpha" as GPUBlendFactor,
+        operation: "add" as GPUBlendOperation,
+      },
+      alpha: {
+        srcFactor: "one" as GPUBlendFactor,
+        dstFactor: "one-minus-src-alpha" as GPUBlendFactor,
+        operation: "add" as GPUBlendOperation,
+      },
+    };
     this.pipeline = this.cache.getRenderPipeline({
-      label: "volume-raymarch-hq-v6",
-      layout: "auto",
+      label: key,
+      layout: this.pipelineLayout!,
       vertex: { module, entryPoint: "vs_main" },
       fragment: {
         module,
         entryPoint: "fs_main",
-        targets: [
-          {
-            format: this.colorFormat,
-            blend: {
-              color: {
-                srcFactor: "src-alpha",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-              alpha: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-            },
-          },
-        ],
+        targets: [{ format: this.colorFormat, blend }],
       },
       primitive: { topology: "triangle-list" },
     });
-    this.frameUniform = new ManagedBuffer(
-      this.ctx.device,
-      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      VOLUME_FRAME_UNIFORM_SIZE,
-    );
-    this.volumeSampler = this.ctx.device.createSampler({
-      magFilter: "linear",
-      minFilter: "linear",
-      addressModeU: "clamp-to-edge",
-      addressModeV: "clamp-to-edge",
-      addressModeW: "clamp-to-edge",
-    });
-    this.tfSampler = this.ctx.device.createSampler({
-      magFilter: "linear",
-      minFilter: "linear",
-      addressModeU: "clamp-to-edge",
-      addressModeV: "clamp-to-edge",
-    });
+    // Warm the other named configs asynchronously so a mid-session switch doesn't hitch.
+    for (const name of ["fast", "quality"] as const) {
+      if (name === this.shaderConfig) continue;
+      const nSpec = specializationFor(name);
+      const nKey = `volume-raymarch-${name}`;
+      const nWgsl = volumeRaymarchWgsl(nSpec);
+      const nMod = this.cache.getModule(nKey, nWgsl);
+      void this.ctx.device.createRenderPipelineAsync({
+        label: nKey,
+        layout: this.pipelineLayout!,
+        vertex: { module: nMod, entryPoint: "vs_main" },
+        fragment: {
+          module: nMod,
+          entryPoint: "fs_main",
+          targets: [{ format: this.colorFormat, blend }],
+        },
+        primitive: { topology: "triangle-list" },
+      }).catch(() => {
+        /* warm compile is best-effort */
+      });
+    }
   }
 
   private ensureBindGroup(): void {
     if (this.bindGroup) return;
+    const spec = specializationFor(this.shaderConfig);
+    const occBuf = spec.occupancy && this.occupancy ? this.occupancy.cellsGpu : this.dummyOcc.gpu;
+    const prefixBuf =
+      spec.occupancy && this.occupancy?.prefixGpu ? this.occupancy.prefixGpu : this.dummyPrefix.gpu;
+    const tileBuf = spec.tiles ? this.tiles.compactedBuffer : this.dummyTiles.gpu;
     this.bindGroup = this.ctx.device.createBindGroup({
       label: "volume",
-      layout: this.pipeline!.getBindGroupLayout(0),
+      layout: this.bindGroupLayout!,
       entries: [
         { binding: 0, resource: { buffer: this.frameUniform!.gpu } },
         { binding: 1, resource: this.volumeTex!.createView({ dimension: "3d" }) },
@@ -648,11 +946,15 @@ export class VolumeRenderer implements Disposable {
         { binding: 3, resource: this.tfTex!.createView({ dimension: "2d" }) },
         { binding: 4, resource: this.tfSampler! },
         { binding: 5, resource: { buffer: this.lightEnv!.gpu } },
-        // Brick texture (binding 6); when there's no brick, bind the coarse texture as a valid dummy.
         {
           binding: 6,
           resource: (this.brickTex ?? this.volumeTex!).createView({ dimension: "3d" }),
         },
+        { binding: 7, resource: { buffer: this.vis.writeBuffer } },
+        { binding: 8, resource: { buffer: occBuf } },
+        { binding: 9, resource: { buffer: prefixBuf } },
+        { binding: 10, resource: { buffer: tileBuf } },
+        { binding: 11, resource: { buffer: (this.tPreintBuffer ?? this.dummyPreint).gpu } },
       ],
     });
   }

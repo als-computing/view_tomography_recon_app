@@ -28,5 +28,5 @@
     "baseUrl": "."
   },
   "include": ["src/**/*.ts", "vite-zarr-static.ts", "vite.config.ts"],
-  "exclude": ["src/fx/test"]
+  "exclude": ["src/fx/test", "src/render/accel/test"]
 }

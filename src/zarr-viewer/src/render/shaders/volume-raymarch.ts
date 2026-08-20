@@ -9,11 +9,45 @@
 
 import { LIGHT_STRUCT_WGSL } from "./lights.js";
 
-/** Byte size of the volume frame uniform block (mat4 + 14 × vec4). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 352;
+/** Byte size of the volume frame uniform block (mat4 + 21 × vec4). */
+export const VOLUME_FRAME_UNIFORM_SIZE = 400;
 
-/** High-quality volume ray-march WGSL (vertex + fragment). */
-export const VOLUME_RAYMARCH_WGSL = /* wgsl */ `
+/** Compile-time specialization for {@link volumeRaymarchWgsl}. */
+export interface VolumeRaymarchSpec {
+  /** Occupancy-grid HDDA + Chebyshev skip + majorant step (Milestone 4). */
+  occupancy: boolean;
+  /** Instanced tile quads instead of a fullscreen triangle (Milestone 4.5). */
+  tiles: boolean;
+  /** Multi-scatter octaves (Milestone 7.3), quality-only (0 = off). */
+  multiScatterOctaves?: number;
+  /** Bent-normal directional ambient (Milestone 7.2), quality-only. */
+  bentNormalAmbient?: boolean;
+  /** Analytic pre-integration (Milestone 3.1), quality-only. */
+  preIntegrate?: boolean;
+}
+
+/**
+ * High-quality volume ray-march WGSL (vertex + fragment), specialized for a named shader config.
+ *
+ * Once occupancy makes the march-loop iteration count data-dependent, every texture sample inside
+ * the loop must be `textureSampleLevel` or `textureLoad` — never implicit-derivative `textureSample`.
+ */
+export function volumeRaymarchWgsl(spec: VolumeRaymarchSpec = { occupancy: false, tiles: false }): string {
+  const OCC = spec.occupancy ? 1 : 0;
+  const TILE = spec.tiles ? 1 : 0;
+  const MS_OCTAVES = Math.max(0, Math.floor(spec.multiScatterOctaves ?? 0));
+  const BENT = spec.bentNormalAmbient ? 1 : 0;
+  const PREINT = spec.preIntegrate ? 1 : 0;
+  return /* wgsl */ `
+const OCCUPANCY: u32 = ${OCC}u;
+const TILE_INSTANCED: u32 = ${TILE}u;
+const MS_OCTAVES: u32 = ${MS_OCTAVES}u;
+const BENT_NORMAL_AMBIENT: u32 = ${BENT}u;
+const PRE_INTEGRATE: u32 = ${PREINT}u;
+const VIS_SCALE: f32 = 128.0;
+const SHADE_ALPHA_EPS: f32 = 1e-4;
+const TARGET_SEGMENT_OPACITY: f32 = 0.25;
+
 struct Frame {
   invViewProj: mat4x4<f32>,
   eye: vec4<f32>,            // xyz = camera, w = frame index
@@ -26,7 +60,7 @@ struct Frame {
   cropMax: vec4<f32>,        // xyz = crop max in uvw [0,1]
   slices: vec4<f32>,         // xyz = slice positions in uvw [0,1], w = packed flags
   liquid: vec4<f32>,         // x = ior, y = roughness, z = envIntensity, w = absorptionScale
-  composite: vec4<f32>,      // x = alphaComposite (1 = transparent miss), y = linear-HDR out
+  composite: vec4<f32>,      // x = alphaComposite, y = linear-HDR, z = ERT threshold, w unused
   lightCtl0: vec4<f32>,      // x = numLights, y = masterAmbient, z = specStrength, w = roughness
   lightCtl1: vec4<f32>,      // x = shadowEnable, y = shadowSteps, z = shadowStrength, w = shadowSoftness
   lightCtl2: vec4<f32>,      // x = aoEnable, y = aoRadius (uvw frac), z = aoIntensity, w = aoSamples
@@ -34,7 +68,13 @@ struct Frame {
   measureFwd: vec4<f32>,     // xyz = camera forward (world, unit); marks the measure plane in depth
   brickMin: vec4<f32>,       // xyz = ROI brick world min, w = enable (1 = composite fine brick)
   brickMax: vec4<f32>,       // xyz = ROI brick world max, w = brickBlend fade weight [0,1]
+  accelOcc: vec4<f32>,       // xyz = occupancy macrocell grid, w unused
+  visGrid: vec4<f32>,        // xyz = vis-bin grid, w = visEnable (1 = accumulate)
+  screen: vec4<f32>,         // xy = internal pixels, z = tile size
 };
+
+struct OccCell { dmin: f32, dmax: f32, dist: f32, occupied: f32 }
+struct TileInst { packedXY: u32, tMin: f32, tMax: f32, pad: f32 }
 
 // slices.w bits: 1=xEn, 2=yEn, 4=zEn, 8=showPlanes, 16/32 = viewMode (0 vol, 1 x, 2 y, 3 z) in bits 4-5
 
@@ -47,6 +87,14 @@ ${LIGHT_STRUCT_WGSL}
 @group(0) @binding(4) var tfSampler: sampler;
 @group(0) @binding(5) var<storage, read> lights: array<Light>;
 @group(0) @binding(6) var brickTex: texture_3d<f32>;
+@group(0) @binding(7) var<storage, read_write> visBins: array<atomic<u32>>;
+@group(0) @binding(8) var<storage, read> occCells: array<OccCell>;
+@group(0) @binding(9) var<storage, read> tfPrefix: array<u32>;
+@group(0) @binding(10) var<storage, read> tileInsts: array<TileInst>;
+// Cumulative extinction LUT for pre-integration (Milestone 3.1): tPreint[i] = ∫₀^{d_i} α(x) dx over the
+// transfer function alpha (density units). Kept f32 (the ratio form is cancellation-prone). One entry
+// per TF LUT bin; a 2-entry dummy is bound when PRE_INTEGRATE is off.
+@group(0) @binding(11) var<storage, read> tPreint: array<f32>;
 
 struct VSOut {
   @builtin(position) clip: vec4<f32>,
@@ -54,16 +102,34 @@ struct VSOut {
 };
 
 @vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
-  var positions = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -1.0),
-    vec2<f32>(3.0, -1.0),
-    vec2<f32>(-1.0, 3.0),
-  );
-  let p = positions[vi];
+fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut {
   var out: VSOut;
-  out.clip = vec4<f32>(p, 0.0, 1.0);
-  out.uv = p * 0.5 + 0.5;
+  if (TILE_INSTANCED == 0u) {
+    var positions = array<vec2<f32>, 3>(
+      vec2<f32>(-1.0, -1.0),
+      vec2<f32>(3.0, -1.0),
+      vec2<f32>(-1.0, 3.0),
+    );
+    let p = positions[vi];
+    out.clip = vec4<f32>(p, 0.0, 1.0);
+    out.uv = p * 0.5 + 0.5;
+    return out;
+  }
+  let tile = tileInsts[ii];
+  let tx = tile.packedXY & 0xffffu;
+  let ty = tile.packedXY >> 16u;
+  var local = array<vec2<f32>, 6>(
+    vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+    vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+  );
+  let tilePx = max(frame.screen.z, 1.0);
+  let w = max(frame.screen.x, 1.0);
+  let h = max(frame.screen.y, 1.0);
+  let px = (f32(tx) + local[vi].x) * tilePx;
+  let py = (f32(ty) + local[vi].y) * tilePx;
+  let ndc = vec2<f32>(px / w * 2.0 - 1.0, 1.0 - py / h * 2.0);
+  out.clip = vec4<f32>(ndc, 0.0, 1.0);
+  out.uv = ndc * 0.5 + 0.5;
   return out;
 }
 
@@ -101,6 +167,61 @@ fn sampleDensity(uvw: vec3<f32>) -> f32 {
 
 fn sampleTf(density: f32) -> vec4<f32> {
   return textureSampleLevel(tfTex, tfSampler, vec2<f32>(density, 0.5), 0.0);
+}
+
+// Linearly-interpolated cumulative extinction T(density) from the pre-integration LUT.
+fn preintT(d: f32) -> f32 {
+  let n = arrayLength(&tPreint);
+  if (n < 2u) { return 0.0; }
+  let x = clamp(d, 0.0, 1.0) * f32(n - 1u);
+  let i0 = u32(floor(x));
+  let i1 = min(i0 + 1u, n - 1u);
+  return mix(tPreint[i0], tPreint[i1], x - floor(x));
+}
+
+// Milestone 3.1: segment-average TF alpha over the density interval [sf, sb] (front→back samples),
+// assuming density varies linearly across the step. The ratio form is the exact average extinction;
+// near-equal endpoints (|sb-sf| < eps) fall back to the midpoint value (2nd-order, no discontinuity at
+// the boundary). This replaces the point-sampled endpoint alpha in the composite, so long majorant
+// steps integrate the transfer function instead of skipping over thin spikes between samples.
+fn preintAvgAlpha(sf: f32, sb: f32) -> f32 {
+  let n = arrayLength(&tPreint);
+  let eps = 3.0 / f32(max(n, 2u));
+  if (abs(sb - sf) < eps) {
+    return sampleTf((sf + sb) * 0.5).a; // limit form (midpoint)
+  }
+  return (preintT(sb) - preintT(sf)) / (sb - sf); // ratio form (exact average)
+}
+
+fn occIndex(c: vec3<i32>) -> u32 {
+  let g = vec3<i32>(max(frame.accelOcc.xyz, vec3<f32>(1.0)));
+  let cc = clamp(c, vec3<i32>(0), g - vec3<i32>(1));
+  return u32(cc.x + cc.y * g.x + cc.z * g.x * g.y);
+}
+
+fn uvwToCell(uvw: vec3<f32>) -> vec3<i32> {
+  let g = max(frame.accelOcc.xyz, vec3<f32>(1.0));
+  return vec3<i32>(clamp(floor(uvw * g), vec3<f32>(0.0), g - vec3<f32>(1.0)));
+}
+
+fn majorantStep(cellMaxDensity: f32, densityScale: f32) -> f32 {
+  let cellMaxSigma = max(cellMaxDensity, 0.0) * densityScale * 12.0;
+  return -log(1.0 - TARGET_SEGMENT_OPACITY) / max(cellMaxSigma, 1e-4);
+}
+
+fn visAccumulate(uvw: vec3<f32>, weight: f32) {
+  if (frame.visGrid.w < 0.5) { return; }
+  let g = max(frame.visGrid.xyz, vec3<f32>(1.0));
+  let c = vec3<u32>(clamp(floor(uvw * g), vec3<f32>(0.0), g - vec3<f32>(1.0)));
+  let idx = c.x + c.y * u32(g.x) + c.z * u32(g.x) * u32(g.y);
+  // Fixed-point weight (WGSL has no float atomics). A bounded, saturating atomicAdd -- NOT a
+  // compareExchange spin-loop: under the per-sample contention of a full-screen march the CAS retry
+  // loop serializes across millions of fragments and hangs the GPU (device-lost / tab crash). q is
+  // clamped to 16 bits and the buffer is cleared every readback cycle, so the u32 accumulator cannot
+  // overflow (2^32 / 65535 additions per bin per cycle is unreachable).
+  let q = u32(clamp(weight * VIS_SCALE, 0.0, 65535.0));
+  if (q == 0u) { return; }
+  atomicAdd(&visBins[idx], q);
 }
 
 fn densityGradient(uvw: vec3<f32>) -> vec3<f32> {
@@ -251,7 +372,14 @@ fn shadeSample(
 
   var ao = 0.0;
   if (aoOn && heavy) { ao = ambientOcclusion(pWorld, n, seed) * clamp(frame.lightCtl2.z, 0.0, 1.0); }
-  let ambientTerm = base * masterAmbient * (1.0 - ao);
+  var ambientTerm = base * masterAmbient * (1.0 - ao);
+  if (BENT_NORMAL_AMBIENT != 0u) {
+    // Milestone 7.2: directional (bent-normal) ambient. Instead of a flat grey ambient, sample the
+    // studio environment along the surface normal (the unoccluded-direction proxy) with (1-ao) as the
+    // cone aperture. Blended near unity so it re-tints/varies ambient without changing overall exposure.
+    let irr = envRadiance(n);
+    ambientTerm = base * masterAmbient * (1.0 - ao) * mix(vec3<f32>(1.0), irr, 0.85);
+  }
 
   var diffuseSpec = vec3<f32>(0.0);
   for (var i = 0; i < numLights; i++) {
@@ -286,6 +414,19 @@ fn shadeSample(
     let ndoth = max(dot(n, H), 0.0);
     let spec = pow(ndoth, shininess) * specStrength * smoothstep(0.05, 0.25, density);
     diffuseSpec += (base * ndotl + spec) * radiance * shadow;
+    if (MS_OCTAVES > 0u && heavy) {
+      // Milestone 7.3: cheap multi-scatter octaves (Wrenninge). Each octave lets light penetrate deeper
+      // via T^c (c < 1) with no extra shadow marching; weighting by (Tj - shadow) adds a soft glow that
+      // fills hard shadows without brightening already-lit samples (Tj == shadow ⇒ zero contribution).
+      var atten = 1.0;
+      var w = 1.0;
+      for (var o = 0u; o < MS_OCTAVES; o++) {
+        atten *= 0.5;
+        w *= 0.6;
+        let Tj = pow(shadow, atten);
+        diffuseSpec += base * ndotl * radiance * max(Tj - shadow, 0.0) * w;
+      }
+    }
   }
 
   let rim = base * pow(1.0 - max(dot(n, viewDir), 0.0), 3.0) * 0.25;
@@ -463,6 +604,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   let jitter = ign(in.clip.xy + vec2<f32>(frame.eye.w * 1.7, frame.eye.w * 0.37));
   var t = max(hit.x, 0.0) + jitter * stepSize;
   let tEnd = hit.y;
+  let rdUvw = rd / (2.0 * halfExt);
 
   var color = vec4<f32>(0.0);
   var mipVal = 0.0;
@@ -474,10 +616,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   let viewDir = -rd;
   // Only composite the plane in front-to-back composite mode; disabled for MIP/minIP/average.
   var planeDone = !(planeT > 0.0) || blendMode != 0;
+  var prevDensity = 0.0; // previous sample's density, for the pre-integration segment (Milestone 3.1)
   var i = 0;
   loop {
     if (i >= maxSteps || t > tEnd) { break; }
-    if (blendMode == 0 && color.a > 0.995) { break; }
+    let ert = select(0.995, frame.composite.z, frame.composite.z > 0.0);
+    if (blendMode == 0 && color.a > ert) { break; }
 
     // Cross the measure plane in depth order: composite it before the sample once the ray reaches it.
     if (!planeDone && t >= planeT) {
@@ -489,24 +633,63 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let p = ro + rd * t;
     let uvw = clamp((p + halfExt) / (2.0 * halfExt), vec3<f32>(0.0), vec3<f32>(1.0));
 
+    var stepNow = stepSize;
+    if (OCCUPANCY != 0u) {
+      let cell = uvwToCell(uvw);
+      let rec = occCells[occIndex(cell)];
+      if (rec.occupied < 0.5) {
+        // Empty macrocell: leap the whole Chebyshev-empty box in one step. rec.dist is the L∞ distance
+        // in cells to the nearest active cell (0 = active), so the box of radius (dist-1) cells around
+        // this one is provably empty (triangle inequality). Jump the ray to that box's far face.
+        let g = max(frame.accelOcc.xyz, vec3<f32>(1.0));
+        let cs = 1.0 / g;
+        let r = max(0.0, floor(rec.dist) - 1.0);
+        let bmin = clamp((vec3<f32>(cell) - r) * cs, vec3<f32>(0.0), vec3<f32>(1.0));
+        let bmax = clamp((vec3<f32>(cell) + r + 1.0) * cs, vec3<f32>(0.0), vec3<f32>(1.0));
+        let skipHit = intersectAabb(uvw, rdUvw, bmin, bmax);
+        // Nudge just past the exit face so the next sample lands in a fresh cell (no re-test).
+        let jump = max(skipHit.y + 1e-4, stepSize);
+        prevDensity = 0.0; // leaped empty space
+        t += jump;
+        i += 1;
+        continue;
+      }
+      // Occupied: never finer than the baseline step (so occupancy can't be slower per-sample), coarser
+      // only where the per-cell majorant proves per-segment opacity stays low.
+      stepNow = max(stepSize, majorantStep(rec.dmax, densityScale));
+    }
+
     if (!inCrop(uvw) || !passesViewMode(uvw, viewMode, slabT * 2.5)) {
-      t += stepSize;
+      prevDensity = 0.0;
+      t += stepNow;
       i += 1;
       continue;
     }
 
     let density = sampleDensity(uvw);
     if (density < 0.01 && blendMode == 0) {
-      t += stepSize * 1.75;
+      prevDensity = density;
+      t += stepNow * 1.75;
       i += 1;
       continue;
     }
 
+    // Ray-guided streaming signal (Milestone 1): transmittance-weighted hit on bins with actual
+    // material. Placed after the empty-space/crop skips so empty bins never contribute (and never pay
+    // an atomic) -- the goal is to fetch high-res detail where visible material is, not empty air.
+    visAccumulate(uvw, 1.0 - color.a);
+
     var src = sampleTf(density);
-    let grad = densityGradient(uvw);
-    let gLen = length(grad);
-    let gFactor = mix(1.0, smoothstep(0.0, gradScale, gLen), clamp(gradOpacity, 0.0, 1.0));
-    src.a = src.a * gFactor;
+    // Milestone 2: skip densityGradient + shading when TF-mapped alpha is already ~0.
+    // Gradient opacity only *decreases* alpha, so a transparent TF window never needs the gradient.
+    var grad = vec3<f32>(0.0);
+    var gFactor = 1.0;
+    if (src.a > SHADE_ALPHA_EPS) {
+      grad = densityGradient(uvw);
+      let gLen = length(grad);
+      gFactor = mix(1.0, smoothstep(0.0, gradScale, gLen), clamp(gradOpacity, 0.0, 1.0));
+      src.a = src.a * gFactor;
+    }
 
     var planeH = 0.0;
     if (showPlanes && viewMode == 0u) {
@@ -533,10 +716,17 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
       if (dielectric) {
         sigmaMul = mix(18.0, 9.0, smoothstep(0.18, 0.55, density)); // steam thinner
       }
-      let sigma = max(src.a, 0.0) * densityScale * sigmaMul;
-      var alpha = 1.0 - exp(-sigma * stepSize);
+      var effAlpha = max(src.a, 0.0);
+      if (PRE_INTEGRATE != 0u) {
+        // Milestone 3.1: integrate the TF over the segment [prevDensity, density] instead of point-
+        // sampling the endpoint alpha, so a long majorant step can't skip a thin TF spike between
+        // samples. Modulated by the same gradient-opacity factor as the point path.
+        effAlpha = max(preintAvgAlpha(prevDensity, density) * gFactor, 0.0);
+      }
+      let sigma = effAlpha * densityScale * sigmaMul;
+      var alpha = 1.0 - exp(-sigma * stepNow);
       alpha = max(alpha, planeH * 0.35);
-      if (alpha > 1e-4) {
+      if (alpha > SHADE_ALPHA_EPS && effAlpha > SHADE_ALPHA_EPS) {
         // Gate the expensive shadow/AO rays to samples that still meaningfully affect the image:
         // in front of the volume (remaining transmittance high) and locally opaque enough to matter.
         let heavy = (1.0 - color.a) > 0.03 && alpha > 0.03;
@@ -554,7 +744,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
       }
     }
 
-    t += stepSize;
+    prevDensity = density;
+    t += stepNow;
     i += 1;
   }
 
@@ -607,5 +798,81 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     outRgb = pow(outRgb, vec3<f32>(0.95));
   }
   return vec4<f32>(outRgb, outA);
+}
+`;
+}
+
+/** Baseline (unaccelerated) WGSL, matching {@link volumeRaymarchWgsl} with occupancy/tiles off. */
+export const VOLUME_RAYMARCH_WGSL = volumeRaymarchWgsl();
+
+/** Fullscreen background pass used when instanced tiles don't cover every pixel. */
+export const VOLUME_BACKGROUND_WGSL = /* wgsl */ `
+struct Frame {
+  invViewProj: mat4x4<f32>,
+  eye: vec4<f32>,
+  params: vec4<f32>,
+  light: vec4<f32>,
+  shade: vec4<f32>,
+  boxHalf: vec4<f32>,
+  quality: vec4<f32>,
+  cropMin: vec4<f32>,
+  cropMax: vec4<f32>,
+  slices: vec4<f32>,
+  liquid: vec4<f32>,
+  composite: vec4<f32>,
+}
+
+@group(0) @binding(0) var<uniform> frame: Frame;
+
+struct VSOut {
+  @builtin(position) clip: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
+  var positions = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>(3.0, -1.0),
+    vec2<f32>(-1.0, 3.0),
+  );
+  let p = positions[vi];
+  var out: VSOut;
+  out.clip = vec4<f32>(p, 0.0, 1.0);
+  out.uv = p * 0.5 + 0.5;
+  return out;
+}
+
+fn envRadiance(dir: vec3<f32>) -> vec3<f32> {
+  let d = normalize(dir);
+  let hemi = d.y * 0.5 + 0.5;
+  let lKey = normalize(frame.light.xyz);
+  let sun = frame.shade.xyz * (0.4 + 1.6 * pow(max(dot(d, lKey), 0.0), 28.0));
+  let amb = vec3<f32>(frame.light.w);
+  let sky = amb * 2.4 + sun + vec3<f32>(0.08, 0.12, 0.22) * hemi;
+  let ground = amb * 0.25 + vec3<f32>(0.05, 0.045, 0.04);
+  return mix(ground, sky, hemi) * max(frame.liquid.z, 0.2);
+}
+
+fn tonemapACES(x: vec3<f32>) -> vec3<f32> {
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+@fragment
+fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+  let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, (1.0 - in.uv.y) * 2.0 - 1.0);
+  let nearH = frame.invViewProj * vec4<f32>(ndc, 0.0, 1.0);
+  let farH = frame.invViewProj * vec4<f32>(ndc, 1.0, 1.0);
+  let rd = normalize(farH.xyz / farH.w - nearH.xyz / nearH.w);
+  var bg = envRadiance(rd) * 0.85;
+  if (frame.composite.y < 0.5) {
+    bg = pow(tonemapACES(bg), vec3<f32>(0.95));
+  }
+  return vec4<f32>(bg, 1.0);
 }
 `;

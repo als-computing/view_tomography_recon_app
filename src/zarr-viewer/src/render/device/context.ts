@@ -69,6 +69,7 @@ export async function createContext(
     new Set<GPUFeatureName>([
       ...(options.requiredFeatures ?? []),
       ...(wantFloat32Filterable ? (["float32-filterable"] as GPUFeatureName[]) : []),
+      ...(adapter.features.has("timestamp-query") ? (["timestamp-query"] as GPUFeatureName[]) : []),
     ]),
   );
 

@@ -166,8 +166,15 @@ export function chooseBrickRegion(
   source: VolumeSource,
   cropMin: readonly [number, number, number],
   cropMax: readonly [number, number, number],
-  opts: { maxTextureDimension: number; maxUploadBytes?: number },
+  opts: {
+    maxTextureDimension: number;
+    maxUploadBytes?: number;
+    /** Optional UVW box that overrides `cropMin`/`cropMax` (ray-guided vis-bin hint). */
+    hint?: { min: readonly [number, number, number]; max: readonly [number, number, number] };
+  },
 ): { level: number; voxelMin: [number, number, number]; voxelMax: [number, number, number] } | null {
+  const loU = opts.hint?.min ?? cropMin;
+  const hiU = opts.hint?.max ?? cropMax;
   const budget = opts.maxUploadBytes ?? DEFAULT_MAX_BRICK_BYTES;
   for (let level = 0; level < source.levelCount; level++) {
     const dims = source.dimensionsAt(level);
@@ -177,8 +184,8 @@ export function chooseBrickRegion(
     let voxels = 1;
     for (let a = 0; a < 3; a++) {
       const d = dims[a]!;
-      const lo = Math.max(0, Math.min(d - 1, Math.floor(cropMin[a]! * d)));
-      const hi = Math.max(lo + 1, Math.min(d, Math.ceil(cropMax[a]! * d)));
+      const lo = Math.max(0, Math.min(d - 1, Math.floor(loU[a]! * d)));
+      const hi = Math.max(lo + 1, Math.min(d, Math.ceil(hiU[a]! * d)));
       voxelMin[a] = lo;
       voxelMax[a] = hi;
       const size = hi - lo;
