@@ -726,6 +726,9 @@ export async function run(
   const ROI_PAD = 0.35; // extra fraction of the AABB on each side
   const ROI_MIN_SPAN = 0.18; // minimum UVW span per axis
   const ROI_SETTLE = 0.2; // seconds of camera stillness before (re)streaming
+  // Milestone 1: only consult the visibility feedback once the camera has been still long enough for the
+  // async vis-bin readback to reflect the current view — using it during motion is what made it thrash.
+  const ROI_HINT_SETTLE = 0.45;
 
   // ROI stream progress for the HUD bar. Updated per chunk; the bar's DOM is patched directly (rAF-
   // throttled) so per-chunk progress never triggers a full HUD rebuild.
@@ -901,7 +904,7 @@ export async function run(
       if (roi) {
         const vis = volumeRenderer.visibility;
         let visHint: { min: [number, number, number]; max: [number, number, number] } | undefined;
-        if (roiEnabled && vis.enabled) {
+        if (roiEnabled && vis.enabled && roiIdle >= ROI_HINT_SETTLE) {
           const ranked = rankVisibilityBins(vis.lastQuantized, vis.grid, {
             levelCount: source.levelCount,
             boxExtent: Math.max(sizeSim.x, sizeSim.y, sizeSim.z),
@@ -946,20 +949,32 @@ export async function run(
             };
           }
         }
-        // Region to stream. `visHint` (Milestone 1 ray-guided streaming) would fetch the highest-priority
-        // visible-but-under-resolved bin, but the vis feedback is currently disabled (its hint thrashed the
-        // target — see setVisibilityFeedback note), so this falls back to the stable frustum/crop box.
-        const regionBox = visHint ?? roi;
+        // Region to stream = the stable frustum/crop box (uniform coverage over the whole visible slab).
+        // Milestone 1's visibility feedback does NOT replace it (a single resident brick can't chase a
+        // per-bin hint without thrash/eviction); instead `visHint` steers the shrink below toward the
+        // most-looked-at sub-region when the box is too big to admit a finer level.
+        const regionBox = roi;
         const regionOpts = { maxTextureDimension: maxTex };
         let region = chooseBrickRegion(source, regionBox.min, regionBox.max, regionOpts);
         // If the generous box is too big for a finer-than-displayed level (typical when the far
         // frustum inflates from one viewing side), shrink toward the box center until one fits.
         if (!(region && region.level < level)) {
-          const cu: [number, number, number] = [
-            (regionBox.min[0] + regionBox.max[0]) * 0.5,
-            (regionBox.min[1] + regionBox.max[1]) * 0.5,
-            (regionBox.min[2] + regionBox.max[2]) * 0.5,
-          ];
+          // Shrink toward the most-looked-at sub-region (visibility hint) when we have one, else the box
+          // centre. Clamp into the box so the shrink stays valid. This is the ray-guided part of M1: when
+          // the visible slab is too big for a finer level, prioritise the detail the user is fixated on.
+          const clampToBox = (v: number, a: number): number =>
+            Math.min(regionBox.max[a]!, Math.max(regionBox.min[a]!, v));
+          const cu: [number, number, number] = visHint
+            ? [
+                clampToBox((visHint.min[0] + visHint.max[0]) * 0.5, 0),
+                clampToBox((visHint.min[1] + visHint.max[1]) * 0.5, 1),
+                clampToBox((visHint.min[2] + visHint.max[2]) * 0.5, 2),
+              ]
+            : [
+                (regionBox.min[0] + regionBox.max[0]) * 0.5,
+                (regionBox.min[1] + regionBox.max[1]) * 0.5,
+                (regionBox.min[2] + regionBox.max[2]) * 0.5,
+              ];
           let mn: [number, number, number] = [regionBox.min[0], regionBox.min[1], regionBox.min[2]];
           let mx: [number, number, number] = [regionBox.max[0], regionBox.max[1], regionBox.max[2]];
           for (let k = 0; k < 8 && !(region && region.level < level); k++) {
@@ -1227,10 +1242,10 @@ export async function run(
     volumeRenderer.setSlicePlanesVisible(showPlanes);
     volumeRenderer.setCrop(cropMin, cropMax);
     volumeRenderer.setShaderConfig(shaderConfig);
-    // Visibility-feedback (Milestone 1 ray-guided streaming) is disabled: its readback-derived hint
-    // shifts every readback cycle, so using it as the brick region made the ROI target thrash and never
-    // settle. Re-enable only with a debounced/stable hint. ROI uses the stable frustum/crop box below.
-    volumeRenderer.setVisibilityFeedback(false);
+    // Visibility feedback drives Milestone 1's ray-guided streaming (steers the ROI shrink toward the
+    // most-looked-at region). Only consulted once the camera settles (ROI_HINT_SETTLE), so it no longer
+    // thrashes. The per-sample accumulation is a bounded atomicAdd below the empty-space skip.
+    volumeRenderer.setVisibilityFeedback(roiEnabled);
   };
 
   /** Frame camera looking along the active slice normal (itk-vtk style). */
@@ -2091,7 +2106,7 @@ export async function run(
       }
       if (t.dataset.chk === "roiEnabled") {
         roiEnabled = on; // the render loop reads this live (updateRoi); toggling off fades + discards
-        volumeRenderer.setVisibilityFeedback(false); // see applyRender note: hint thrash disabled for now
+        volumeRenderer.setVisibilityFeedback(roiEnabled); // Milestone 1: ray-guided streaming signal
         return;
       }
       if (
