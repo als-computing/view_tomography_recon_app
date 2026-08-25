@@ -33,13 +33,14 @@ const BLEND_WGSL = /* wgsl */ `
 struct Params {
   invViewProj: mat4x4<f32>,   // current frame: reconstruct a world ray from a screen uv
   prevViewProj: mat4x4<f32>,  // previous frame: project a world point into history uv
-  eyePivot: vec4<f32>,        // xyz = camera eye, w = planar reprojection depth (orbit pivot distance)
+  eyePivot: vec4<f32>,        // xyz = camera eye, w = far plane (denormalizes the per-pixel depth)
   misc: vec4<f32>,            // x = blend weight, y = reproject enable, zw = (1/width, 1/height)
 }
 @group(0) @binding(0) var curTex: texture_2d<f32>;
 @group(0) @binding(1) var histTex: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 @group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var depthTex: texture_2d<f32>; // per-pixel depth centroid / far (Milestone 5.1)
 
 struct VSOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32> }
 
@@ -73,11 +74,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     return vec4<f32>(mix(hist.rgb, cur.rgb, weight), 1.0);
   }
 
-  // Moving camera — planar reprojection: assume this pixel's content lies on the plane at the orbit-pivot
-  // depth, find where that world point sat in the previous frame, and sample history there. Off-pivot
-  // parallax is corrected by the variance clip below rather than per-pixel depth (a later increment).
+  // Moving camera — per-pixel reprojection (Milestone 5.1): reconstruct this pixel's world point from its
+  // transmittance-weighted depth centroid, find where it sat in the previous frame, and sample history
+  // there. The variance clip below still guards disocclusion / thin edges.
   let rd = worldRay(suv);
-  let worldP = params.eyePivot.xyz + rd * params.eyePivot.w;
+  let d01 = textureSampleLevel(depthTex, samp, suv, 0.0).r;
+  let worldP = params.eyePivot.xyz + rd * (d01 * params.eyePivot.w);
   let pc = params.prevViewProj * vec4<f32>(worldP, 1.0);
   if (pc.w <= 0.0) { return vec4<f32>(cur.rgb, 1.0); }
   let puv = pc.xy / pc.w * 0.5 + vec2<f32>(0.5);
@@ -121,7 +123,7 @@ export class TemporalAccumulator {
   #layout: GPUBindGroupLayout | undefined;
   // Reprojection state (set per frame by the viewer; used while the camera moves).
   #reproject = false;
-  #pivot = 1;
+  #far = 1;
   #eye: [number, number, number] = [0, 0, 0];
   readonly #curInvVP = new Float32Array(16);
   readonly #curVP = new Float32Array(16);
@@ -141,20 +143,20 @@ export class TemporalAccumulator {
 
   /**
    * Per-frame reprojection inputs. `invViewProj` (current) reconstructs world rays; `viewProj` (current)
-   * is stored to become next frame's `prevViewProj`. `pivotDepth` is the planar reprojection distance
-   * (orbit pivot). `enable` turns on motion reprojection (off = plain still accumulation).
+   * is stored to become next frame's `prevViewProj`. `far` denormalizes the per-pixel depth centroid.
+   * `enable` turns on motion reprojection (off = plain still accumulation).
    */
   public setReprojection(
     invViewProj: ArrayLike<number>,
     viewProj: ArrayLike<number>,
     eye: readonly [number, number, number],
-    pivotDepth: number,
+    far: number,
     enable: boolean,
   ): void {
     this.#curInvVP.set(invViewProj);
     this.#curVP.set(viewProj);
     this.#eye = [eye[0], eye[1], eye[2]];
-    this.#pivot = pivotDepth;
+    this.#far = far;
     this.#reproject = enable;
   }
 
@@ -192,7 +194,13 @@ export class TemporalAccumulator {
    * Add the accumulate pass to `graph` and return the handle the post stack should read. `current` is
    * this frame's freshly-rendered (jittered) HDR. Sized to `w × h`; a size change reseeds history.
    */
-  public resolve(graph: RenderGraph, current: ResourceHandle, w: number, h: number): ResourceHandle {
+  public resolve(
+    graph: RenderGraph,
+    current: ResourceHandle,
+    depth: ResourceHandle,
+    w: number,
+    h: number,
+  ): ResourceHandle {
     this.#ensureTextures(w, h);
     this.#ensurePipeline();
     const prev = this.#readA ? this.#historyA! : this.#historyB!;
@@ -209,7 +217,7 @@ export class TemporalAccumulator {
     u[32] = this.#eye[0];
     u[33] = this.#eye[1];
     u[34] = this.#eye[2];
-    u[35] = this.#pivot;
+    u[35] = this.#far;
     u[36] = weight;
     u[37] = reproject ? 1 : 0;
     u[38] = 1 / Math.max(1, w);
@@ -219,6 +227,7 @@ export class TemporalAccumulator {
     this.#hasPrev = true;
 
     const curH = current;
+    const depthH = depth;
     const prevH = graph.importTexture(prev, "taau-hist-prev", HDR_FORMAT);
     const nextH = graph.importTexture(next, "taau-hist-next", HDR_FORMAT);
     const device = this.device;
@@ -228,7 +237,7 @@ export class TemporalAccumulator {
     const paramsBuf = this.#params.gpu;
     graph.addPass({
       name: "taau-accumulate",
-      reads: [curH, prevH],
+      reads: [curH, prevH, depthH],
       writes: [nextH],
       execute(ctx): void {
         const bg = device.createBindGroup({
@@ -238,6 +247,7 @@ export class TemporalAccumulator {
             { binding: 1, resource: ctx.texture(prevH).createView() },
             { binding: 2, resource: sampler },
             { binding: 3, resource: { buffer: paramsBuf } },
+            { binding: 4, resource: ctx.texture(depthH).createView() },
           ],
         });
         const pass = ctx.encoder.beginRenderPass({
@@ -289,6 +299,7 @@ export class TemporalAccumulator {
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     });
     const mod = this.#cache.getModule("taau-blend", BLEND_WGSL);

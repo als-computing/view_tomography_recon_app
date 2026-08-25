@@ -561,8 +561,10 @@ fn passesViewMode(uvw: vec3<f32>, viewMode: u32, thickness: f32) -> bool {
   return true;
 }
 
-@fragment
-fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+// Composites the volume into a colour and, via depthOut, the transmittance-weighted depth centroid
+// (Milestone 5.1) normalized by the far plane — for TAAU reprojection. All early exits leave depthOut at
+// the caller's default (1.0 = far); only the composited path writes a real centroid.
+fn marchColor(in: VSOut, depthOut: ptr<function, f32>) -> vec4<f32> {
   let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, (1.0 - in.uv.y) * 2.0 - 1.0);
   let nearH = frame.invViewProj * vec4<f32>(ndc, 0.0, 1.0);
   let farH = frame.invViewProj * vec4<f32>(ndc, 1.0, 1.0);
@@ -635,6 +637,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   // Only composite the plane in front-to-back composite mode; disabled for MIP/minIP/average.
   var planeDone = !(planeT > 0.0) || blendMode != 0;
   var prevDensity = 0.0; // previous sample's density, for the pre-integration segment (Milestone 3.1)
+  var centroidNum = 0.0;    // Σ t·Δα  — transmittance-weighted depth centroid (Milestone 5.1)
+  var centroidWeight = 0.0; // Σ Δα
   var i = 0;
   loop {
     if (i >= maxSteps || t > tEnd) { break; }
@@ -651,17 +655,22 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let p = ro + rd * t;
     let uvw = clamp((p + halfExt) / (2.0 * halfExt), vec3<f32>(0.0), vec3<f32>(1.0));
 
-    var stepNow = stepSize;
+    let stepNow = stepSize;
     if (OCCUPANCY != 0u) {
       let cell = uvwToCell(uvw);
       let rec = occCells[occIndex(cell)];
-      if (rec.occupied < 0.5) {
-        // Empty macrocell: leap the whole Chebyshev-empty box in one step. rec.dist is the L∞ distance
-        // in cells to the nearest active cell (0 = active), so the box of radius (dist-1) cells around
-        // this one is provably empty (triangle inequality). Jump the ray to that box's far face.
+      // Leap only cells well clear of material — at least OCC_LEAP_MIN macrocells from any active cell
+      // (rec.dist is the L∞ distance in cells, 0 = active). Everything closer is marched at baseline
+      // fidelity so the silhouette follows the actual density fade, not the blocky macrocell grid; a soft
+      // semi-transparent boundary can accumulate visible material several cells beyond the per-macrocell
+      // "active" classification, hence the wide margin. This is nearly free: the baseline density < 0.01
+      // skip still fast-forwards through the empty voxels inside the margin — only the *deep* air is
+      // leaped. The leap box of radius (dist - OCC_LEAP_MIN) stays in the provably-empty interior.
+      let OCC_LEAP_MIN = 5.0;
+      if (rec.dist >= OCC_LEAP_MIN) {
         let g = max(frame.accelOcc.xyz, vec3<f32>(1.0));
         let cs = 1.0 / g;
-        let r = max(0.0, floor(rec.dist) - 1.0);
+        let r = max(0.0, floor(rec.dist) - OCC_LEAP_MIN);
         let bmin = clamp((vec3<f32>(cell) - r) * cs, vec3<f32>(0.0), vec3<f32>(1.0));
         let bmax = clamp((vec3<f32>(cell) + r + 1.0) * cs, vec3<f32>(0.0), vec3<f32>(1.0));
         let skipHit = intersectAabb(uvw, rdUvw, bmin, bmax);
@@ -672,12 +681,24 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         i += 1;
         continue;
       }
-      // Occupied: never finer than the baseline step (so occupancy can't be slower per-sample), coarser
-      // only where the per-cell majorant proves per-segment opacity stays low.
-      stepNow = max(stepSize, majorantStep(rec.dmax, densityScale));
+      // Otherwise march at the baseline step — no majorant coarsening (it banded flat / crop faces); the
+      // speed-up comes purely from leaping the empty interior above.
     }
 
-    if (!inCrop(uvw) || !passesViewMode(uvw, viewMode, slabT * 2.5)) {
+    if (!inCrop(uvw)) {
+      // Skip the cropped-away region by jumping straight to the crop-box entry, so coarse steps through it
+      // don't alias into bands on the flat crop face. If the crop is behind / around us, fall back to a step.
+      let cropHit = intersectAabb(uvw, rdUvw, frame.cropMin.xyz, frame.cropMax.xyz);
+      prevDensity = 0.0;
+      if (cropHit.x > 0.0 && cropHit.x < cropHit.y) {
+        t += cropHit.x + 1e-4;
+      } else {
+        t += stepNow;
+      }
+      i += 1;
+      continue;
+    }
+    if (!passesViewMode(uvw, viewMode, slabT * 2.5)) {
       prevDensity = 0.0;
       t += stepNow;
       i += 1;
@@ -759,6 +780,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         let a = clamp(alpha, 0.0, 1.0);
         let oneMinus = 1.0 - color.a;
         color = vec4<f32>(color.rgb + oneMinus * lit * a, color.a + oneMinus * a);
+        let dContrib = oneMinus * a; // this sample's opacity contribution
+        centroidNum += t * dContrib;
+        centroidWeight += dContrib;
       }
     }
 
@@ -815,7 +839,25 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     outRgb = tonemapACES(outRgb);
     outRgb = pow(outRgb, vec3<f32>(0.95));
   }
+  // Depth centroid (world distance along the ray) normalized by the far plane, for TAAU reprojection.
+  let far = max(frame.shadowCtl.y, 1e-6);
+  let centroidT = select(hit.x, centroidNum / max(centroidWeight, 1e-6), centroidWeight > 1e-5);
+  *depthOut = clamp(centroidT / far, 0.0, 1.0);
   return vec4<f32>(outRgb, outA);
+}
+
+// MRT entry point: colour to location 0, depth centroid (.r) to location 1. Splitting marchColor out
+// keeps its many early returns untouched; the depth defaults to 1.0 (far) for every early exit.
+struct FragOut {
+  @location(0) color: vec4<f32>,
+  @location(1) depth: vec4<f32>,
+};
+
+@fragment
+fn fs_main(in: VSOut) -> FragOut {
+  var depth = 1.0;
+  let color = marchColor(in, &depth);
+  return FragOut(color, vec4<f32>(depth, 0.0, 0.0, 0.0));
 }
 `;
 }
@@ -881,8 +923,14 @@ fn tonemapACES(x: vec3<f32>) -> vec3<f32> {
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Two render targets to match the volume pipeline (colour + depth); background depth = 1.0 (far).
+struct FragOut {
+  @location(0) color: vec4<f32>,
+  @location(1) depth: vec4<f32>,
+};
+
 @fragment
-fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VSOut) -> FragOut {
   let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, (1.0 - in.uv.y) * 2.0 - 1.0);
   let nearH = frame.invViewProj * vec4<f32>(ndc, 0.0, 1.0);
   let farH = frame.invViewProj * vec4<f32>(ndc, 1.0, 1.0);
@@ -891,6 +939,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   if (frame.composite.y < 0.5) {
     bg = pow(tonemapACES(bg), vec3<f32>(0.95));
   }
-  return vec4<f32>(bg, 1.0);
+  return FragOut(vec4<f32>(bg, 1.0), vec4<f32>(1.0, 0.0, 0.0, 0.0));
 }
 `;

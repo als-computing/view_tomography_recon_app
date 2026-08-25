@@ -60,8 +60,9 @@ struct Frame {
 }
 struct TileParams {
   screen: vec4<f32>,     // xy = width/height in pixels
-  tilesOcc: vec4<u32>,   // x = tilesX, y = tilesY, z = occEnable
+  tilesOcc: vec4<u32>,   // x = tilesX, y = tilesY, z = occEnable, w = bboxValid
   occGrid: vec4<u32>,    // xyz = occupancy grid
+  bbox: vec4<f32>,       // volume AABB screen-space bounding box in pixels (minX, minY, maxX, maxY)
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -99,44 +100,22 @@ fn occIndex(c: vec3<i32>) -> u32 {
 fn classify(@builtin(global_invocation_id) id: vec3<u32>) {
   if (id.x >= tp.tilesOcc.x || id.y >= tp.tilesOcc.y) { return; }
   let tilePx = 16.0;
-  let w = tp.screen.x;
-  let h = tp.screen.y;
-  // Pixel-space tile, y-down. Match the fragment shader's uv → ndc convention.
   let px0 = f32(id.x) * tilePx;
   let py0 = f32(id.y) * tilePx;
-  let px1 = min(px0 + tilePx, w);
-  let py1 = min(py0 + tilePx, h);
-  let ro = frame.eye.xyz;
-  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
-  var tMin = 1e30;
-  var tMax = -1e30;
-  var anyHit = false;
-  let corners = array<vec2<f32>, 5>(
-    vec2<f32>(px0, py0), vec2<f32>(px1, py0), vec2<f32>(px0, py1), vec2<f32>(px1, py1),
-    vec2<f32>(0.5 * (px0 + px1), 0.5 * (py0 + py1)),
-  );
-  for (var k = 0; k < 5; k++) {
-    let uv = vec2<f32>(corners[k].x / w, corners[k].y / h);
-    // Existing raymarch: ndc = (uv.x*2-1, (1-uv.y)*2-1) with uv from clip (y-up-ish).
-    // Tile pixels are y-down from the top, so uv.y_pixel/h = 0 at top = ndc.y +1.
-    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let rd = rayForNdc(ndc);
-    let hit = intersectAabb(ro, rd, -halfExt, halfExt);
-    if (hit.x <= hit.y && hit.y >= 0.0) {
-      anyHit = true;
-      tMin = min(tMin, max(hit.x, 0.0));
-      tMax = max(tMax, hit.y);
-    }
+  let px1 = px0 + tilePx;
+  let py1 = py0 + tilePx;
+  // Keep any tile whose pixel rect overlaps the volume AABB's screen-space bounding box. This is robust
+  // where the old 5-point ray test was not: a small / thin projection (zoomed out, or a slab seen
+  // edge-on) can slip *between* the sampled points and get wrongly culled — tile-shaped holes at the
+  // boundary that get worse the smaller the volume projects. bboxValid == 0 (camera inside / near the
+  // volume, box can't be reliably bounded on screen) → keep all tiles that frame.
+  if (tp.tilesOcc.w > 0u) {
+    let bmin = tp.bbox.xy;
+    let bmax = tp.bbox.zw;
+    if (!(px0 < bmax.x && px1 > bmin.x && py0 < bmax.y && py1 > bmin.y)) { return; }
   }
-  if (!anyHit) { return; }
-
-  // Conservative: draw any tile whose ray hits the volume AABB. Empty space *inside* the AABB is culled
-  // per-pixel by the occupancy empty-space leap in the raymarch shader, NOT here. A per-tile centre-ray
-  // occupancy probe produced false negatives -- tiles over hollow / thin regions were dropped, leaving
-  // tile-shaped holes where the background showed through (the "obvious tiles" / clipping artifact).
-
   let slot = atomicAdd(&drawArgs[1], 1u);
-  compacted[slot] = TileInst(id.x | (id.y << 16u), tMin, tMax, 0.0);
+  compacted[slot] = TileInst(id.x | (id.y << 16u), 0.0, 0.0, 0.0);
 }
 `;
 
@@ -174,7 +153,7 @@ export class TileCompactor implements Disposable {
     this.tileParams = new ManagedBuffer(
       device,
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      48,
+      64,
     );
     this.capacity = 1;
   }
@@ -203,6 +182,8 @@ export class TileCompactor implements Disposable {
     dummyCells: GPUBuffer,
     width: number,
     height: number,
+    /** Volume AABB screen bbox in pixels; `null` → camera can't bound it (keep every tile). */
+    bbox: { minX: number; minY: number; maxX: number; maxY: number } | null,
   ): boolean {
     const tilesX = Math.max(1, Math.ceil(width / TILE_SIZE));
     const tilesY = Math.max(1, Math.ceil(height / TILE_SIZE));
@@ -224,7 +205,7 @@ export class TileCompactor implements Disposable {
     // DrawIndirect: vertexCount=6, instanceCount=0 (atomicAdd'd), firstVertex=0, firstInstance=0.
     this.drawArgs.write(new Uint32Array([6, 0, 0, 0]));
     const occGrid = occupancy?.grid ?? [1, 1, 1];
-    const raw = new ArrayBuffer(48);
+    const raw = new ArrayBuffer(64);
     const f32 = new Float32Array(raw);
     const u32 = new Uint32Array(raw);
     f32[0] = width;
@@ -232,9 +213,15 @@ export class TileCompactor implements Disposable {
     u32[4] = tilesX;
     u32[5] = tilesY;
     u32[6] = occupancy?.ready ? 1 : 0;
+    u32[7] = bbox ? 1 : 0; // bboxValid
     u32[8] = occGrid[0]!;
     u32[9] = occGrid[1]!;
     u32[10] = occGrid[2]!;
+    // bbox (minX, minY, maxX, maxY) at float offset 12..15.
+    f32[12] = bbox ? bbox.minX : 0;
+    f32[13] = bbox ? bbox.minY : 0;
+    f32[14] = bbox ? bbox.maxX : 0;
+    f32[15] = bbox ? bbox.maxY : 0;
     this.tileParams.write(new Uint8Array(raw));
 
     const occBuf = occupancy?.cellsGpu ?? dummyCells;

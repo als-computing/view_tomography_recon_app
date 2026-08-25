@@ -31,6 +31,12 @@ import { OccupancyGrid } from "../accel/occupancy.js";
 import { TileCompactor, TILE_SIZE } from "../accel/tiles.js";
 import { ShadowMap } from "../accel/shadow-map.js";
 
+/**
+ * Second render target of the volume pass (Milestone 5.1): the transmittance-weighted depth centroid,
+ * normalized by the far plane. Consumed by TAAU reprojection; a single filterable channel is enough.
+ */
+export const VOLUME_DEPTH_FORMAT: GPUTextureFormat = "r16float";
+
 /** Volume blend / compositing mode (itk-vtk `setImageBlendMode`). */
 export type VolumeBlendMode = "composite" | "mip" | "minip" | "average";
 
@@ -171,6 +177,8 @@ export class VolumeRenderer implements Disposable {
   private dirtyShadow = true;
   private shadowLightDir: [number, number, number] = [0.45, 0.85, 0.35];
   private readonly worldToLight = new Float32Array(16);
+  // Far-plane distance used to normalize the depth-centroid output (Milestone 5.1 TAAU reprojection).
+  private reprojectFar = 1;
 
   // Multi-light shading (prism lighting library). The light list is rebuilt per frame by the viewer
   // (global / camera flashlight / stage) and uploaded to this storage buffer; the control params
@@ -476,6 +484,11 @@ export class VolumeRenderer implements Disposable {
     this.internalHeight = Math.max(1, height);
   }
 
+  /** Far-plane distance used to normalize the depth-centroid output for TAAU reprojection. */
+  public setReprojectFar(far: number): void {
+    this.reprojectFar = Math.max(1e-6, far);
+  }
+
   /**
    * Occupancy rebuild + tile classify + vis-bin copy. Call on the same encoder, before the volume
    * render pass, when the current shader config uses those structures.
@@ -501,6 +514,7 @@ export class VolumeRenderer implements Disposable {
       }
     }
     if (spec.tiles && this.frameUniform) {
+      const bbox = this.aabbScreenBbox(viewProj, this.internalWidth, this.internalHeight);
       const rebuilt = this.tiles.record(
         encoder,
         this.frameUniform.gpu,
@@ -508,6 +522,7 @@ export class VolumeRenderer implements Disposable {
         this.dummyOcc.gpu,
         this.internalWidth,
         this.internalHeight,
+        bbox,
       );
       if (rebuilt) this.bindGroup = undefined;
     }
@@ -526,12 +541,56 @@ export class VolumeRenderer implements Disposable {
         boxHalf: this.boxHalf,
         densityScale: this.densityScale,
         sigmaMul: 12,
+        cropMin: this.cropMin,
+        cropMax: this.cropMax,
       });
       this.worldToLight.set(t.worldToLightUvw);
       this.shadowMapBuilt = true;
       this.dirtyShadow = false;
     }
     this.vis.recordCopy(encoder);
+  }
+
+  /**
+   * Screen-space pixel bounding box of the volume AABB, for conservative tile classification. Projects
+   * the 8 box corners with `viewProj`; returns `null` when any corner is at/behind the camera (the box
+   * can't be reliably bounded on screen → the caller keeps every tile that frame). Padded by one tile.
+   */
+  private aabbScreenBbox(
+    viewProj: Mat4,
+    w: number,
+    h: number,
+  ): { minX: number; minY: number; maxX: number; maxY: number } | null {
+    const e = viewProj.elements;
+    const [hx, hy, hz] = this.boxHalf;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i < 8; i++) {
+      const x = i & 1 ? hx : -hx;
+      const y = i & 2 ? hy : -hy;
+      const z = i & 4 ? hz : -hz;
+      const cx = e[0]! * x + e[4]! * y + e[8]! * z + e[12]!;
+      const cy = e[1]! * x + e[5]! * y + e[9]! * z + e[13]!;
+      const cw = e[3]! * x + e[7]! * y + e[11]! * z + e[15]!;
+      if (cw <= 1e-6) return null; // corner at/behind the camera — can't bound; keep all tiles
+      const px = ((cx / cw) * 0.5 + 0.5) * w;
+      // The fragment shader reconstructs rays with ndc.y = 2·py/h − 1 (y-flipped from standard clip),
+      // so a point renders at py = (ndc.y + 1)/2·h — match that, or the bbox is vertically mirrored.
+      const py = ((cy / cw) * 0.5 + 0.5) * h;
+      minX = Math.min(minX, px);
+      maxX = Math.max(maxX, px);
+      minY = Math.min(minY, py);
+      maxY = Math.max(maxY, py);
+    }
+    const pad = TILE_SIZE; // never clip at the very edge
+    return {
+      minX: Math.max(0, minX - pad),
+      minY: Math.max(0, minY - pad),
+      maxX: Math.min(w, maxX + pad),
+      maxY: Math.min(h, maxY + pad),
+    };
   }
 
   /** Map pending vis-bin readback. Must run after the encoder that copied it has been submitted. */
@@ -564,19 +623,27 @@ export class VolumeRenderer implements Disposable {
 
   /** Crop region in normalized volume UVW `[0,1]^3`. */
   public setCrop(min: readonly [number, number, number], max: readonly [number, number, number]): void {
-    this.cropMin = [
+    const nmin: [number, number, number] = [
       Math.min(min[0], max[0]),
       Math.min(min[1], max[1]),
       Math.min(min[2], max[2]),
     ];
-    this.cropMax = [
+    const nmax: [number, number, number] = [
       Math.max(min[0], max[0]),
       Math.max(min[1], max[1]),
       Math.max(min[2], max[2]),
     ];
+    // The shadow map excludes cropped-away material, so a crop change invalidates it (only when it
+    // actually changed — setCrop is re-called every applyRender).
+    if (nmin.some((v, i) => v !== this.cropMin[i]) || nmax.some((v, i) => v !== this.cropMax[i])) {
+      this.dirtyShadow = true;
+    }
+    this.cropMin = nmin;
+    this.cropMax = nmax;
   }
 
   public resetCrop(): void {
+    if (this.cropMin[0] !== 0 || this.cropMin[1] !== 0 || this.cropMin[2] !== 0) this.dirtyShadow = true;
     this.cropMin = [0, 0, 0];
     this.cropMax = [1, 1, 1];
   }
@@ -833,7 +900,7 @@ export class VolumeRenderer implements Disposable {
     // worldToLight mat4 (Milestone 7.1) at floats 100..115, then shadowCtl at 116.
     for (let k = 0; k < 16; k++) d[100 + k] = this.worldToLight[k]!;
     d[116] = this.shadowMapEnabled && this.shadowMapBuilt ? 1 : 0;
-    d[117] = 0;
+    d[117] = this.reprojectFar; // shadowCtl.y → depth-centroid normalization (TAAU)
     d[118] = 0;
     d[119] = 0;
     this.frameUniform!.write(d);
@@ -926,7 +993,7 @@ export class VolumeRenderer implements Disposable {
         fragment: {
           module: bgMod,
           entryPoint: "fs_main",
-          targets: [{ format: this.colorFormat }],
+          targets: [{ format: this.colorFormat }, { format: VOLUME_DEPTH_FORMAT }],
         },
         primitive: { topology: "triangle-list" },
       });
@@ -959,7 +1026,7 @@ export class VolumeRenderer implements Disposable {
       fragment: {
         module,
         entryPoint: "fs_main",
-        targets: [{ format: this.colorFormat, blend }],
+        targets: [{ format: this.colorFormat, blend }, { format: VOLUME_DEPTH_FORMAT }],
       },
       primitive: { topology: "triangle-list" },
     });
@@ -977,7 +1044,7 @@ export class VolumeRenderer implements Disposable {
         fragment: {
           module: nMod,
           entryPoint: "fs_main",
-          targets: [{ format: this.colorFormat, blend }],
+          targets: [{ format: this.colorFormat, blend }, { format: VOLUME_DEPTH_FORMAT }],
         },
         primitive: { topology: "triangle-list" },
       }).catch(() => {

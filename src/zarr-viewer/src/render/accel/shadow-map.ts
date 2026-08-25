@@ -82,6 +82,8 @@ struct Params {
   boxHalf: vec4<f32>, // xyz volume half-extents
   dims: vec4<u32>,    // xyz = light-texture dims
   cfg: vec4<f32>,     // x = densityScale, y = sigmaMul
+  cropMin: vec4<f32>, // xyz = crop lower bound in uvw [0,1]
+  cropMax: vec4<f32>, // xyz = crop upper bound in uvw [0,1]
 }
 
 @group(0) @binding(0) var volumeTex: texture_3d<f32>;
@@ -113,7 +115,11 @@ fn build(@builtin(global_invocation_id) id: vec3<u32>) {
     let f = ((f32(k) + 0.5) / f32(sd)) * 2.0 * projF - projF;
     let worldP = p.right.xyz * r + p.up.xyz * u + p.fwd.xyz * f;
     let uvw = (worldP + p.boxHalf.xyz) / (2.0 * p.boxHalf.xyz);
-    if (all(uvw >= vec3<f32>(0.0)) && all(uvw <= vec3<f32>(1.0))) {
+    // Respect the crop: material cropped away casts no shadow (matches the brute-march path), so an
+    // exposed crop face is lit directly instead of darkened by voxels that are no longer shown.
+    let lo = max(vec3<f32>(0.0), p.cropMin.xyz);
+    let hi = min(vec3<f32>(1.0), p.cropMax.xyz);
+    if (all(uvw >= lo) && all(uvw <= hi)) {
       let d = textureSampleLevel(volumeTex, volSamp, uvw, 0.0).r;
       let a = textureSampleLevel(tfTex, tfSamp, vec2<f32>(d, 0.5), 0.0).a;
       tau = tau + max(a, 0.0) * p.cfg.x * p.cfg.y * stepF;
@@ -143,7 +149,7 @@ export class ShadowMap implements Disposable {
       dimension: "3d",
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     });
-    this.params = new ManagedBuffer(device, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, 96);
+    this.params = new ManagedBuffer(device, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, 128);
     this.sampler = device.createSampler({
       magFilter: "linear",
       minFilter: "linear",
@@ -173,11 +179,15 @@ export class ShadowMap implements Disposable {
       boxHalf: readonly [number, number, number];
       densityScale: number;
       sigmaMul: number;
+      cropMin?: readonly [number, number, number];
+      cropMax?: readonly [number, number, number];
     },
   ): ShadowTransform {
     this.ensurePipeline();
     const t = shadowTransform(opts.lightDir, opts.boxHalf);
-    const raw = new ArrayBuffer(96);
+    const cropMin = opts.cropMin ?? [0, 0, 0];
+    const cropMax = opts.cropMax ?? [1, 1, 1];
+    const raw = new ArrayBuffer(128);
     const f = new Float32Array(raw);
     const u = new Uint32Array(raw);
     f[0] = t.right[0]; f[1] = t.right[1]; f[2] = t.right[2]; f[3] = t.projRight;
@@ -186,6 +196,8 @@ export class ShadowMap implements Disposable {
     f[12] = opts.boxHalf[0]; f[13] = opts.boxHalf[1]; f[14] = opts.boxHalf[2]; f[15] = 0;
     u[16] = this.dims[0]; u[17] = this.dims[1]; u[18] = this.dims[2]; u[19] = 0;
     f[20] = opts.densityScale; f[21] = opts.sigmaMul; f[22] = 0; f[23] = 0;
+    f[24] = cropMin[0]; f[25] = cropMin[1]; f[26] = cropMin[2]; f[27] = 0;
+    f[28] = cropMax[0]; f[29] = cropMax[1]; f[30] = cropMax[2]; f[31] = 0;
     this.params.write(new Uint8Array(raw));
 
     const bg = this.device.createBindGroup({

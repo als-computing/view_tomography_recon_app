@@ -2618,6 +2618,7 @@ export async function run(
     const rw = Math.max(1, Math.round(canvas.width * fxPipeline.renderScale));
     const rh = Math.max(1, Math.round(canvas.height * fxPipeline.renderScale));
     volumeRenderer.setInternalSize(rw, rh);
+    volumeRenderer.setReprojectFar(far); // normalize the depth-centroid output for TAAU reprojection
     // Milestone 5: accumulate only once fully settled — the camera stopped AND the adaptive step has
     // finished refining (else we'd blend coarse-in-motion frames with the sharp ones). Anything else
     // resets the history so a moving view shows the live frame with no ghosting. When accumulating, jitter
@@ -2639,7 +2640,7 @@ export async function run(
           invViewProj.elements,
           viewProj.elements,
           [camera.position.x, camera.position.y, camera.position.z],
-          Math.max(1e-3, controls.distance),
+          far,
           !settled,
         );
       }

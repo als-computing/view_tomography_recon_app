@@ -16,6 +16,7 @@ import { RenderGraph } from "../graph/render-graph.js";
 import { PostStack, type Effect } from "@prism/fx";
 import { GpuTimer } from "../accel/gpu-timer.js";
 import type { TemporalAccumulator } from "../accel/taau.js";
+import { VOLUME_DEPTH_FORMAT } from "../volume/volume-renderer.js";
 
 /** RENDER_ATTACHMENT | TEXTURE_BINDING — the HDR target must be both drawn to and sampled. */
 const HDR_USAGE = 0x10 | 0x04;
@@ -87,9 +88,11 @@ export class FxPipeline {
     const timer = this.#timer;
 
     const hdr = graph.createTexture({ size: [rw, rh, 1], format: HDR_FORMAT, usage: HDR_USAGE });
+    // Milestone 5.1: second render target = the per-pixel depth centroid (for TAAU reprojection).
+    const depth = graph.createTexture({ size: [rw, rh, 1], format: VOLUME_DEPTH_FORMAT, usage: HDR_USAGE });
     graph.addPass({
       name: "volume",
-      writes: [hdr],
+      writes: [hdr, depth],
       execute(ctx): void {
         prepare?.(ctx.encoder);
         const pass = ctx.encoder.beginRenderPass({
@@ -98,6 +101,12 @@ export class FxPipeline {
             {
               view: ctx.texture(hdr).createView(),
               clearValue,
+              loadOp: "clear",
+              storeOp: "store",
+            },
+            {
+              view: ctx.texture(depth).createView(),
+              clearValue: { r: 1, g: 0, b: 0, a: 0 }, // far
               loadOp: "clear",
               storeOp: "store",
             },
@@ -110,9 +119,9 @@ export class FxPipeline {
       },
     });
 
-    // Milestone 5: temporally accumulate the jittered volume frame into persistent history (still camera
-    // only) before the post stack. When disabled this is a no-op and the raw frame feeds post directly.
-    const sceneColor = taau && taau.enabled ? taau.resolve(graph, hdr, rw, rh) : hdr;
+    // Milestone 5: temporally accumulate the jittered volume frame into persistent history before the
+    // post stack, reprojecting the previous frame via the per-pixel depth. Disabled → raw frame to post.
+    const sceneColor = taau && taau.enabled ? taau.resolve(graph, hdr, depth, rw, rh) : hdr;
 
     const out = graph.importTexture(canvasContext.getCurrentTexture(), "swap", format);
     this.#stack.build(graph, sceneColor, { size: [rw, rh, 1], format: HDR_FORMAT, output: out });
