@@ -10,7 +10,6 @@ import { units } from "@zarr-viewer/core";
 import {
   openOmeZarr,
   httpStore,
-  physicalSizeQuantities,
   physicalSizeSim,
   volumeMaxExtentMeters,
   listUploadableLevels,
@@ -29,10 +28,6 @@ import {
   VolumeRenderer,
   composeTransferFunction,
   OpacityCurveEditor,
-  colorMapNames,
-  makeDirectionalLight,
-  makeSpotLight,
-  type GpuLight,
   type ColorMapName,
   type VolumeBlendMode,
   type VolumeViewMode,
@@ -70,18 +65,27 @@ import {
   defaultCroppingState,
   mergeDefined,
 } from "./viewer/RenderingState.js";
-import { mulMat4Vec4, niceFloor125, zarrUrlFromQuery, pickZarrStore } from "./viewer/util.js";
+import { niceFloor125, zarrUrlFromQuery, pickZarrStore } from "./viewer/util.js";
 import { autoWindow, buildEqualizeRemap, rebinThroughRemap } from "./viewer/histogram.js";
+import { type PanelId, section, fmt } from "./viewer/ui/html.js";
+import { cropIsSet, focalRoiUvw, rayDir } from "./viewer/volume/roi-geometry.js";
+import { buildFrameLights } from "./viewer/rendering/lighting.js";
 import {
-  type PanelId,
-  section,
-  segBtn,
-  slider,
-  fmt,
-  colorRow,
-  escAttr,
-  rangeSlider,
-} from "./viewer/ui/html.js";
+  type CameraContext,
+  frameSliceCamera as frameSliceCameraPure,
+  enterViewMode as enterViewModePure,
+  activeSlice as activeSlicePure,
+  setActiveSlice as setActiveSlicePure,
+} from "./viewer/camera/sliceView.js";
+import { dataPanelBody } from "./viewer/ui/panels/dataPanel.js";
+import { tfPanelBody } from "./viewer/ui/panels/tfPanel.js";
+import { renderPanelBody } from "./viewer/ui/panels/renderPanel.js";
+import { slicesPanelBody } from "./viewer/ui/panels/slicesPanel.js";
+import { cropPanelBody } from "./viewer/ui/panels/cropPanel.js";
+import { measurePanelBody } from "./viewer/ui/panels/measurePanel.js";
+import { postfxPanelBody } from "./viewer/ui/panels/postfxPanel.js";
+import { lightingPanelBody } from "./viewer/ui/panels/lightingPanel.js";
+import { presetsPanelBody, sanitizeSelectedPreset } from "./viewer/ui/panels/presetsPanel.js";
 
 export type { WebGpuRenderingState, WebGpuCroppingState } from "./viewer/RenderingState.js";
 
@@ -276,18 +280,6 @@ export async function run(
   };
   rebuildFxStack();
 
-  // sRGB hex (from <input type="color">) → linear RGB for the HDR shading path.
-  const srgbToLinear = (c: number): number =>
-    c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-  const hexToLinearRgb = (hex: string): [number, number, number] => {
-    const h = hex.replace("#", "");
-    return [
-      srgbToLinear(parseInt(h.slice(0, 2), 16) / 255),
-      srgbToLinear(parseInt(h.slice(2, 4), 16) / 255),
-      srgbToLinear(parseInt(h.slice(4, 6), 16) / 255),
-    ];
-  };
-
   // Push the (non-per-frame) lighting params to the renderer + set the half-res lever. Called on any
   // Lighting-panel change; the light *positions* themselves are rebuilt per frame (below).
   const applyLighting = (): void => {
@@ -309,71 +301,6 @@ export async function run(
     fxPipeline.setRenderScale(rendering.halfRes ? 0.5 : 1);
   };
 
-  // Rebuild the GPU light list from the enabled modes + the camera basis. Global is a fixed-direction
-  // directional (also drives the studio env); flashlight is a spot at the eye aimed at the sample;
-  // stage lights are four spots pinned to the screen corners aiming inward for even fill.
-  const buildFrameLights = (
-    eye: { x: number; y: number; z: number },
-    right: readonly [number, number, number],
-    up: readonly [number, number, number],
-    fwd: readonly [number, number, number],
-    extent: number,
-  ): GpuLight[] => {
-    const lights: GpuLight[] = [];
-    if (rendering.lightGlobalOn) {
-      const el = (rendering.lightElevation * Math.PI) / 180;
-      const az = (rendering.lightAzimuth * Math.PI) / 180;
-      const dir: [number, number, number] = [
-        Math.cos(el) * Math.cos(az),
-        Math.sin(el),
-        Math.cos(el) * Math.sin(az),
-      ];
-      const gl = makeDirectionalLight(dir, hexToLinearRgb(rendering.lightGlobalColor), rendering.lightGlobalIntensity);
-      gl.castShadows = rendering.shadowCastGlobal;
-      lights.push(gl);
-    }
-    if (rendering.lightFlashOn) {
-      const outer = (rendering.flashConeDeg * Math.PI) / 180;
-      // True camera headlight: positioned exactly at the eye (canvas center) and pointed forward along
-      // the camera's view direction, so it tracks the camera 1:1. No offset, no pull-back.
-      const fl = makeSpotLight(
-        [eye.x, eye.y, eye.z],
-        [fwd[0], fwd[1], fwd[2]], // forward into the scene (camera view direction)
-        hexToLinearRgb(rendering.lightFlashColor),
-        rendering.lightFlashIntensity,
-        { range: extent * rendering.flashRange, innerConeAngle: outer * 0.7, outerConeAngle: outer },
-      );
-      fl.castShadows = rendering.shadowCastFlash;
-      lights.push(fl);
-    }
-    if (rendering.lightStageOn) {
-      const d = extent * 2.2; // in front of the eye along the view axis
-      const k = extent * 1.7; // corner spread
-      const col = hexToLinearRgb(rendering.lightStageColor);
-      const outer = (rendering.stageConeDeg * Math.PI) / 180;
-      const corners: [number, number][] = [
-        [-1, -1],
-        [1, -1],
-        [-1, 1],
-        [1, 1],
-      ];
-      for (const [sx, sy] of corners) {
-        const pos: [number, number, number] = [
-          eye.x + fwd[0] * d + right[0] * k * sx + up[0] * k * sy,
-          eye.y + fwd[1] * d + right[1] * k * sx + up[1] * k * sy,
-          eye.z + fwd[2] * d + right[2] * k * sx + up[2] * k * sy,
-        ];
-        const sl = makeSpotLight(pos, [-pos[0], -pos[1], -pos[2]], col, rendering.lightStageIntensity, {
-          range: extent * rendering.stageRange,
-          innerConeAngle: outer * 0.7,
-          outerConeAngle: outer,
-        });
-        sl.castShadows = rendering.shadowCastStage;
-        lights.push(sl);
-      }
-    }
-    return lights;
-  };
   applyLighting();
 
   const scene = new Scene();
@@ -463,13 +390,6 @@ export async function run(
   let roiRequestInFlight = false; // a brick request is streaming (drives the reset guard + progress bar)
   let roiReqSeq = 0; // monotonic id so a superseded request's finally() can't clobber a newer one
   let prevRoiCam = controls.getState();
-  // ROI brick sizing (UVW [0,1]). The on-screen frustum at the first-hit is only ~10% of XY when
-  // zoomed in — too small a patch. We widen the frustum, extrude into the volume, and pad; if the
-  // box no longer fits L0, chooseBrickRegion drops to L1.
-  const ROI_VIEW_SCALE = 1.75; // NDC corner scale (>1 fetches around the viewport)
-  const ROI_DEPTH_UVW = 0.38; // UVW-length into the volume from the near face along the view
-  const ROI_PAD = 0.35; // extra fraction of the AABB on each side
-  const ROI_MIN_SPAN = 0.18; // minimum UVW span per axis
   const ROI_SETTLE = 0.2; // seconds of camera stillness before (re)streaming
   // Milestone 1: only consult the visibility feedback once the camera has been still long enough for the
   // async vis-bin readback to reflect the current view — using it during motion is what made it thrash.
@@ -535,103 +455,6 @@ export async function run(
     paintRoiProgress();
   });
 
-  const cropIsSet = (): boolean =>
-    cropping.cropMin[0] > 0.001 ||
-    cropping.cropMin[1] > 0.001 ||
-    cropping.cropMin[2] > 0.001 ||
-    cropping.cropMax[0] < 0.999 ||
-    cropping.cropMax[1] < 0.999 ||
-    cropping.cropMax[2] < 0.999;
-
-  // Ray ∩ volume box [-h,h]; returns [tNear, tFar] or null.
-  const intersectRoiBox = (
-    ox: number, oy: number, oz: number, dx: number, dy: number, dz: number,
-    hx: number, hy: number, hz: number,
-  ): [number, number] | null => {
-    const invx = 1 / (dx === 0 ? 1e-20 : dx);
-    const invy = 1 / (dy === 0 ? 1e-20 : dy);
-    const invz = 1 / (dz === 0 ? 1e-20 : dz);
-    let a0 = (-hx - ox) * invx; let a1 = (hx - ox) * invx; if (a0 > a1) [a0, a1] = [a1, a0];
-    let b0 = (-hy - oy) * invy; let b1 = (hy - oy) * invy; if (b0 > b1) [b0, b1] = [b1, b0];
-    let c0 = (-hz - oz) * invz; let c1 = (hz - oz) * invz; if (c0 > c1) [c0, c1] = [c1, c0];
-    const tN = Math.max(a0, b0, c0);
-    const tF = Math.min(a1, b1, c1);
-    if (tN > tF || tF < 0) return null;
-    return [tN, tF];
-  };
-
-  // Ray direction (world, normalized) through NDC (nx, ny) using the current inverse view-proj.
-  const rayDir = (nx: number, ny: number): [number, number, number] => {
-    const nearH = mulMat4Vec4(invViewProj, nx, ny, 0, 1);
-    const farH = mulMat4Vec4(invViewProj, nx, ny, 1, 1);
-    const ax = nearH[0] / nearH[3], ay = nearH[1] / nearH[3], az = nearH[2] / nearH[3];
-    const bx = farH[0] / farH[3], by = farH[1] / farH[3], bz = farH[2] / farH[3];
-    let dx = bx - ax, dy = by - ay, dz = bz - az;
-    const dl = Math.hypot(dx, dy, dz) || 1;
-    return [dx / dl, dy / dl, dz / dl];
-  };
-
-  // Focal-region AABB in UVW [0,1]. Starts at the volume ENTRY along the view (closest to the
-  // camera) and extrudes inward. Probe-centered placement put the near face inside the sample, so
-  // the high-res region started too far from the camera. If the generous box is too big for a finer
-  // level, updateRoi shrinks it. No view-ray hit → no ROI.
-  const focalRoiUvw = ():
-    | { min: [number, number, number]; max: [number, number, number] }
-    | null => {
-    invViewProj.copy(lastViewProj);
-    if (!invViewProj.invert()) return null;
-    const hx = sizeSim.x * 0.5, hy = sizeSim.y * 0.5, hz = sizeSim.z * 0.5;
-    const eye = camera.position;
-    const [ccx, ccy, ccz] = rayDir(0, 0);
-    const hit = intersectRoiBox(eye.x, eye.y, eye.z, ccx, ccy, ccz, hx, hy, hz);
-    if (!hit) return null;
-    const tNear = Math.max(hit[0], 0);
-    const tFar = hit[1];
-    if (tFar < tNear) return null;
-
-    const toU = (val: number, h: number): number => Math.min(1, Math.max(0, (val + h) / (2 * h)));
-    const vu = ccx / (2 * hx), vv = ccy / (2 * hy), vw = ccz / (2 * hz);
-    const vLen = Math.hypot(vu, vv, vw) || 1;
-    const tStart = tNear;
-    const tEnd = Math.min(tFar, tStart + ROI_DEPTH_UVW / vLen);
-    const tMid = (tStart + tEnd) * 0.5;
-    const fx = Math.min(hx, Math.max(-hx, eye.x + ccx * tMid));
-    const fy = Math.min(hy, Math.max(-hy, eye.y + ccy * tMid));
-    const fz = Math.min(hz, Math.max(-hz, eye.z + ccz * tMid));
-
-    let mnu = 1, mnv = 1, mnw = 1;
-    let mxu = 0, mxv = 0, mxw = 0;
-    const add = (x: number, y: number, z: number): void => {
-      const u = toU(x, hx), v = toU(y, hy), w = toU(z, hz);
-      mnu = Math.min(mnu, u); mxu = Math.max(mxu, u);
-      mnv = Math.min(mnv, v); mxv = Math.max(mxv, v);
-      mnw = Math.min(mnw, w); mxw = Math.max(mxw, w);
-    };
-    add(fx, fy, fz);
-    for (const t of [tStart, tMid, tEnd]) {
-      for (const [su, sv] of [[0, 0], [1, 0], [0, 1], [1, 1]] as const) {
-        const [dx, dy, dz] = rayDir((su * 2 - 1) * ROI_VIEW_SCALE, ((1 - sv) * 2 - 1) * ROI_VIEW_SCALE);
-        add(eye.x + dx * t, eye.y + dy * t, eye.z + dz * t);
-      }
-    }
-    const padU = (mxu - mnu) * ROI_PAD, padV = (mxv - mnv) * ROI_PAD, padW = (mxw - mnw) * ROI_PAD;
-    mnu -= padU; mxu += padU;
-    mnv -= padV; mxv += padV;
-    mnw -= padW; mxw += padW;
-    const fu = toU(fx, hx), fv = toU(fy, hy), fw = toU(fz, hz);
-    const grow = (mn: number, mx: number, f: number): [number, number] => {
-      if (mx - mn >= ROI_MIN_SPAN) return [mn, mx];
-      return [f - ROI_MIN_SPAN * 0.5, f + ROI_MIN_SPAN * 0.5];
-    };
-    [mnu, mxu] = grow(mnu, mxu, fu);
-    [mnv, mxv] = grow(mnv, mxv, fv);
-    [mnw, mxw] = grow(mnw, mxw, fw);
-    return {
-      min: [Math.max(0, mnu), Math.max(0, mnv), Math.max(0, mnw)],
-      max: [Math.min(1, mxu), Math.min(1, mxv), Math.min(1, mxw)],
-    };
-  };
-
   // Per-frame ROI update: derive the region (crop override, else frustum when zoomed in), pick the
   // finest fitting level, and (debounced) request the brick; hysteresis + fade drive smooth zoom-out.
   const updateRoi = (dt: number): void => {
@@ -641,11 +464,11 @@ export async function run(
     let want = 0; // brick blend target this frame (a loaded brick is on screen)
     let desired = false; // we intend to keep a high-res brick this frame (a finer region applies)
     if (roiEnabled) {
-      const cropSet = cropIsSet();
+      const cropSet = cropIsSet(cropping.cropMin, cropping.cropMax);
       // Crop box overrides the focal box; otherwise use the depth-bounded frustum slab.
       const roi: { min: [number, number, number]; max: [number, number, number] } | null = cropSet
         ? { min: [cropping.cropMin[0], cropping.cropMin[1], cropping.cropMin[2]], max: [cropping.cropMax[0], cropping.cropMax[1], cropping.cropMax[2]] }
-        : focalRoiUvw();
+        : focalRoiUvw(invViewProj, lastViewProj, sizeSim, camera.position);
       if (roi) {
         const vis = volumeRenderer.visibility;
         let visHint: { min: [number, number, number]; max: [number, number, number] } | undefined;
@@ -934,45 +757,18 @@ export async function run(
     volumeRenderer.setVisibilityFeedback(roiEnabled);
   };
 
-  /** Frame camera looking along the active slice normal (itk-vtk style). */
-  const frameSliceCamera = (): void => {
-    const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
-    const px = (cropping.sliceX - 0.5) * sizeSim.x;
-    const py = (cropping.sliceY - 0.5) * sizeSim.y;
-    const pz = (cropping.sliceZ - 0.5) * sizeSim.z;
-    const dist = extent * 1.65;
-    if (rendering.viewMode === "xPlane") {
-      controls.target.set(px, 0, 0);
-      camera.position.set(px + dist, py * 0.05, pz * 0.05);
-    } else if (rendering.viewMode === "yPlane") {
-      controls.target.set(0, py, 0);
-      camera.position.set(px * 0.05, py + dist, pz * 0.05);
-    } else if (rendering.viewMode === "zPlane") {
-      controls.target.set(0, 0, pz);
-      camera.position.set(px * 0.05, py * 0.05, pz + dist);
-    } else {
-      controls.target.set(0, 0, 0);
-      camera.position.set(extent * 1.2, extent * 0.85, extent * 1.2);
-    }
-    controls.syncFromNode();
-    controls.update(0);
-  };
+  const cameraCtx: CameraContext = { controls, camera, sizeSim };
 
-  const enterViewMode = (mode: VolumeViewMode, reframe = true): void => {
-    rendering.viewMode = mode;
-    if (mode === "xPlane") {
-      cropping.enX = true;
-      cropping.showPlanes = true;
-    } else if (mode === "yPlane") {
-      cropping.enY = true;
-      cropping.showPlanes = true;
-    } else if (mode === "zPlane") {
-      cropping.enZ = true;
-      cropping.showPlanes = true;
-    }
-    applyRender();
-    if (reframe) frameSliceCamera();
-  };
+  /** Frame camera looking along the active slice normal (itk-vtk style). */
+  const frameSliceCamera = (): void =>
+    frameSliceCameraPure(cameraCtx, rendering.viewMode, {
+      x: cropping.sliceX,
+      y: cropping.sliceY,
+      z: cropping.sliceZ,
+    });
+
+  const enterViewMode = (mode: VolumeViewMode, reframe = true): void =>
+    enterViewModePure(cameraCtx, mode, rendering, cropping, applyRender, reframe);
 
   // Switch view mode (and, for the plane modes, the slice it enables) then notify listeners — view
   // mode carries both a render mode and slice enables/overlays, so both change events fire together.
@@ -987,21 +783,10 @@ export async function run(
     emitCropping();
   };
 
-  const activeSlice = (): { axis: "x" | "y" | "z"; value: number } | null => {
-    if (rendering.viewMode === "xPlane") return { axis: "x", value: cropping.sliceX };
-    if (rendering.viewMode === "yPlane") return { axis: "y", value: cropping.sliceY };
-    if (rendering.viewMode === "zPlane") return { axis: "z", value: cropping.sliceZ };
-    return null;
-  };
+  const activeSlice = (): { axis: "x" | "y" | "z"; value: number } | null =>
+    activeSlicePure(rendering, cropping);
 
-  const setActiveSlice = (v: number): void => {
-    const clamped = Math.min(1, Math.max(0, v));
-    if (rendering.viewMode === "xPlane") cropping.sliceX = clamped;
-    else if (rendering.viewMode === "yPlane") cropping.sliceY = clamped;
-    else if (rendering.viewMode === "zPlane") cropping.sliceZ = clamped;
-    else return;
-    applyRender();
-  };
+  const setActiveSlice = (v: number): void => setActiveSlicePure(v, rendering, cropping, applyRender);
 
   const sliceWorldLabel = (axis: "x" | "y" | "z", t: number): string => {
     const u = lengthUnit();
@@ -1137,23 +922,7 @@ export async function run(
         lastPick = undefined;
         return;
       }
-      const nearH = mulMat4Vec4(invViewProj, u, v, 0, 1);
-      const farH = mulMat4Vec4(invViewProj, u, v, 1, 1);
-      const nw = 1 / (nearH[3] || 1e-12);
-      const fw = 1 / (farH[3] || 1e-12);
-      const nx = nearH[0]! * nw;
-      const ny = nearH[1]! * nw;
-      const nz = nearH[2]! * nw;
-      const fx = farH[0]! * fw;
-      const fy = farH[1]! * fw;
-      const fz = farH[2]! * fw;
-      let dx = fx - nx;
-      let dy = fy - ny;
-      let dz = fz - nz;
-      const len = Math.hypot(dx, dy, dz) || 1;
-      dx /= len;
-      dy /= len;
-      dz /= len;
+      const [dx, dy, dz] = rayDir(invViewProj, u, v);
       const eye = camera.position;
       const feature = await pickConnectedFeature(source, {
         level,
@@ -1194,240 +963,32 @@ export async function run(
 
     const [dx, dy, dz] = source.dimensionsAt(level);
     const unit = lengthUnit();
-    const [qx, qy, qz] = physicalSizeQuantities(source, level);
-    const vx = new units.Quantity(source.spacingAt(level)[0]!, units.LENGTH).to(unit);
 
-    const lodBtns = levels
-      .map((lv) => {
-        const [lx, ly, lz] = source.dimensionsAt(lv);
-        return segBtn("data-level", String(lv), `L${lv} ${lx}×${ly}×${lz}`, lv === level, loading);
-      })
-      .join("");
+    const dataBody = dataPanelBody({ source, levels, level, loading, maxTex, unit });
+    const tfBody = tfPanelBody(rendering);
+    const renderBody = renderPanelBody(rendering);
 
-    const blocked: string[] = [];
-    for (let lv = 0; lv < source.levelCount; lv++) {
-      if (levels.includes(lv)) continue;
-      const [lx, ly, lz] = source.dimensionsAt(lv);
-      if (lx > maxTex || ly > maxTex || lz > maxTex) {
-        blocked.push(`L${lv} needs ${Math.max(lx, ly, lz)}³ (GPU max ${maxTex})`);
-      }
-    }
-
-    // Data section
-    const dataBody = [
-      `<div class="whud__hint">Resolution (GPU max ${maxTex}³)</div>`,
-      `<div class="whud__seg">${lodBtns}</div>`,
-      `<div class="whud__hint">voxel ${vx.toFixed(3)} ${unit.symbol} · ${qx.to(unit).toFixed(0)}×${qy.to(unit).toFixed(0)}×${qz.to(unit).toFixed(0)} ${unit.symbol}</div>`,
-      blocked.length ? `<div class="whud__hint">${blocked.join(" · ")}</div>` : "",
-    ].join("");
-
-    // TF section
-    const maps = colorMapNames()
-      .map((m) => `<option value="${m}" ${m === rendering.colorMap ? "selected" : ""}>${m}</option>`)
-      .join("");
-    const tfBody = [
-      `<label class="whud__row" style="font-size:11px">Colormap <select id="cmap" class="whud__select">${maps}</select></label>`,
-      slider("opacityScale", "Opacity ×", rendering.opacityScale, 0.05, 2, 0.01),
-      `<div class="whud__hint">Opacity curve (drag · dbl-click add) · volume histogram behind</div>`,
-      `<canvas id="opacity-curve" style="width:100%;height:84px;display:block;touch-action:none;cursor:crosshair"></canvas>`,
-      // Dual-thumb color-range slider under the graph — both heads set [colorLo, colorHi] together.
-      rangeSlider("color", "Color range", rendering.colorLo, rendering.colorHi, 0.005),
-      // Auto contrast: percentile auto-window + global contrast-limited equalization.
-      `<div class="whud__row" style="gap:8px;margin-top:4px">` +
-        `<button type="button" data-act="autoContrast" class="whud__seg-btn">Auto</button>` +
-        `<label class="whud__check" style="margin:0"><input type="checkbox" data-chk="equalizeOn" ${rendering.equalizeOn ? "checked" : ""}/> Equalize</label>` +
-        `</div>`,
-      slider("equalizeClip", "Clip limit", rendering.equalizeClip, 1, 8, 0.5),
-    ].join("");
-
-    // Render section
-    const blends: VolumeBlendMode[] = ["composite", "mip", "minip", "average"];
-    const blendBtns = blends
-      .map((b) => segBtn("data-blend", b, b, rendering.blendMode === b))
-      .join("");
-    const renderBody = [
-      `<div class="whud__seg">${blendBtns}</div>`,
-      `<div class="whud__hint" style="margin-top:6px">Shader config</div>`,
-      `<div class="whud__seg">${(["baseline", "fast", "quality"] as const)
-        .map((c) => segBtn("data-shader", c, c, rendering.shaderConfig === c))
-        .join("")}</div>`,
-      `<div class="whud__hint">baseline = plain march. fast/quality = empty-space leap + tiled draw (faster on data with air margins). quality adds cinematic shading (multi-scatter / ambient) — arriving with M7; identical to fast until then.</div>`,
-      `<button type="button" data-act="exportPng" class="whud__seg-btn" style="margin-top:6px">Export PNG (stamped)</button>`,
-      slider("sampleDist", "Sample dist", rendering.sampleDist, 0.35, 3, 0.05),
-      slider("density", "Density", rendering.densityScale, 0.2, 4, 0.05),
-      slider("exposure", "Exposure", rendering.exposure, 0.2, 4, 0.05),
-      slider("gradOp", "Grad opacity", rendering.gradOpacity, 0, 1, 0.01),
-      slider("gradScale", "Grad scale", rendering.gradScale, 0.02, 0.5, 0.01),
-      slider("lighting", "Lighting", rendering.lighting, 0, 1, 0.01),
-    ].join("");
-
-    // Slices section
-    const modes: [VolumeViewMode, string][] = [
-      ["volume", "3D"],
-      ["xPlane", "X (sagittal)"],
-      ["yPlane", "Y (coronal)"],
-      ["zPlane", "Z (axial)"],
-    ];
-    const modeBtns = modes
-      .map(([m, lab]) => segBtn("data-view", m, lab, rendering.viewMode === m))
-      .join("");
     const active = activeSlice();
     const [nx, ny, nz] = source.dimensionsAt(level);
-    let primary = "";
-    if (active) {
-      const n = active.axis === "x" ? nx : active.axis === "y" ? ny : nz;
-      const idx = Math.min(n - 1, Math.floor(active.value * n));
-      primary = [
-        `<div style="font-size:12px;margin:8px 0 4px;font-weight:600">Slice along ${active.axis.toUpperCase()}</div>`,
-        `<div class="whud__hint" data-slice-info>${sliceWorldLabel(active.axis, active.value)} · index ${idx}/${n - 1}</div>`,
-        slider("activeSlice", "Position", active.value, 0, 1, 1 / Math.max(n, 2)),
-        `<div class="whud__hint">Scroll wheel = scrub slice · Ctrl+wheel = zoom · middle/Alt-drag = pan · F = reframe</div>`,
-      ].join("");
-    } else {
-      primary = `<div class="whud__hint">Pick an axis view, then scrub with the slider or mouse wheel.</div>`;
-    }
-    const slicesBody = [
-      `<div class="whud__seg">${modeBtns}</div>`,
-      primary,
-      `<details style="margin-top:8px"><summary style="cursor:pointer;color:var(--whud-muted);font-size:11px">Overlays &amp; all axes</summary>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="showPlanes" ${cropping.showPlanes ? "checked" : ""}/> Show plane overlays in 3D</label>`,
-      `<div class="whud__row">`,
-      `<label class="whud__check"><input type="checkbox" data-chk="enX" ${cropping.enX ? "checked" : ""}/> X</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="enY" ${cropping.enY ? "checked" : ""}/> Y</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="enZ" ${cropping.enZ ? "checked" : ""}/> Z</label>`,
-      `</div>`,
-      slider("sliceX", "X", cropping.sliceX, 0, 1, 0.005),
-      slider("sliceY", "Y", cropping.sliceY, 0, 1, 0.005),
-      slider("sliceZ", "Z", cropping.sliceZ, 0, 1, 0.005),
-      `<button type="button" data-act="frameSlice" class="whud__seg-btn" style="margin-top:6px">Reframe to slice</button>`,
-      `</details>`,
-    ].join("");
+    const axisVoxelCount = active ? (active.axis === "x" ? nx : active.axis === "y" ? ny : nz) : 0;
+    const slicesBody = slicesPanelBody({
+      rendering,
+      cropping,
+      active,
+      sliceWorldLabel: active ? sliceWorldLabel(active.axis, active.value) : "",
+      axisVoxelCount,
+    });
 
-    // Crop section — one dual-thumb [min, max] slider per axis (ROI in UVW 0–1).
-    const cropBody = [
-      `<div class="whud__hint">ROI crop (UVW 0–1)</div>`,
-      rangeSlider("cropX", "X", cropping.cropMin[0], cropping.cropMax[0], 0.01),
-      rangeSlider("cropY", "Y", cropping.cropMin[1], cropping.cropMax[1], 0.01),
-      rangeSlider("cropZ", "Z", cropping.cropMin[2], cropping.cropMax[2], 0.01),
-      `<button type="button" data-act="resetCrop" class="whud__seg-btn" style="margin-top:6px">Reset crop</button>`,
-    ].join("");
+    const cropBody = cropPanelBody(cropping);
+    const measureBody = measurePanelBody({ rendering, pickMode, pickStatus, lastPick, u3: um3() });
+    const postfxBody = postfxPanelBody(rendering);
+    const lightingBody = lightingPanelBody({ rendering, roiEnabled, roiProgress });
 
-    // Measure section
-    const u3 = um3();
-    const detail = lastPick
-      ? [
-          `<div style="margin-top:8px;font-size:11px;line-height:1.45">`,
-          `<div>Seed voxel <b>${lastPick.seedVoxel.join(", ")}</b> · density ${lastPick.seedDensity.toFixed(2)}</div>`,
-          `<div>Threshold ≥ <b>${lastPick.threshold.toFixed(2)}</b> · <b>${lastPick.voxelCount.toLocaleString()}</b> voxels</div>`,
-          `<div>Volume <b>${lastPick.volume.to(u3).toExponential(3)}</b> ${u3.symbol}</div>`,
-          `<div style="color:var(--whud-muted)">${lastPick.volume.to(units.milliliter).toExponential(3)} mL · mean ${lastPick.meanDensity.toFixed(2)}</div>`,
-          `</div>`,
-        ].join("")
-      : "";
-    const measureBody = [
-      `<label class="whud__check"><input type="checkbox" data-chk="measurePlaneOn" ${rendering.measurePlaneOn ? "checked" : ""}/> Measure plane (camera-linked ruler)</label>`,
-      slider("measureDepth", "Plane depth (front→back)", rendering.measureDepth, 0, 1, 0.01),
-      slider("measureGray", "Plane gray", rendering.measurePlaneGray, 0, 1, 0.02),
-      slider("measureAlpha", "Plane opacity", rendering.measurePlaneAlpha, 0, 1, 0.02),
-      `<div class="whud__hint">A grey sheet that sweeps from the volume's front face (0) to its back face (1) along the view axis, tracking zoom; the volume in front of it occludes it and it dims volume behind, so you can read depth. Rulers calibrate to this plane; off = exact at the volume center.</div>`,
-      `<div class="whud__hint" style="margin-top:8px">Click a structure to grow a connected component and measure its physical volume (current LOD).</div>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="pickMode" ${pickMode ? "checked" : ""}/> Pick mode (or Ctrl+click)</label>`,
-      `<div class="whud__row"><button type="button" data-act="clearPick" class="whud__seg-btn">Clear selection</button></div>`,
-      pickStatus ? `<div style="margin-top:8px;font-size:11px">${pickStatus}</div>` : "",
-      detail,
-      `<div class="whud__hint">Uses ray pick through the volume + 6-connected flood fill. Crop snaps to the feature. Prefer L2+ for speed on huge volumes.</div>`,
-    ].join("");
-
-    // Post FX section — tonemap (always on) + toggle-gated bloom / FXAA / sharpen / vignette.
-    const tmOps: ToneMapOperator[] = ["aces", "reinhard", "reinhard-extended"];
-    const tmOptions = tmOps
-      .map((o) => `<option value="${o}" ${o === rendering.fxOperator ? "selected" : ""}>${o}</option>`)
-      .join("");
-    const postfxBody = [
-      `<label class="whud__row" style="font-size:11px">Tonemap <select id="fxop" class="whud__select">${tmOptions}</select></label>`,
-      slider("fxExposure", "Exposure (stops)", rendering.fxExposure, -4, 4, 0.05),
-      `<label class="whud__check"><input type="checkbox" data-chk="fxBloom" ${rendering.fxBloom ? "checked" : ""}/> Bloom</label>`,
-      slider("fxBloomThreshold", "Bloom threshold", rendering.fxBloomThreshold, 0, 3, 0.05),
-      slider("fxBloomIntensity", "Bloom intensity", rendering.fxBloomIntensity, 0, 2, 0.05),
-      `<label class="whud__check"><input type="checkbox" data-chk="fxFxaa" ${rendering.fxFxaa ? "checked" : ""}/> FXAA (anti-alias edges)</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="fxSharpen" ${rendering.fxSharpen ? "checked" : ""}/> Sharpen</label>`,
-      slider("fxSharpenAmount", "Sharpen amount", rendering.fxSharpenAmount, 0, 2, 0.05),
-      `<label class="whud__check"><input type="checkbox" data-chk="fxVignette" ${rendering.fxVignette ? "checked" : ""}/> Vignette</label>`,
-      slider("fxVignetteAmount", "Vignette amount", rendering.fxVignetteAmount, 0, 1, 0.02),
-    ].join("");
-
-    // Lighting section — three modes (global / camera flashlight / 4-corner stage) each with color +
-    // intensity, shared shading params, volumetric shadows, ambient occlusion, and a half-res lever.
-    const lightingBody = [
-      `<label class="whud__check"><input type="checkbox" data-chk="lightGlobalOn" ${rendering.lightGlobalOn ? "checked" : ""}/> Global directional</label>`,
-      colorRow("lightGlobalColor", "Color", rendering.lightGlobalColor),
-      slider("lightGlobalIntensity", "Intensity", rendering.lightGlobalIntensity, 0, 4, 0.05),
-      slider("lightAzimuth", "Azimuth°", rendering.lightAzimuth, 0, 360, 1),
-      slider("lightElevation", "Elevation°", rendering.lightElevation, -90, 90, 1),
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightFlashOn" ${rendering.lightFlashOn ? "checked" : ""}/> Camera flashlight</label>`,
-      colorRow("lightFlashColor", "Color", rendering.lightFlashColor),
-      slider("lightFlashIntensity", "Intensity", rendering.lightFlashIntensity, 0, 4, 0.05),
-      slider("flashConeDeg", "Cone°", rendering.flashConeDeg, 10, 89, 1),
-      slider("flashRange", "Range ×ext", rendering.flashRange, 1, 20, 0.5),
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightStageOn" ${rendering.lightStageOn ? "checked" : ""}/> Stage lights (4 corners)</label>`,
-      colorRow("lightStageColor", "Color", rendering.lightStageColor),
-      slider("lightStageIntensity", "Intensity", rendering.lightStageIntensity, 0, 4, 0.05),
-      slider("stageConeDeg", "Cone°", rendering.stageConeDeg, 10, 89, 1),
-      slider("stageRange", "Range ×ext", rendering.stageRange, 1, 20, 0.5),
-      `<div class="whud__hint" style="margin-top:6px">Shading</div>`,
-      slider("lightAmbient", "Ambient", rendering.lightAmbient, 0, 1, 0.01),
-      slider("lightSpecular", "Specular", rendering.lightSpecular, 0, 2, 0.05),
-      slider("lightRoughness", "Roughness", rendering.lightRoughness, 0, 1, 0.02),
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="shadowOn" ${rendering.shadowOn ? "checked" : ""}/> Shadows</label>`,
-      slider("shadowQuality", "Shadow steps", rendering.shadowQuality, 4, 64, 1),
-      slider("shadowStrength", "Shadow strength", rendering.shadowStrength, 0, 1, 0.02),
-      slider("shadowSoftness", "Shadow softness", rendering.shadowSoftness, 0, 1, 0.02),
-      `<div class="whud__hint" style="margin-top:4px">Casters (fewer = faster)</div>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastGlobal" ${rendering.shadowCastGlobal ? "checked" : ""}/> Global</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastFlash" ${rendering.shadowCastFlash ? "checked" : ""}/> Flashlight</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastStage" ${rendering.shadowCastStage ? "checked" : ""}/> Stage</label>`,
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="aoOn" ${rendering.aoOn ? "checked" : ""}/> Ambient occlusion</label>`,
-      slider("aoRadius", "AO radius", rendering.aoRadius, 0.01, 0.3, 0.01),
-      slider("aoIntensity", "AO intensity", rendering.aoIntensity, 0, 1, 0.02),
-      slider("aoSamples", "AO samples", rendering.aoSamples, 1, 16, 1),
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${rendering.halfRes ? "checked" : ""}/> Half resolution</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="temporalAA" ${rendering.temporalAA ? "checked" : ""}/> Temporal AA (accumulate when still)</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="roiEnabled" ${roiEnabled ? "checked" : ""}/> High-res ROI (stream visible detail)</label>`,
-      `<div id="roiProgressWrap" style="margin-top:6px;${roiProgress ? "" : "display:none"}">` +
-        `<div style="display:flex;justify-content:space-between;font-size:10px;opacity:0.85">` +
-        `<span>Streaming ROI…</span>` +
-        `<span id="roiProgressLabel">${roiProgress ? `${roiProgress.loaded}/${roiProgress.total} chunks` : ""}</span>` +
-        `</div>` +
-        `<div style="height:4px;margin-top:2px;background:rgba(255,255,255,0.15);border-radius:2px;overflow:hidden">` +
-        `<div id="roiProgressFill" style="height:100%;background:#5b9dd9;transition:width 0.1s linear;width:${
-          roiProgress && roiProgress.total ? Math.round((roiProgress.loaded / roiProgress.total) * 100) : 0
-        }%"></div>` +
-        `</div>` +
-        `</div>`,
-      `<div class="whud__hint">Shadows + AO cast secondary rays per sample. Enable half-res on large volumes to keep it interactive.</div>`,
-    ].join("");
-
-    // Presets section — save/apply/delete named looks. Keep the selection valid across HUD rebuilds.
+    // Presets section — sanitize the selection against the current preset list before rendering, so
+    // it stays valid across preset add/remove and HUD rebuilds.
     const presetNames = listPresetNames();
-    if (selectedPreset && !presetNames.includes(selectedPreset)) selectedPreset = "";
-    if (!selectedPreset && presetNames.length) selectedPreset = presetNames[0]!;
-    const presetOptions = presetNames.length
-      ? presetNames
-          .map(
-            (n) =>
-              `<option value="${escAttr(n)}" ${n === selectedPreset ? "selected" : ""}>${escAttr(n)}</option>`,
-          )
-          .join("")
-      : `<option value="">(no presets saved)</option>`;
-    const presetsBody = [
-      `<label class="whud__row" style="font-size:11px">Preset <select id="presetSelect" class="whud__select">${presetOptions}</select></label>`,
-      `<div class="whud__row" style="gap:6px;margin-top:6px">` +
-        `<button type="button" data-act="applyPreset" class="whud__seg-btn"${presetNames.length ? "" : " disabled"}>Apply</button>` +
-        `<button type="button" data-act="savePreset" class="whud__seg-btn">Save as…</button>` +
-        `<button type="button" data-act="deletePreset" class="whud__seg-btn"${presetNames.length ? "" : " disabled"}>Delete</button>` +
-        `</div>`,
-      `<div class="whud__hint">Saves the current look (colormap, opacity, density/exposure, FX, lighting, measure) to this browser — shared across samples and sessions. Camera and cropping are not included. Your latest look is auto-applied to new samples.</div>`,
-    ].join("");
+    selectedPreset = sanitizeSelectedPreset(selectedPreset, presetNames);
+    const presetsBody = presetsPanelBody(presetNames, selectedPreset);
 
     ui.innerHTML = [
       `<div class="whud__header">` +
@@ -2163,6 +1724,7 @@ export async function run(
     );
     volumeRenderer.setLights(
       buildFrameLights(
+        rendering,
         camera.position,
         [wm[0]! / rL, wm[1]! / rL, wm[2]! / rL],
         [wm[4]! / uL, wm[5]! / uL, wm[6]! / uL],
