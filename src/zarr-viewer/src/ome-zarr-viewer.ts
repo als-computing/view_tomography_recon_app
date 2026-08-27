@@ -13,18 +13,13 @@ import {
   physicalSizeSim,
   volumeMaxExtentMeters,
   listUploadableLevels,
-  pickConnectedFeature,
   type VolumeSource,
   type Store,
-  type PickedFeature,
 } from "@zarr-viewer/io";
 import {
   createContext,
   VolumeLoader,
   type VolumeLevelResult,
-  BrickLoader,
-  chooseBrickRegion,
-  type BrickResult,
   VolumeRenderer,
   composeTransferFunction,
   OpacityCurveEditor,
@@ -32,9 +27,6 @@ import {
   type VolumeBlendMode,
   type VolumeViewMode,
   type ShaderConfigName,
-  rankVisibilityBins,
-  visBinUvwBox,
-  stampCanvasPng,
 } from "@zarr-viewer/render";
 import { Scene, Node } from "@zarr-viewer/scene";
 import { OrbitControls } from "@zarr-viewer/controls";
@@ -68,7 +60,9 @@ import {
 import { zarrUrlFromQuery, pickZarrStore } from "./viewer/util.js";
 import { autoWindow, buildEqualizeRemap, rebinThroughRemap } from "./viewer/histogram.js";
 import { type PanelId, section, fmt } from "./viewer/ui/html.js";
-import { cropIsSet, focalRoiUvw, rayDir } from "./viewer/volume/roi-geometry.js";
+import { ResidencyController } from "./viewer/volume/ResidencyController.js";
+import { PickingController } from "./viewer/interaction/PickingController.js";
+import { bindHudEvents, type HudEventContext } from "./viewer/ui/hudEvents.js";
 import { buildFrameLights } from "./viewer/rendering/lighting.js";
 import {
   computeCameraBasis,
@@ -84,6 +78,7 @@ import {
   activeSlice as activeSlicePure,
   setActiveSlice as setActiveSlicePure,
 } from "./viewer/camera/sliceView.js";
+import { camsEqual } from "./viewer/camera/compare.js";
 import { dataPanelBody } from "./viewer/ui/panels/dataPanel.js";
 import { tfPanelBody } from "./viewer/ui/panels/tfPanel.js";
 import { renderPanelBody } from "./viewer/ui/panels/renderPanel.js";
@@ -162,10 +157,6 @@ export async function run(
   // under-samples it — the empty-space skip then steps right over thin fine structures and the region
   // looks sparse/blank. While a brick is up we march at its (floored) Nyquist step instead.
   let brickStep: number | undefined;
-  let pickMode = false;
-  let measuring = false;
-  let lastPick: PickedFeature | undefined;
-  let pickStatus = "";
   const invViewProj = new Mat4();
   const lastViewProj = new Mat4();
   // Scratch for the TAAU sub-pixel-jittered projection used only for the volume render (the un-jittered
@@ -342,7 +333,7 @@ export async function run(
       e instanceof PointerEvent &&
       e.type === "pointerdown" &&
       e.button === 0 &&
-      (pickMode || e.ctrlKey || e.metaKey)
+      (picking.pickMode || e.ctrlKey || e.metaKey)
     ) {
       return false;
     }
@@ -372,21 +363,6 @@ export async function run(
   let targetLevel = level;
   let frameExtent = 1;
 
-  // High-res ROI brick: stream + composite a fine sub-volume over the coarse base when zoomed in (or a
-  // crop ROI is set), and fade it out / discard on zoom-out (see BrickLoader + the shader composite).
-  const brickLoader = new BrickLoader(ctx.device, {
-    supportsFloat32Filtering: ctx.supportsFloat32Filtering,
-  });
-  session.onDispose(() => brickLoader.dispose());
-  let roiEnabled = false;
-  let brickBlendCurrent = 0;
-  let brickBlendTarget = 0;
-  let brickLevel: number | undefined;
-  let lastRoiKey = "";
-  let lastRegion:
-    | { level: number; voxelMin: [number, number, number]; voxelMax: [number, number, number] }
-    | null = null;
-  let roiIdle = 0;
   // Adaptive sampling: while the camera moves, coarsen the ray step (≥ NAV_SAMPLE_DIST) for a smooth
   // framerate, then ease back to the configured `sampleDist` once settled. `navSampleDist` is the
   // eased, currently-applied multiplier.
@@ -394,244 +370,54 @@ export async function run(
   const NAV_SETTLE = 0.15; // seconds of camera stillness before refining back to the configured value
   let navSampleDist = 1;
   let taauPrevSettled = false; // tracks the moving↔settled edge so TAAU reseeds fine detail on settle
-  let roiRequestInFlight = false; // a brick request is streaming (drives the reset guard + progress bar)
-  let roiReqSeq = 0; // monotonic id so a superseded request's finally() can't clobber a newer one
-  let prevRoiCam = controls.getState();
-  const ROI_SETTLE = 0.2; // seconds of camera stillness before (re)streaming
-  // Milestone 1: only consult the visibility feedback once the camera has been still long enough for the
-  // async vis-bin readback to reflect the current view — using it during motion is what made it thrash.
-  const ROI_HINT_SETTLE = 0.45;
 
-  // ROI stream progress for the HUD bar. Updated per chunk; the bar's DOM is patched directly (rAF-
-  // throttled) so per-chunk progress never triggers a full HUD rebuild.
-  let roiProgress: { loaded: number; total: number } | null = null;
+  // High-res ROI brick: stream + composite a fine sub-volume over the coarse base when zoomed in (or a
+  // crop ROI is set), and fade it out / discard on zoom-out. ROI stream progress is patched directly
+  // into the HUD DOM (rAF-throttled) so per-chunk progress never triggers a full HUD rebuild.
   let roiProgressPaintQueued = false;
-  const paintRoiProgress = (): void => {
-    if (roiProgressPaintQueued) return;
-    roiProgressPaintQueued = true;
-    requestAnimationFrame(() => {
-      roiProgressPaintQueued = false;
-      const wrap = ui.querySelector<HTMLElement>("#roiProgressWrap");
-      if (!wrap) return;
-      if (!roiProgress) {
-        wrap.style.display = "none";
-        return;
-      }
-      wrap.style.display = "";
-      const pct = roiProgress.total ? Math.round((roiProgress.loaded / roiProgress.total) * 100) : 0;
-      const fill = ui.querySelector<HTMLElement>("#roiProgressFill");
-      const label = ui.querySelector<HTMLElement>("#roiProgressLabel");
-      if (fill) fill.style.width = `${pct}%`;
-      if (label) label.textContent = `${roiProgress.loaded}/${roiProgress.total} chunks`;
-    });
-  };
-
-  brickLoader.onBrick((b: BrickResult) => {
-    volumeRenderer.setBrick(b.texture, b.worldMin, b.worldMax);
-    brickLevel = b.level;
-    // March at the brick's voxel size (floored so the step count stays well under maxSteps and the ray
-    // still reaches the far face) instead of the coarse level's — otherwise the fine brick is
-    // under-sampled and looks sparse/blank when zoomed in.
-    const [bsx, bsy, bsz] = source.spacingAt(b.level);
-    brickStep = Math.max(
-      Math.max(
-        units.toSim(new units.Quantity(bsx, units.LENGTH), sim),
-        units.toSim(new units.Quantity(bsy, units.LENGTH), sim),
-        units.toSim(new units.Quantity(bsz, units.LENGTH), sim),
-      ) * 0.55,
-      frameExtent / 2000,
-      // Perf cap: never shrink the GLOBAL step more than ~2.9× vs coarse (the fine step is marched
-      // across the whole ray, so an unbounded fine step explodes the step count).
-      baseStep * 0.35,
-    );
-    applyRender();
-    brickBlendTarget = 1;
-    renderUi();
-  });
-  brickLoader.onClear(() => {
-    volumeRenderer.setBrick(null);
-    brickLevel = undefined;
-    brickStep = undefined;
-    applyRender();
-    roiProgress = null;
-    paintRoiProgress();
-    renderUi();
-  });
-  brickLoader.onProgress((loaded, total) => {
-    roiProgress = { loaded, total };
-    paintRoiProgress();
-  });
-
-  // Per-frame ROI update: derive the region (crop override, else frustum when zoomed in), pick the
-  // finest fitting level, and (debounced) request the brick; hysteresis + fade drive smooth zoom-out.
-  const updateRoi = (dt: number): void => {
-    const cs = controls.getState();
-    if (!camsEqual(cs, prevRoiCam)) { roiIdle = 0; prevRoiCam = cs; } else { roiIdle += dt; }
-
-    let want = 0; // brick blend target this frame (a loaded brick is on screen)
-    let desired = false; // we intend to keep a high-res brick this frame (a finer region applies)
-    if (roiEnabled) {
-      const cropSet = cropIsSet(cropping.cropMin, cropping.cropMax);
-      // Crop box overrides the focal box; otherwise use the depth-bounded frustum slab.
-      const roi: { min: [number, number, number]; max: [number, number, number] } | null = cropSet
-        ? { min: [cropping.cropMin[0], cropping.cropMin[1], cropping.cropMin[2]], max: [cropping.cropMax[0], cropping.cropMax[1], cropping.cropMax[2]] }
-        : focalRoiUvw(invViewProj, lastViewProj, sizeSim, camera.position);
-      if (roi) {
-        const vis = volumeRenderer.visibility;
-        let visHint: { min: [number, number, number]; max: [number, number, number] } | undefined;
-        if (roiEnabled && vis.enabled && roiIdle >= ROI_HINT_SETTLE) {
-          const ranked = rankVisibilityBins(vis.lastQuantized, vis.grid, {
-            levelCount: source.levelCount,
-            boxExtent: Math.max(sizeSim.x, sizeSim.y, sizeSim.z),
-            eye: [camera.position.x, camera.position.y, camera.position.z],
-            boxHalf: [sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5],
-            residentLevelOf: (x, y, z) => {
-              const box = visBinUvwBox(x, y, z, vis.grid);
-              const cx = (box.min[0] + box.max[0]) * 0.5;
-              const cy = (box.min[1] + box.max[1]) * 0.5;
-              const cz = (box.min[2] + box.max[2]) * 0.5;
-              const brick = brickLoader.currentBrick;
-              if (brick) {
-                const wx = cx * sizeSim.x - sizeSim.x * 0.5;
-                const wy = cy * sizeSim.y - sizeSim.y * 0.5;
-                const wz = cz * sizeSim.z - sizeSim.z * 0.5;
-                if (
-                  wx >= brick.worldMin[0] && wx <= brick.worldMax[0] &&
-                  wy >= brick.worldMin[1] && wy <= brick.worldMax[1] &&
-                  wz >= brick.worldMin[2] && wz <= brick.worldMax[2]
-                ) {
-                  return brick.level;
-                }
-              }
-              return level;
-            },
-          });
-          const top = ranked[0];
-          if (top && top.priority > 0) {
-            const box = visBinUvwBox(top.x, top.y, top.z, vis.grid);
-            const pad = 0.05;
-            visHint = {
-              min: [
-                Math.max(0, box.min[0] - pad),
-                Math.max(0, box.min[1] - pad),
-                Math.max(0, box.min[2] - pad),
-              ],
-              max: [
-                Math.min(1, box.max[0] + pad),
-                Math.min(1, box.max[1] + pad),
-                Math.min(1, box.max[2] + pad),
-              ],
-            };
-          }
+  const residency = new ResidencyController({
+    device: ctx.device,
+    supportsFloat32Filtering: ctx.supportsFloat32Filtering,
+    getSource: () => source,
+    sizeSim,
+    getLevel: () => level,
+    getFrameExtent: () => frameExtent,
+    getBaseStep: () => baseStep,
+    setBrickStep: (step) => {
+      brickStep = step;
+    },
+    maxTex,
+    camera,
+    controls,
+    cropping,
+    volumeRenderer,
+    invViewProj,
+    lastViewProj,
+    sim,
+    applyRender: () => applyRender(),
+    renderUi: () => renderUi(),
+    notifyProgress: () => {
+      if (roiProgressPaintQueued) return;
+      roiProgressPaintQueued = true;
+      requestAnimationFrame(() => {
+        roiProgressPaintQueued = false;
+        const wrap = ui.querySelector<HTMLElement>("#roiProgressWrap");
+        if (!wrap) return;
+        const p = residency.progress;
+        if (!p) {
+          wrap.style.display = "none";
+          return;
         }
-        // Region to stream = the stable frustum/crop box (uniform coverage over the whole visible slab).
-        // Milestone 1's visibility feedback does NOT replace it (a single resident brick can't chase a
-        // per-bin hint without thrash/eviction); instead `visHint` steers the shrink below toward the
-        // most-looked-at sub-region when the box is too big to admit a finer level.
-        const regionBox = roi;
-        const regionOpts = { maxTextureDimension: maxTex };
-        let region = chooseBrickRegion(source, regionBox.min, regionBox.max, regionOpts);
-        // If the generous box is too big for a finer-than-displayed level (typical when the far
-        // frustum inflates from one viewing side), shrink toward the box center until one fits.
-        if (!(region && region.level < level)) {
-          // Shrink toward the most-looked-at sub-region (visibility hint) when we have one, else the box
-          // centre. Clamp into the box so the shrink stays valid. This is the ray-guided part of M1: when
-          // the visible slab is too big for a finer level, prioritise the detail the user is fixated on.
-          const clampToBox = (v: number, a: number): number =>
-            Math.min(regionBox.max[a]!, Math.max(regionBox.min[a]!, v));
-          const cu: [number, number, number] = visHint
-            ? [
-                clampToBox((visHint.min[0] + visHint.max[0]) * 0.5, 0),
-                clampToBox((visHint.min[1] + visHint.max[1]) * 0.5, 1),
-                clampToBox((visHint.min[2] + visHint.max[2]) * 0.5, 2),
-              ]
-            : [
-                (regionBox.min[0] + regionBox.max[0]) * 0.5,
-                (regionBox.min[1] + regionBox.max[1]) * 0.5,
-                (regionBox.min[2] + regionBox.max[2]) * 0.5,
-              ];
-          let mn: [number, number, number] = [regionBox.min[0], regionBox.min[1], regionBox.min[2]];
-          let mx: [number, number, number] = [regionBox.max[0], regionBox.max[1], regionBox.max[2]];
-          for (let k = 0; k < 8 && !(region && region.level < level); k++) {
-            for (let a = 0; a < 3; a++) {
-              mn[a] = cu[a]! + (mn[a]! - cu[a]!) * 0.7;
-              mx[a] = cu[a]! + (mx[a]! - cu[a]!) * 0.7;
-            }
-            region = chooseBrickRegion(source, mn, mx, regionOpts);
-          }
-        }
-        // Engage whenever a finer-than-displayed level fits the focal box (no zoom threshold — the
-        // depth-bounded box only admits a finer level once you're zoomed in enough for it to fit).
-        if (region && region.level < level) {
-          desired = true; // a finer region applies → hold onto its request key across the load
-          const dims = source.dimensionsAt(region.level);
-          // Snap the voxel box to a grid so sub-voxel camera drift doesn't re-request (and abort) the
-          // brick every frame; the ROI only changes when it moves by ≥ Q voxels.
-          const Q = 32;
-          const voxelMin: [number, number, number] = [0, 0, 0];
-          const voxelMax: [number, number, number] = [0, 0, 0];
-          for (let a = 0; a < 3; a++) {
-            const d = dims[a]!;
-            voxelMin[a] = Math.max(0, Math.floor(region.voxelMin[a]! / Q) * Q);
-            voxelMax[a] = Math.min(d, Math.max(voxelMin[a] + Q, Math.ceil(region.voxelMax[a]! / Q) * Q));
-          }
-          // Skip if the resident brick (same level) already covers this box — small moves reuse it.
-          const covered =
-            lastRegion !== null &&
-            lastRegion.level === region.level &&
-            voxelMin[0] >= lastRegion.voxelMin[0] && voxelMin[1] >= lastRegion.voxelMin[1] &&
-            voxelMin[2] >= lastRegion.voxelMin[2] && voxelMax[0] <= lastRegion.voxelMax[0] &&
-            voxelMax[1] <= lastRegion.voxelMax[1] && voxelMax[2] <= lastRegion.voxelMax[2];
-          const key = `${region.level}:${voxelMin.join(",")}:${voxelMax.join(",")}`;
-          // (Re)stream a genuinely new, settled region. A newer region SUPERSEDES an in-flight one
-          // (request() aborts the stale fetch), so the brick for where the user actually is loads
-          // promptly instead of waiting out the old load. Finishing the stale brick first is what made
-          // the high-res ROI briefly drop to coarse / go blank when moving mid-load. Same-key requests
-          // are still blocked (key === lastRoiKey) and ROI_SETTLE debounces motion, so this can't flood.
-          if (!covered && key !== lastRoiKey && roiIdle >= ROI_SETTLE) {
-            lastRoiKey = key;
-            lastRegion = { level: region.level, voxelMin, voxelMax };
-            const half = [sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5];
-            const full = [sizeSim.x, sizeSim.y, sizeSim.z];
-            const wmin: [number, number, number] = [0, 0, 0];
-            const wmax: [number, number, number] = [0, 0, 0];
-            for (let a = 0; a < 3; a++) {
-              wmin[a] = -half[a]! + (voxelMin[a] / dims[a]!) * full[a]!;
-              wmax[a] = -half[a]! + (voxelMax[a] / dims[a]!) * full[a]!;
-            }
-            const reqId = ++roiReqSeq;
-            roiRequestInFlight = true;
-            void brickLoader
-              .request({ source, level: region.level, voxelMin, voxelMax, worldMin: wmin, worldMax: wmax })
-              .finally(() => {
-                if (reqId !== roiReqSeq) return; // superseded — the newer request owns the flag + bar
-                roiRequestInFlight = false;
-                roiProgress = null; // hide the bar once the latest stream settles (loaded / failed)
-                paintRoiProgress();
-              });
-          }
-          if (brickLoader.currentBrick) want = 1;
-        }
-      }
-    }
-    // Forget the resident request key only when no brick is desired (ROI off / zoomed out) and nothing
-    // is mid-flight — NOT merely because the brick isn't visible yet. Resetting while a request was in
-    // flight made the loader re-request the same box on the frame it finished (and endlessly retry a
-    // failed/aborted fetch), flooding the network and never settling on higher-res detail.
-    if (!desired && !roiRequestInFlight) {
-      lastRoiKey = "";
-      lastRegion = null;
-    }
-    brickBlendTarget = want;
-
-    // Fade the brick weight toward the target (~150 ms); clear once fully faded out.
-    const diff = brickBlendTarget - brickBlendCurrent;
-    brickBlendCurrent += Math.sign(diff) * Math.min(Math.abs(diff), 6 * dt);
-    volumeRenderer.setBrickBlend(brickBlendCurrent);
-    if (brickBlendCurrent <= 0.001 && brickBlendTarget === 0 && brickLoader.currentBrick) {
-      brickLoader.clear();
-    }
-  };
+        wrap.style.display = "";
+        const pct = p.total ? Math.round((p.loaded / p.total) * 100) : 0;
+        const fill = ui.querySelector<HTMLElement>("#roiProgressFill");
+        const label = ui.querySelector<HTMLElement>("#roiProgressLabel");
+        if (fill) fill.style.width = `${pct}%`;
+        if (label) label.textContent = `${p.loaded}/${p.total} chunks`;
+      });
+    },
+  });
+  session.onDispose(() => residency.dispose());
 
   ensureHudStyles();
   const docked = options?.hudMount != null;
@@ -761,7 +547,7 @@ export async function run(
     // Visibility feedback drives Milestone 1's ray-guided streaming (steers the ROI shrink toward the
     // most-looked-at region). Only consulted once the camera settles (ROI_HINT_SETTLE), so it no longer
     // thrashes. The per-sample accumulation is a bounded atomicAdd below the empty-space skip.
-    volumeRenderer.setVisibilityFeedback(roiEnabled);
+    volumeRenderer.setVisibilityFeedback(residency.isEnabled);
   };
 
   const cameraCtx: CameraContext = { controls, camera, sizeSim };
@@ -876,8 +662,7 @@ export async function run(
   const applyLevel = (next: number, reframe = false): void => {
     if (!levels.includes(next)) return;
     targetLevel = next;
-    lastPick = undefined;
-    pickStatus = "";
+    picking.clear();
     physicalSizeSim(sizeSim, source, sim, next);
     volumeRenderer.setBoxHalfSize(sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5);
     frameExtent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z);
@@ -914,54 +699,23 @@ export async function run(
     renderUi();
   };
 
-  const runPickAt = async (clientX: number, clientY: number): Promise<void> => {
-    if (measuring || loading) return;
-    measuring = true;
-    pickStatus = "Picking…";
-    renderUi();
-    try {
-      const rect = canvas.getBoundingClientRect();
-      const u = ((clientX - rect.left) / Math.max(rect.width, 1)) * 2 - 1;
-      const v = -(((clientY - rect.top) / Math.max(rect.height, 1)) * 2 - 1);
-      invViewProj.copy(lastViewProj);
-      if (!invViewProj.invert()) {
-        pickStatus = "Pick failed (bad camera matrix).";
-        lastPick = undefined;
-        return;
-      }
-      const [dx, dy, dz] = rayDir(invViewProj, u, v);
-      const eye = camera.position;
-      const feature = await pickConnectedFeature(source, {
-        level,
-        ray: {
-          origin: [eye.x, eye.y, eye.z],
-          direction: [dx, dy, dz],
-        },
-        boxHalf: [sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5],
-        hitDensity: Math.max(valueRange[1] * 0.15, 2),
-        relativeLow: 0.55,
-        maxRegionVoxels: 2_000_000,
-      });
-      if (!feature) {
-        lastPick = undefined;
-        pickStatus = "No feature under cursor (try a denser region or lower LOD).";
-        return;
-      }
-      lastPick = feature;
-      cropping.cropMin = [...feature.cropMin] as [number, number, number];
-      cropping.cropMax = [...feature.cropMax] as [number, number, number];
-      applyRender();
-      const u3 = um3();
-      pickStatus = `Selected ${feature.voxelCount.toLocaleString()} voxels · ${feature.volume.to(u3).toExponential(3)} ${u3.symbol}`;
-      openSections.add("measure");
-    } catch (err) {
-      lastPick = undefined;
-      pickStatus = err instanceof Error ? err.message : String(err);
-    } finally {
-      measuring = false;
-      renderUi();
-    }
-  };
+  const picking = new PickingController({
+    canvas,
+    camera,
+    invViewProj,
+    lastViewProj,
+    getSource: () => source,
+    getLevel: () => level,
+    sizeSim,
+    cropping,
+    valueRange,
+    isLoading: () => loading,
+    getVolumeUnit3: () => um3(),
+    applyRender: () => applyRender(),
+    renderUi: () => renderUi(),
+    onPicked: () => openSections.add("measure"),
+  });
+  session.onDispose(() => picking.dispose());
 
   const renderUi = (): void => {
     requestRender(); // catch-all: any HUD interaction that rebuilds the panel also repaints the canvas
@@ -987,9 +741,19 @@ export async function run(
     });
 
     const cropBody = cropPanelBody(cropping);
-    const measureBody = measurePanelBody({ rendering, pickMode, pickStatus, lastPick, u3: um3() });
+    const measureBody = measurePanelBody({
+      rendering,
+      pickMode: picking.pickMode,
+      pickStatus: picking.status,
+      lastPick: picking.lastFeature,
+      u3: um3(),
+    });
     const postfxBody = postfxPanelBody(rendering);
-    const lightingBody = lightingPanelBody({ rendering, roiEnabled, roiProgress });
+    const lightingBody = lightingPanelBody({
+      rendering,
+      roiEnabled: residency.isEnabled,
+      roiProgress: residency.progress,
+    });
 
     // Presets section — sanitize the selection against the current preset list before rendering, so
     // it stays valid across preset add/remove and HUD rebuilds.
@@ -1004,7 +768,7 @@ export async function run(
         `title="${collapsed ? "Expand panel" : "Collapse panel"}" ` +
         `aria-label="${collapsed ? "Expand panel" : "Collapse panel"}">${collapsed ? "\u2039" : "\u203A"}</button>` +
         `</div>`,
-      `<div class="whud__status">L${level} · ${dx}×${dy}×${dz}${loading ? " · loading…" : ""}${pickMode ? " · PICK" : ""}${brickLevel !== undefined ? ` · ROI L${brickLevel}` : ""}</div>`,
+      `<div class="whud__status">L${level} · ${dx}×${dy}×${dz}${loading ? " · loading…" : ""}${picking.pickMode ? " · PICK" : ""}${residency.brickLevel !== undefined ? ` · ROI L${residency.brickLevel}` : ""}</div>`,
       section(openSections, "data", "Data", dataBody),
       section(openSections, "tf", "Transfer Function", tfBody),
       section(openSections, "render", "Render", renderBody),
@@ -1046,495 +810,49 @@ export async function run(
     applyCollapsed();
   };
 
-  ui.addEventListener("click", (e) => {
-    const btn = (e.target as HTMLElement).closest("button") as HTMLButtonElement | null;
-    if (!btn) return;
-    if (btn.dataset.act === "toggleCollapse") {
-      collapsed = !collapsed;
-      renderUi();
-      return;
-    }
-    if (btn.dataset.level != null) {
-      void applyLevel(Number(btn.dataset.level));
-      return;
-    }
-    if (btn.dataset.blend) {
-      rendering.blendMode = btn.dataset.blend as VolumeBlendMode;
-      applyRender();
-      renderUi();
-      emitRendering();
-      return;
-    }
-    if (btn.dataset.shader) {
-      rendering.shaderConfig = btn.dataset.shader as ShaderConfigName;
-      applyRender();
-      renderUi();
-      emitRendering();
-      return;
-    }
-    if (btn.dataset.act === "exportPng") {
-      void (async () => {
-        const blob = await stampCanvasPng(
-          canvas,
-          volumeRenderer.provenance(fxPipeline.renderScale),
-        );
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `tomo-${rendering.shaderConfig}.png`;
-        a.click();
-        URL.revokeObjectURL(url);
-      })();
-      return;
-    }
-    if (btn.dataset.view) {
-      setViewModeAndEmit(btn.dataset.view as VolumeViewMode, { openSlices: true });
-      return;
-    }
-    if (btn.dataset.act === "resetCrop") {
-      resetCrop();
-      return;
-    }
-    if (btn.dataset.act === "frameSlice") {
-      frameSliceCamera();
-      return;
-    }
-    if (btn.dataset.act === "autoContrast") {
-      // Percentile auto-window from the true distribution → color levels; refresh UI + slider thumbs.
-      if (rawHistogram) {
-        [rendering.colorLo, rendering.colorHi] = autoWindow(rawHistogram, [
-          rendering.colorLo,
-          rendering.colorHi,
-        ]);
-        applyTf();
-        renderUi();
-        emitRendering();
-      }
-      return;
-    }
-    if (btn.dataset.act === "applyPreset") {
-      const name = ui.querySelector<HTMLSelectElement>("#presetSelect")?.value || selectedPreset;
-      if (name) {
-        const preset = getPreset(name);
-        if (preset) {
-          selectedPreset = name;
-          applyRenderingState(preset as Partial<WebGpuRenderingState>);
-          renderUi();
-          emitRendering(); // propagate to a linked peer + refresh the auto-remembered "last used"
-        }
-      }
-      return;
-    }
-    if (btn.dataset.act === "savePreset") {
-      const suggested = selectedPreset || "My preset";
-      const name = window.prompt("Save current rendering as preset:", suggested)?.trim();
-      if (name) {
-        savePreset(name, readRendering() as unknown as Record<string, unknown>);
-        selectedPreset = name;
-        renderUi();
-      }
-      return;
-    }
-    if (btn.dataset.act === "deletePreset") {
-      const name = ui.querySelector<HTMLSelectElement>("#presetSelect")?.value || selectedPreset;
-      if (name && window.confirm(`Delete preset "${name}"?`)) {
-        deletePreset(name);
-        if (selectedPreset === name) selectedPreset = "";
-        renderUi();
-      }
-      return;
-    }
-    if (btn.dataset.act === "clearPick") {
-      lastPick = undefined;
-      pickStatus = "";
-      resetCrop();
-    }
-  });
-
-  ui.addEventListener("change", (e) => {
-    const t = e.target as HTMLSelectElement;
-    if (t.id === "cmap") {
-      rendering.colorMap = t.value as ColorMapName;
-      applyTf();
-      curveEditor?.setColorMap(rendering.colorMap);
-      emitRendering();
-    } else if (t.id === "fxop") {
-      rendering.fxOperator = t.value as ToneMapOperator;
-      rebuildFxStack();
-      emitRendering();
-    } else if (t.id === "presetSelect") {
-      selectedPreset = t.value;
-    }
-  });
-
-  const RENDERING_SLIDERS = new Set([
-    "opacityScale",
-    "sampleDist",
-    "density",
-    "exposure",
-    "gradOp",
-    "gradScale",
-    "lighting",
-    "equalizeClip",
-    "measureDepth",
-    "measureGray",
-    "measureAlpha",
-  ]);
-  // Single-value sliders that emit a cropping change. (Crop min/max are dual-thumb `data-range`
-  // groups handled separately below — they emit their own croppingChange.)
-  const CROPPING_SLIDERS = new Set(["activeSlice", "sliceX", "sliceY", "sliceZ"]);
-  // Post-FX sliders: each drives a stack rebuild (effect params are captured at build time) and
-  // emits a rendering change so links / share carry the value.
-  const FX_SLIDERS = new Set([
-    "fxExposure",
-    "fxBloomThreshold",
-    "fxBloomIntensity",
-    "fxSharpenAmount",
-    "fxVignetteAmount",
-  ]);
-  // Lighting sliders: set the closure var, push params (applyLighting), and emit for links / share.
-  const LIGHTING_SLIDERS = new Set([
-    "lightGlobalIntensity",
-    "lightAzimuth",
-    "lightElevation",
-    "lightFlashIntensity",
-    "lightStageIntensity",
-    "lightAmbient",
-    "lightSpecular",
-    "lightRoughness",
-    "shadowQuality",
-    "shadowStrength",
-    "shadowSoftness",
-    "aoRadius",
-    "aoIntensity",
-    "aoSamples",
-    "flashConeDeg",
-    "flashRange",
-    "stageConeDeg",
-    "stageRange",
-  ]);
-
-  ui.addEventListener("input", (e) => {
-    const t = e.target as HTMLInputElement;
-    if (t.dataset.chk) {
-      const on = t.checked;
-      if (t.dataset.chk === "showPlanes") cropping.showPlanes = on;
-      if (t.dataset.chk === "enX") cropping.enX = on;
-      if (t.dataset.chk === "enY") cropping.enY = on;
-      if (t.dataset.chk === "enZ") cropping.enZ = on;
-      if (t.dataset.chk === "pickMode") {
-        pickMode = on;
-        canvas.style.cursor = pickMode ? "crosshair" : "";
-        renderUi();
-        return;
-      }
-      if (
-        t.dataset.chk === "fxBloom" ||
-        t.dataset.chk === "fxFxaa" ||
-        t.dataset.chk === "fxSharpen" ||
-        t.dataset.chk === "fxVignette"
-      ) {
-        if (t.dataset.chk === "fxBloom") rendering.fxBloom = on;
-        else if (t.dataset.chk === "fxFxaa") rendering.fxFxaa = on;
-        else if (t.dataset.chk === "fxSharpen") rendering.fxSharpen = on;
-        else if (t.dataset.chk === "fxVignette") rendering.fxVignette = on;
-        rebuildFxStack();
-        emitRendering();
-        return;
-      }
-      if (t.dataset.chk === "equalizeOn") {
-        rendering.equalizeOn = on;
-        recomputeEqualize();
-        applyTf();
-        renderUi(); // refresh the histogram (equalized vs raw) + curve editor
-        emitRendering();
-        return;
-      }
-      if (t.dataset.chk === "measurePlaneOn") {
-        rendering.measurePlaneOn = on; // the render loop reads this live; just emit for links/share
-        emitRendering();
-        return;
-      }
-      if (t.dataset.chk === "roiEnabled") {
-        roiEnabled = on; // the render loop reads this live (updateRoi); toggling off fades + discards
-        volumeRenderer.setVisibilityFeedback(roiEnabled); // Milestone 1: ray-guided streaming signal
-        return;
-      }
-      if (
-        t.dataset.chk === "lightGlobalOn" ||
-        t.dataset.chk === "lightFlashOn" ||
-        t.dataset.chk === "lightStageOn" ||
-        t.dataset.chk === "shadowOn" ||
-        t.dataset.chk === "aoOn" ||
-        t.dataset.chk === "halfRes" ||
-        t.dataset.chk === "temporalAA" ||
-        t.dataset.chk === "shadowCastGlobal" ||
-        t.dataset.chk === "shadowCastFlash" ||
-        t.dataset.chk === "shadowCastStage"
-      ) {
-        if (t.dataset.chk === "lightGlobalOn") rendering.lightGlobalOn = on;
-        else if (t.dataset.chk === "lightFlashOn") rendering.lightFlashOn = on;
-        else if (t.dataset.chk === "lightStageOn") rendering.lightStageOn = on;
-        else if (t.dataset.chk === "shadowOn") rendering.shadowOn = on;
-        else if (t.dataset.chk === "aoOn") rendering.aoOn = on;
-        else if (t.dataset.chk === "halfRes") rendering.halfRes = on;
-        else if (t.dataset.chk === "temporalAA") { rendering.temporalAA = on; taau.setEnabled(on); }
-        else if (t.dataset.chk === "shadowCastGlobal") rendering.shadowCastGlobal = on;
-        else if (t.dataset.chk === "shadowCastFlash") rendering.shadowCastFlash = on;
-        else if (t.dataset.chk === "shadowCastStage") rendering.shadowCastStage = on;
-        applyLighting();
-        emitRendering();
-        return;
-      }
-      applyRender();
-      emitCropping();
-      return;
-    }
-    if (t.dataset.color) {
-      const cid = t.dataset.color;
-      if (cid === "lightGlobalColor") rendering.lightGlobalColor = t.value;
-      else if (cid === "lightFlashColor") rendering.lightFlashColor = t.value;
-      else if (cid === "lightStageColor") rendering.lightStageColor = t.value;
-      emitRendering();
-      return;
-    }
-    if (t.dataset.range) {
-      // Dual-thumb range (color low/high, or per-axis crop min/max). Everything is scoped to this
-      // group's `.whud__range` wrapper so multiple ranges coexist. Keep lo <= hi (a thumb dragged past
-      // its partner pushes it), reflect the filled band + label in place, then dispatch by group.
-      const [group, end] = t.dataset.range.split(":"); // e.g. "cropX", "lo"
-      const wrap = t.closest<HTMLElement>(".whud__range");
-      if (!wrap) return;
-      const loEl = wrap.querySelector<HTMLInputElement>('[data-range$=":lo"]');
-      const hiEl = wrap.querySelector<HTMLInputElement>('[data-range$=":hi"]');
-      if (!loEl || !hiEl) return;
-      let lo = Number(loEl.value);
-      let hi = Number(hiEl.value);
-      if (lo > hi) {
-        if (end === "lo") hi = lo;
-        else lo = hi;
-        loEl.value = String(lo);
-        hiEl.value = String(hi);
-      }
-      const fill = wrap.querySelector<HTMLElement>("[data-range-fill]");
-      if (fill) {
-        fill.style.left = `${lo * 100}%`;
-        fill.style.width = `${(hi - lo) * 100}%`;
-      }
-      const vals = wrap.nextElementSibling?.querySelector("[data-range-vals]");
-      if (vals) vals.textContent = `${fmt(lo)} – ${fmt(hi)}`;
-      if (group === "color") {
-        rendering.colorLo = lo;
-        rendering.colorHi = hi;
-        applyTf();
-        curveEditor?.setColorRange([rendering.colorLo, rendering.colorHi]);
-        emitRendering();
-      } else if (group === "cropX" || group === "cropY" || group === "cropZ") {
-        const axis = group === "cropX" ? 0 : group === "cropY" ? 1 : 2;
-        cropping.cropMin[axis] = lo;
-        cropping.cropMax[axis] = hi;
-        applyRender();
-        emitCropping();
-      }
-      return;
-    }
-    if (!t.dataset.slider) return;
-    const id = t.dataset.slider;
-    const v = Number(t.value);
-    const lab = ui.querySelector(`[data-val="${id}"]`);
-    if (lab) lab.textContent = fmt(v);
-    switch (id) {
-      case "opacityScale":
-        rendering.opacityScale = v;
-        applyTf();
-        break;
-      case "measureDepth":
-        rendering.measureDepth = v; // the render loop reads these live (ruler + plane depth/appearance)
-        break;
-      case "measureGray":
-        rendering.measurePlaneGray = v;
-        break;
-      case "measureAlpha":
-        rendering.measurePlaneAlpha = v;
-        break;
-      case "equalizeClip":
-        rendering.equalizeClip = v;
-        if (rendering.equalizeOn) {
-          recomputeEqualize();
-          applyTf();
-          if (histogram) curveEditor?.setHistogram(histogram);
-        }
-        break;
-      case "sampleDist":
-        rendering.sampleDist = v;
-        applyRender();
-        break;
-      case "density":
-        rendering.densityScale = v;
-        applyRender();
-        break;
-      case "exposure":
-        rendering.exposure = v;
-        applyRender();
-        break;
-      case "gradOp":
-        rendering.gradOpacity = v;
-        applyRender();
-        break;
-      case "gradScale":
-        rendering.gradScale = v;
-        applyRender();
-        break;
-      case "lighting":
-        rendering.lighting = v;
-        applyRender();
-        break;
-      case "activeSlice":
-        setActiveSlice(v);
-        if (openSections.has("slices")) {
-          // Refresh µm / index labels without rebuilding the whole panel (keeps focus).
-          const active = activeSlice();
-          if (active) {
-            const n =
-              active.axis === "x"
-                ? source.dimensionsAt(level)[0]!
-                : active.axis === "y"
-                  ? source.dimensionsAt(level)[1]!
-                  : source.dimensionsAt(level)[2]!;
-            const idx = Math.min(n - 1, Math.floor(active.value * n));
-            const info = ui.querySelector("[data-slice-info]");
-            if (info) {
-              info.textContent = `${sliceWorldLabel(active.axis, active.value)} · index ${idx}/${n - 1}`;
-            }
-          }
-        }
-        break;
-      case "sliceX":
-        cropping.sliceX = v;
-        applyRender();
-        break;
-      case "sliceY":
-        cropping.sliceY = v;
-        applyRender();
-        break;
-      case "sliceZ":
-        cropping.sliceZ = v;
-        applyRender();
-        break;
-      case "fxExposure":
-        rendering.fxExposure = v;
-        rebuildFxStack();
-        break;
-      case "fxBloomThreshold":
-        rendering.fxBloomThreshold = v;
-        rebuildFxStack();
-        break;
-      case "fxBloomIntensity":
-        rendering.fxBloomIntensity = v;
-        rebuildFxStack();
-        break;
-      case "fxSharpenAmount":
-        rendering.fxSharpenAmount = v;
-        rebuildFxStack();
-        break;
-      case "fxVignetteAmount":
-        rendering.fxVignetteAmount = v;
-        rebuildFxStack();
-        break;
-      case "lightGlobalIntensity":
-        rendering.lightGlobalIntensity = v;
-        break;
-      case "lightAzimuth":
-        rendering.lightAzimuth = v;
-        break;
-      case "lightElevation":
-        rendering.lightElevation = v;
-        break;
-      case "lightFlashIntensity":
-        rendering.lightFlashIntensity = v;
-        break;
-      case "lightStageIntensity":
-        rendering.lightStageIntensity = v;
-        break;
-      case "lightAmbient":
-        rendering.lightAmbient = v;
-        applyLighting();
-        break;
-      case "lightSpecular":
-        rendering.lightSpecular = v;
-        applyLighting();
-        break;
-      case "lightRoughness":
-        rendering.lightRoughness = v;
-        applyLighting();
-        break;
-      case "shadowQuality":
-        rendering.shadowQuality = v;
-        applyLighting();
-        break;
-      case "shadowStrength":
-        rendering.shadowStrength = v;
-        applyLighting();
-        break;
-      case "aoRadius":
-        rendering.aoRadius = v;
-        applyLighting();
-        break;
-      case "aoIntensity":
-        rendering.aoIntensity = v;
-        applyLighting();
-        break;
-      case "shadowSoftness":
-        rendering.shadowSoftness = v;
-        applyLighting();
-        break;
-      case "aoSamples":
-        rendering.aoSamples = v;
-        applyLighting();
-        break;
-      // Cone/range feed buildFrameLights (rebuilt per frame) — just store the value.
-      case "flashConeDeg":
-        rendering.flashConeDeg = v;
-        break;
-      case "flashRange":
-        rendering.flashRange = v;
-        break;
-      case "stageConeDeg":
-        rendering.stageConeDeg = v;
-        break;
-      case "stageRange":
-        rendering.stageRange = v;
-        break;
-      default:
-        break;
-    }
-    if (RENDERING_SLIDERS.has(id)) emitRendering();
-    else if (CROPPING_SLIDERS.has(id)) emitCropping();
-    else if (FX_SLIDERS.has(id)) emitRendering();
-    else if (LIGHTING_SLIDERS.has(id)) emitRendering();
-  });
-
-  // Ctrl/Meta+click or pick-mode click → feature pick (Shift left free for pan).
-  let pickDown: { x: number; y: number } | null = null;
-  const onPickPointerDown = (e: PointerEvent): void => {
-    if (e.button !== 0) return;
-    if (!(pickMode || e.ctrlKey || e.metaKey)) return;
-    pickDown = { x: e.clientX, y: e.clientY };
+  const hudEventCtx: HudEventContext = {
+    ui,
+    canvas,
+    rendering,
+    cropping,
+    volumeRenderer,
+    fxPipeline,
+    taau,
+    residency,
+    picking,
+    openSections,
+    getSource: () => source,
+    getLevel: () => level,
+    getCurveEditor: () => curveEditor,
+    getRawHistogram: () => rawHistogram,
+    getHistogram: () => histogram,
+    getSelectedPreset: () => selectedPreset,
+    setSelectedPreset: (v) => {
+      selectedPreset = v;
+    },
+    getCollapsed: () => collapsed,
+    setCollapsed: (v) => {
+      collapsed = v;
+    },
+    applyLevel: (next) => void applyLevel(next),
+    applyRender: () => applyRender(),
+    applyTf: () => applyTf(),
+    applyRenderingState: (state) => applyRenderingState(state),
+    renderUi: () => renderUi(),
+    emitRendering: () => emitRendering(),
+    emitCropping: () => emitCropping(),
+    setViewModeAndEmit: (mode, opts) => setViewModeAndEmit(mode, opts),
+    resetCrop: () => resetCrop(),
+    frameSliceCamera: () => frameSliceCamera(),
+    recomputeEqualize: () => recomputeEqualize(),
+    rebuildFxStack: () => rebuildFxStack(),
+    applyLighting: () => applyLighting(),
+    setActiveSlice: (v) => setActiveSlice(v),
+    activeSlice: () => activeSlice(),
+    sliceWorldLabel: (axis, t) => sliceWorldLabel(axis, t),
+    readRendering: () => readRendering(),
   };
-  const onPickPointerUp = (e: PointerEvent): void => {
-    if (!pickDown) return;
-    const dx = e.clientX - pickDown.x;
-    const dy = e.clientY - pickDown.y;
-    pickDown = null;
-    if (dx * dx + dy * dy > 36) return; // drag → ignore
-    void runPickAt(e.clientX, e.clientY);
-  };
-  canvas.addEventListener("pointerdown", onPickPointerDown);
-  canvas.addEventListener("pointerup", onPickPointerUp);
-  session.onDispose(() => {
-    canvas.removeEventListener("pointerdown", onPickPointerDown);
-    canvas.removeEventListener("pointerup", onPickPointerUp);
-  });
+  bindHudEvents(hudEventCtx);
 
   // Slice scrub with wheel in plane views.
   const onSliceWheel = (e: WheelEvent): void => {
@@ -1587,8 +905,7 @@ export async function run(
       } else if (e.code === "KeyF") {
         frameSliceCamera();
       } else if (e.code === "KeyP") {
-        pickMode = !pickMode;
-        canvas.style.cursor = pickMode ? "crosshair" : "";
+        picking.togglePickMode();
         openSections.add("measure");
         renderUi();
       } else if (e.code === "KeyS") {
@@ -1607,16 +924,12 @@ export async function run(
         store = next;
         source = await openOmeZarr(store, { skipRangeEstimate: true, valueRange });
         levels = allowedLevels();
-        lastPick = undefined;
-        pickStatus = "";
+        picking.clear();
         loaderOpened = false; // new dataset → reopen the loader (drops old resident textures)
-        brickLoader.clear(); // drop the old dataset's ROI brick
-        lastRoiKey = "";
-        lastRegion = null;
+        residency.clearForNewDataset(); // drop the old dataset's ROI brick
         if (levels.length) applyLevel(finestTargetLevel(), true);
       } else if (e.code === "KeyE") {
-        lastPick = undefined;
-        pickStatus = "";
+        picking.clear();
         resetCrop();
       }
     })();
@@ -1633,18 +946,6 @@ export async function run(
     "extent m",
     volumeMaxExtentMeters(source, level),
   );
-
-  const camsEqual = (a: WebGpuCameraState | null, b: WebGpuCameraState | null): boolean => {
-    if (!a || !b) return false;
-    const close = (x: number, y: number): boolean =>
-      Math.abs(x - y) <= 1e-4 * (1 + Math.abs(x) + Math.abs(y));
-    return (
-      close(a.distance, b.distance) &&
-      a.target.every((v, i) => close(v, b.target[i]!)) &&
-      a.offset.every((v, i) => close(v, b.offset[i]!)) &&
-      a.gazeUp.every((v, i) => close(v, b.gazeUp[i]!))
-    );
-  };
 
   session.loop((dt) => {
     resizeDemoCanvas(canvas);
@@ -1731,12 +1032,12 @@ export async function run(
     // plane and its calibrated ruler track zoom instead of a fixed multiple of the extent. Clamp the
     // front to `near` (usable when the eye is inside the volume); see computeMeasurePlaneDepth().
     const planeDepth = computeMeasurePlaneDepth(centerDepth, halfDepth, near, rendering.measureDepth);
-    updateRoi(dt);
+    residency.update(dt);
     // Adaptive sampling: coarsen the ray step while navigating (camera moving) for a smooth framerate,
-    // then refine once settled. `roiIdle` is seconds since the camera last moved (updated in updateRoi).
+    // then refine once settled. `residency.idle` is seconds since the camera last moved.
     // Coarsen instantly for responsiveness; ease back to the configured `sampleDist` over ~0.4 s so the
     // sharpening isn't a visible pop. max(NAV_SAMPLE_DIST, sampleDist) keeps a coarse slider still coarse.
-    const navTarget = roiIdle < NAV_SETTLE ? Math.max(NAV_SAMPLE_DIST, rendering.sampleDist) : rendering.sampleDist;
+    const navTarget = residency.idle < NAV_SETTLE ? Math.max(NAV_SAMPLE_DIST, rendering.sampleDist) : rendering.sampleDist;
     if (navTarget > navSampleDist) navSampleDist = navTarget;
     else navSampleDist += (navTarget - navSampleDist) * Math.min(1, dt * 8);
     volumeRenderer.setParams({ stepSize: Math.min(brickStep ?? baseStep, baseStep) * navSampleDist });
@@ -1765,7 +1066,7 @@ export async function run(
       // "Settled" = camera stopped AND the adaptive step has finished refining. On the moving→settled
       // edge, reseed accumulation so the sharp frames replace the coarse in-motion history; a moving view
       // keeps converging via reprojection rather than resetting.
-      const settled = roiIdle >= NAV_SETTLE && Math.abs(navSampleDist - rendering.sampleDist) < 0.02;
+      const settled = residency.idle >= NAV_SETTLE && Math.abs(navSampleDist - rendering.sampleDist) < 0.02;
       if (settled && !taauPrevSettled) taau.reset();
       taauPrevSettled = settled;
       // Reprojection inputs use the UN-jittered matrices (jitter is only for the render's sub-pixel
@@ -1828,7 +1129,7 @@ export async function run(
     lastRenderH = canvas.height;
     const adaptiveEasing = Math.abs(navSampleDist - rendering.sampleDist) > 0.005;
     const taauConverging = rendering.temporalAA && taau.sampleCount < taau.maxAccum;
-    const brickFading = brickBlendCurrent !== brickBlendTarget;
+    const brickFading = residency.isFading;
     if (adaptiveEasing || taauConverging || brickFading) requestRender();
   });
 
