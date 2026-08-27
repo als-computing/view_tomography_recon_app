@@ -65,11 +65,18 @@ import {
   defaultCroppingState,
   mergeDefined,
 } from "./viewer/RenderingState.js";
-import { niceFloor125, zarrUrlFromQuery, pickZarrStore } from "./viewer/util.js";
+import { zarrUrlFromQuery, pickZarrStore } from "./viewer/util.js";
 import { autoWindow, buildEqualizeRemap, rebinThroughRemap } from "./viewer/histogram.js";
 import { type PanelId, section, fmt } from "./viewer/ui/html.js";
 import { cropIsSet, focalRoiUvw, rayDir } from "./viewer/volume/roi-geometry.js";
 import { buildFrameLights } from "./viewer/rendering/lighting.js";
+import {
+  computeCameraBasis,
+  computeNearFar,
+  computeMeasurePlaneDepth,
+  computeRuler,
+  applyTaauJitter,
+} from "./viewer/rendering/frameMath.js";
 import {
   type CameraContext,
   frameSliceCamera as frameSliceCameraPure,
@@ -1663,42 +1670,19 @@ export async function run(
     if (canvas.width !== lastRenderW || canvas.height !== lastRenderH) requestRender();
     if (renderFrames <= 0) return;
     renderFrames -= 1;
-    const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
     // Near/far bracket the volume CENTER's depth ALONG THE VIEW AXIS (the box is centered at the world
-    // origin), plus the bounding-sphere radius. We project the center onto the actual view direction
-    // rather than use the straight-line eye→origin distance: under zoom-to-cursor the orbit target
-    // drifts off the origin, so the camera's forward stops pointing at the box center. Using the
-    // straight-line distance then overestimates the center's depth, pushing the near plane in front of
-    // the box and clipping its front — which read as the volume "inverting" when zoomed far out.
-    // Projecting onto the view axis brackets the box correctly at any zoom/drift and keeps the near/far
-    // ratio bounded so the inv(viewProj) DVR ray reconstruction stays float32-stable.
+    // origin), from its actual projected depth (not the bounding sphere). We project the center onto
+    // the actual view direction rather than use the straight-line eye→origin distance: under
+    // zoom-to-cursor the orbit target drifts off the origin, so the camera's forward stops pointing at
+    // the box center. Using the straight-line distance then overestimates the center's depth, pushing
+    // the near plane in front of the box and clipping its front — which read as the volume "inverting"
+    // when zoomed far out. A sphere-radius margin would also hugely over-bracket a thin/wide slab,
+    // forcing `near` to clamp to a tiny fraction of `far`, skewing the DVR ray reconstruction; the
+    // projected half-depth is orientation-aware and keeps the near/far ratio well-conditioned. See
+    // computeNearFar()/computeCameraBasis() for the full margin-growth rationale.
     const wm = camera.worldMatrix().elements;
-    // Camera looks down its local -Z; world forward = -(worldZ axis) = -(column 2).
-    let fx = -wm[8]!;
-    let fy = -wm[9]!;
-    let fz = -wm[10]!;
-    const flen = Math.hypot(fx, fy, fz) || 1;
-    fx /= flen;
-    fy /= flen;
-    fz /= flen;
-    const centerDepth = -(camera.position.x * fx + camera.position.y * fy + camera.position.z * fz);
-    // Bracket the box's ACTUAL projected depth along the view axis (0.5·Σ size·|axisⁱ|), not the bounding
-    // sphere. A sphere-radius margin hugely over-brackets a thin/wide slab, forcing `near` to clamp to a
-    // tiny fraction of `far`; the resulting far/near precision skew reconstructs the DVR rays badly and
-    // reads as clipping / the volume inverting when zoomed out. The projected half-depth is orientation-
-    // aware and keeps the near/far ratio well-conditioned while still fully containing the box.
-    const projHalfDepth =
-      0.5 * (sizeSim.x * Math.abs(fx) + sizeSim.y * Math.abs(fy) + sizeSim.z * Math.abs(fz));
-    // Grow the margin with distance when zoomed far out: bracketing a fixed-size box from an ever-larger
-    // centerDepth drives far·near/(far−near) toward centerDepth² (past float32 range → the volume vanishes).
-    // Flooring the margin at ~5% of centerDepth keeps that term linear in centerDepth, so the box still
-    // renders (tiny) instead of disappearing. Up close the tight projected-depth term dominates (fixes the
-    // thin-slab clipping), so this only loosens the bracket at extreme zoom-out.
-    const margin = Math.max(projHalfDepth * 1.25 + extent * 0.02, centerDepth * 0.05);
-    const far = Math.max(centerDepth + margin, margin * 2);
-    // Clamp near above a small fraction of far so the ratio stays float32-friendly even when the eye is
-    // inside (or very close to) the volume; never let it collapse to ~0.
-    const near = Math.max(centerDepth - margin, far * 0.002);
+    const basis = computeCameraBasis(wm);
+    const { near, far, extent, centerDepth, halfDepth } = computeNearFar(sizeSim, camera.position, basis.forward);
     proj.perspective(
       (42 * Math.PI) / 180,
       canvas.width / Math.max(1, canvas.height),
@@ -1710,15 +1694,13 @@ export async function run(
     lastViewProj.copy(viewProj);
     // Rebuild the procedural light set from the camera basis so flashlight / stage lights track the
     // view. Global stays fixed-direction. Must run before recordInto (uploads the light buffer).
-    const rL = Math.hypot(wm[0]!, wm[1]!, wm[2]!) || 1;
-    const uL = Math.hypot(wm[4]!, wm[5]!, wm[6]!) || 1;
     // Feed the camera basis + FOV so the shader builds primary rays without invViewProj (which loses
     // float32 precision at extreme zoom-out → the volume vanishes / inverts). Must match the projection
-    // above (42° vertical FOV, canvas aspect). fx/fy/fz is the unit camera forward computed earlier.
+    // above (42° vertical FOV, canvas aspect).
     volumeRenderer.setCameraBasis(
-      [wm[0]! / rL, wm[1]! / rL, wm[2]! / rL],
-      [wm[4]! / uL, wm[5]! / uL, wm[6]! / uL],
-      [fx, fy, fz],
+      basis.right,
+      basis.up,
+      basis.forward,
       (42 * Math.PI) / 180,
       canvas.width / Math.max(1, canvas.height),
     );
@@ -1726,9 +1708,9 @@ export async function run(
       buildFrameLights(
         rendering,
         camera.position,
-        [wm[0]! / rL, wm[1]! / rL, wm[2]! / rL],
-        [wm[4]! / uL, wm[5]! / uL, wm[6]! / uL],
-        [fx, fy, fz],
+        basis.right,
+        basis.up,
+        basis.forward,
         extent,
       ),
     );
@@ -1746,16 +1728,9 @@ export async function run(
     volumeRenderer.setShadowMap(shadowDir !== null, shadowDir ?? [0.45, 0.85, 0.35]);
     // Measure plane depth in world units along the view axis. `measureDepth` is a 0..1 fraction across
     // the volume's actual depth footprint (0 = front face nearest the camera, 1 = back face), so the
-    // plane and its calibrated ruler track zoom instead of a fixed multiple of the extent. The AABB is
-    // centered at the origin with half-extents sizeSim/2; its projected half-depth along the unit view
-    // axis is 0.5·Σ(size·|axisⁱ|). Clamp the front to `near` (usable when the eye is inside the volume)
-    // and the slider fraction to [0,1] (keeps legacy shared values, which used a 0.2..6 range, sane).
-    const halfDepth =
-      0.5 * (sizeSim.x * Math.abs(fx) + sizeSim.y * Math.abs(fy) + sizeSim.z * Math.abs(fz));
-    const frontDepth = Math.max(centerDepth - halfDepth, near);
-    const backDepth = Math.max(centerDepth + halfDepth, frontDepth + 1e-6);
-    const planeT = Math.min(1, Math.max(0, rendering.measureDepth));
-    const planeDepth = frontDepth + planeT * (backDepth - frontDepth);
+    // plane and its calibrated ruler track zoom instead of a fixed multiple of the extent. Clamp the
+    // front to `near` (usable when the eye is inside the volume); see computeMeasurePlaneDepth().
+    const planeDepth = computeMeasurePlaneDepth(centerDepth, halfDepth, near, rendering.measureDepth);
     updateRoi(dt);
     // Adaptive sampling: coarsen the ray step while navigating (camera moving) for a smooth framerate,
     // then refine once settled. `roiIdle` is seconds since the camera last moved (updated in updateRoi).
@@ -1772,7 +1747,7 @@ export async function run(
       depth: planeDepth,
       gray: rendering.measurePlaneGray,
       alpha: rendering.measurePlaneAlpha,
-      forward: [fx, fy, fz],
+      forward: basis.forward,
     });
     // Volume → linear HDR, then the post stack to the swapchain (one encoder / one submit). The DOM
     // overlay (gizmo + scale bar) draws to a separate canvas and is unaffected.
@@ -1805,11 +1780,7 @@ export async function run(
           !settled,
         );
       }
-      const [jx, jy] = taau.jitterPixels();
-      jitterProj.copy(proj);
-      jitterProj.elements[8]! += (2 * jx) / rw;
-      jitterProj.elements[9]! += (2 * jy) / rh;
-      jitterViewProj.multiplyMatrices(jitterProj, view);
+      applyTaauJitter(jitterProj, jitterViewProj, proj, view, taau.jitterPixels(), rw, rh);
       renderViewProj = jitterViewProj;
     } else {
       taau.reset();
@@ -1826,41 +1797,25 @@ export async function run(
     );
     volumeRenderer.afterSubmit();
 
-    // Bottom-left overlay: axis gizmo (camera world basis) + physical scale bar. The gizmo uses the
-    // world right/up/forward columns of the camera; forward (fx,fy,fz) is already unit-normalized above.
-    const rlen = Math.hypot(wm[0]!, wm[1]!, wm[2]!) || 1;
-    const ulen = Math.hypot(wm[4]!, wm[5]!, wm[6]!) || 1;
+    // Bottom-left overlay: axis gizmo (camera world basis) + physical scale bar.
     // Edge rulers: world (sim µm) per CSS pixel at the calibration depth. Perspective ⇒ exact only on
     // the fronto-parallel plane at that depth; isotropic, so X and Y share one scale. The depth is the
     // orbit-pivot distance by default, or the camera-linked measure plane depth (a fraction across the
     // volume's view-axis footprint) when the plane is on (the plane itself is rendered by the volume
     // shader). ~80px major spacing.
     const measureDist = rendering.measurePlaneOn ? planeDepth : controls.distance;
-    let ruler: {
-      majorPx: number;
-      minorPerMajor: number;
-      majorValue: number;
-      unitLabel: string;
-    } | null = null;
-    const cssH = canvas.clientHeight;
-    if (cssH > 0 && Number.isFinite(measureDist) && measureDist > 0) {
-      const worldPerPx = (2 * measureDist * Math.tan(controls.fovY / 2)) / cssH;
-      const u = lengthUnit();
-      const dispPerPx = units.fromSim(worldPerPx, units.LENGTH, sim).to(u); // display units / css px
-      if (Number.isFinite(dispPerPx) && dispPerPx > 0) {
-        const majorValue = niceFloor125(dispPerPx * 80);
-        ruler = {
-          majorPx: majorValue / dispPerPx,
-          minorPerMajor: 5,
-          majorValue,
-          unitLabel: u.symbol,
-        };
-      }
-    }
+    const rulerUnit = lengthUnit();
+    const ruler = computeRuler({
+      measureDist,
+      fovY: controls.fovY,
+      cssHeight: canvas.clientHeight,
+      worldPerPxToDisplay: (worldPerPx) => units.fromSim(worldPerPx, units.LENGTH, sim).to(rulerUnit),
+      unitSymbol: rulerUnit.symbol,
+    });
     overlay.draw({
-      right: [wm[0]! / rlen, wm[1]! / rlen, wm[2]! / rlen],
-      up: [wm[4]! / ulen, wm[5]! / ulen, wm[6]! / ulen],
-      forward: [fx, fy, fz],
+      right: basis.right,
+      up: basis.up,
+      forward: basis.forward,
       ruler,
       banner: volumeRenderer.approximateShadingBanner(),
     });
