@@ -100,6 +100,16 @@ export class OrbitControls implements Controller {
    * orbit target toward/away from that point.
    */
   public zoomToCursor = true;
+  /**
+   * Optional axis-aligned clamp for the orbit {@link target} (world units). When set, the pivot is
+   * kept inside this box every {@link update} — before the eye is derived from it. Zoom-to-cursor
+   * slides the target toward the cursor point each frame ({@link update}); with the cursor over empty
+   * background that point lies far outside the data, so the target (and the eye that trails it at a
+   * fixed {@link maxDistance}) can drift arbitrarily far from the volume until it overruns float32 and
+   * the volume vanishes. Pinning the pivot to the data bounds caps the eye's absolute distance from
+   * the volume. `null` disables the clamp (free pivot).
+   */
+  public targetBounds: { min: Vec3; max: Vec3 } | null = null;
   /** Exponential damping factor (0 = snap, ~10 = smooth). */
   public damping = 12;
   /** When false, pointer/wheel input is ignored. */
@@ -442,6 +452,17 @@ export class OrbitControls implements Controller {
       if (Math.abs(this.distance - this._desiredDistance) < 1e-5) {
         this._hasZoomPivot = false;
       }
+    }
+
+    // Pin the pivot to the data bounds *before* deriving the eye, so a zoom-to-cursor slide over empty
+    // background can't carry the target (and the trailing eye) off to float32-overrun distances where
+    // the volume vanishes. Clamping here (not post-update in the render loop) keeps eye = target+offset
+    // consistent within the same frame — no one-frame-late correction, no fight with the slide.
+    if (this.targetBounds) {
+      const { min, max } = this.targetBounds;
+      this.target.x = Math.min(max.x, Math.max(min.x, this.target.x));
+      this.target.y = Math.min(max.y, Math.max(min.y, this.target.y));
+      this.target.z = Math.min(max.z, Math.max(min.z, this.target.z));
     }
 
     const ol = this._offset.length();

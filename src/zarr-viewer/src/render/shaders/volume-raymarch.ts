@@ -9,8 +9,8 @@
 
 import { LIGHT_STRUCT_WGSL } from "./lights.js";
 
-/** Byte size of the volume frame uniform block (mat4 + 21 × vec4 + shadow mat4 + shadowCtl vec4). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 480;
+/** Byte size of the volume frame uniform block (mat4 + 21 × vec4 + shadow mat4 + shadowCtl + camRight/camUp). */
+export const VOLUME_FRAME_UNIFORM_SIZE = 512;
 
 /** Compile-time specialization for {@link volumeRaymarchWgsl}. */
 export interface VolumeRaymarchSpec {
@@ -73,6 +73,8 @@ struct Frame {
   screen: vec4<f32>,         // xy = internal pixels, z = tile size
   worldToLight: mat4x4<f32>, // world → light-space UVW for the opacity shadow map (Milestone 7.1)
   shadowCtl: vec4<f32>,      // x = shadowMapEnable (1 = sample the map instead of marching a shadow ray)
+  camRight: vec4<f32>,       // xyz = camera right axis (world, unit), w = tan(halfFovY) * aspect
+  camUp: vec4<f32>,          // xyz = camera up axis (world, unit),    w = tan(halfFovY)
 };
 
 struct OccCell { dmin: f32, dmax: f32, dist: f32, occupied: f32 }
@@ -566,13 +568,20 @@ fn passesViewMode(uvw: vec3<f32>, viewMode: u32, thickness: f32) -> bool {
 // the caller's default (1.0 = far); only the composited path writes a real centroid.
 fn marchColor(in: VSOut, depthOut: ptr<function, f32>) -> vec4<f32> {
   let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, (1.0 - in.uv.y) * 2.0 - 1.0);
-  let nearH = frame.invViewProj * vec4<f32>(ndc, 0.0, 1.0);
-  let farH = frame.invViewProj * vec4<f32>(ndc, 1.0, 1.0);
-  let nearW = nearH.xyz / nearH.w;
-  let farW = farH.xyz / farH.w;
 
   let ro = frame.eye.xyz;
-  let rd = normalize(farW - nearW);
+  // Build the ray direction from the camera basis + FOV directly, NOT from invViewProj. Reconstructing
+  // via invViewProj (differencing two reprojected world points, or dividing by a reprojected w) loses
+  // most of its float32 precision when zoomed far out: near/far are both ~centerDepth and huge, so the
+  // reprojected points nearly coincide and their difference / w-divide degenerate — the direction jitters
+  // or even flips sign, and the volume vanishes or shows an inverted (back-face) image. The camera basis
+  // (unit right/up/forward) and FOV are magnitude-independent, so the direction stays exact at any zoom.
+  // frame.camRight.w = tan(halfFovY)*aspect, frame.camUp.w = tan(halfFovY). ndc.y is already the display-
+  // flipped NDC (see vs_main), matching how the basis vectors are oriented.
+  let forward = frame.measureFwd.xyz;
+  let rd = normalize(
+    forward + ndc.x * frame.camRight.w * frame.camRight.xyz + ndc.y * frame.camUp.w * frame.camUp.xyz,
+  );
   let alphaComposite = frame.composite.x > 0.5;
   let bg = background(rd);
 
@@ -865,7 +874,11 @@ fn fs_main(in: VSOut) -> FragOut {
 /** Baseline (unaccelerated) WGSL, matching {@link volumeRaymarchWgsl} with occupancy/tiles off. */
 export const VOLUME_RAYMARCH_WGSL = volumeRaymarchWgsl();
 
-/** Fullscreen background pass used when instanced tiles don't cover every pixel. */
+/**
+ * Fullscreen background pass used when instanced tiles don't cover every pixel. The Frame struct must
+ * byte-match {@link volumeRaymarchWgsl}'s (up through camRight/camUp) since both bind the same uniform
+ * buffer — unused trailing fields are declared anyway so the offsets of camRight/camUp line up.
+ */
 export const VOLUME_BACKGROUND_WGSL = /* wgsl */ `
 struct Frame {
   invViewProj: mat4x4<f32>,
@@ -880,6 +893,20 @@ struct Frame {
   slices: vec4<f32>,
   liquid: vec4<f32>,
   composite: vec4<f32>,
+  lightCtl0: vec4<f32>,
+  lightCtl1: vec4<f32>,
+  lightCtl2: vec4<f32>,
+  measurePlane: vec4<f32>,
+  measureFwd: vec4<f32>,
+  brickMin: vec4<f32>,
+  brickMax: vec4<f32>,
+  accelOcc: vec4<f32>,
+  visGrid: vec4<f32>,
+  screen: vec4<f32>,
+  worldToLight: mat4x4<f32>,
+  shadowCtl: vec4<f32>,
+  camRight: vec4<f32>, // xyz = camera right axis (world, unit), w = tan(halfFovY) * aspect
+  camUp: vec4<f32>,    // xyz = camera up axis (world, unit),    w = tan(halfFovY)
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -932,9 +959,13 @@ struct FragOut {
 @fragment
 fn fs_main(in: VSOut) -> FragOut {
   let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, (1.0 - in.uv.y) * 2.0 - 1.0);
-  let nearH = frame.invViewProj * vec4<f32>(ndc, 0.0, 1.0);
-  let farH = frame.invViewProj * vec4<f32>(ndc, 1.0, 1.0);
-  let rd = normalize(farH.xyz / farH.w - nearH.xyz / nearH.w);
+  // Match marchColor's camera-basis ray reconstruction exactly (not invViewProj, which loses precision
+  // at extreme zoom-out): a mismatched ray direction here vs. the tile march is what reads as a seam /
+  // clipping discontinuity at the tile-classifier boundary when zoomed far out.
+  let forward = frame.measureFwd.xyz;
+  let rd = normalize(
+    forward + ndc.x * frame.camRight.w * frame.camRight.xyz + ndc.y * frame.camUp.w * frame.camUp.xyz,
+  );
   var bg = envRadiance(rd) * 0.85;
   if (frame.composite.y < 0.5) {
     bg = pow(tonemapACES(bg), vec3<f32>(0.95));

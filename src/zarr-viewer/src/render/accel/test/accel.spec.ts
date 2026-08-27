@@ -66,6 +66,8 @@ describe("shader-config", () => {
     expect(specializationFor("baseline").occupancy).toBe(false);
     expect(specializationFor("baseline").tiles).toBe(false);
     expect(specializationFor("fast").occupancy).toBe(true);
+    expect(specializationFor("fast").tiles).toBe(true);
+    expect(specializationFor("quality").occupancy).toBe(true);
     expect(specializationFor("quality").tiles).toBe(true);
   });
 

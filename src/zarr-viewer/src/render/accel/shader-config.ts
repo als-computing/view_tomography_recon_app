@@ -47,6 +47,12 @@ export function specializationFor(name: ShaderConfigName): ShaderSpecialization 
   const quality = name === "quality";
   return {
     occupancy: accel,
+    // Tile compaction (Milestone 4.5): draw-indirect tile march + a fullscreen background pass for the
+    // culled pixels. This is the big win when the volume is small on screen (zoomed out) — most tiles are
+    // background and never pay the march. The background pass must paint EXACTLY what the march paints for
+    // a miss pixel (same envRadiance, same camera-basis ray) or the coverage boundary seams; that is now
+    // enforced in VOLUME_BACKGROUND_WGSL. The screen-AABB classifier pads by a tile and keeps all tiles
+    // when any corner is behind the camera, so it never under-covers the silhouette.
     tiles: accel,
     // Milestone 7: approximate (artistic) shading lives ONLY in `quality`, never default — see the
     // provenance requirement. Two octaves of cheap multi-scatter + a directional (bent-normal) ambient.

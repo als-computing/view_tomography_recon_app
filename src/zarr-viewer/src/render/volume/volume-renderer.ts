@@ -202,6 +202,13 @@ export class VolumeRenderer implements Disposable {
   private measurePlaneGray = 0.5;
   private measurePlaneAlpha = 0.35;
   private measureForward: [number, number, number] = [0, 0, 1];
+  // Camera basis + FOV for the primary ray direction (see marchColor). Passed explicitly so the shader
+  // never reconstructs the ray via invViewProj, which loses precision at large zoom-out and makes the
+  // volume vanish / invert. Defaults frame a unit camera looking down -Z until setCameraBasis runs.
+  private camRight: [number, number, number] = [1, 0, 0];
+  private camUp: [number, number, number] = [0, 1, 0];
+  private tanHalfFovY = Math.tan((42 * Math.PI) / 180 / 2);
+  private camAspect = 1;
 
   private pipeline: GPURenderPipeline | undefined;
   private frameUniform: ManagedBuffer | undefined;
@@ -487,6 +494,28 @@ export class VolumeRenderer implements Disposable {
   /** Far-plane distance used to normalize the depth-centroid output for TAAU reprojection. */
   public setReprojectFar(far: number): void {
     this.reprojectFar = Math.max(1e-6, far);
+  }
+
+  /**
+   * Camera basis + FOV for building the primary ray direction in the shader (see marchColor). Supplying
+   * the unit right/up/forward axes and FOV lets the ray-march reconstruct directions without invViewProj,
+   * which degrades in float32 at large zoom-out (volume vanishing / inverting). `right`/`up`/`forward`
+   * must be unit and orthonormal; `fovYRadians` is the vertical FOV and `aspect` = width/height.
+   */
+  public setCameraBasis(
+    right: [number, number, number],
+    up: [number, number, number],
+    forward: [number, number, number],
+    fovYRadians: number,
+    aspect: number,
+  ): void {
+    this.camRight = right;
+    this.camUp = up;
+    this.tanHalfFovY = Math.tan(Math.max(1e-3, fovYRadians) * 0.5);
+    this.camAspect = Math.max(1e-3, aspect);
+    // The shader reads the camera forward from the measureFwd slot (also what the measure plane needs);
+    // keep it in sync so the ray forward is fresh every frame even if setMeasurePlane isn't called.
+    this.measureForward = forward;
   }
 
   /**
@@ -903,6 +932,16 @@ export class VolumeRenderer implements Disposable {
     d[117] = this.reprojectFar; // shadowCtl.y → depth-centroid normalization (TAAU)
     d[118] = 0;
     d[119] = 0;
+    // camRight: camera right axis (world, unit), w = tan(halfFovY) * aspect (horizontal half-extent)
+    d[120] = this.camRight[0];
+    d[121] = this.camRight[1];
+    d[122] = this.camRight[2];
+    d[123] = this.tanHalfFovY * this.camAspect;
+    // camUp: camera up axis (world, unit), w = tan(halfFovY) (vertical half-extent)
+    d[124] = this.camUp[0];
+    d[125] = this.camUp[1];
+    d[126] = this.camUp[2];
+    d[127] = this.tanHalfFovY;
     this.frameUniform!.write(d);
   }
 

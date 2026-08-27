@@ -1453,6 +1453,15 @@ export async function run(
     // Cap zoom-out so the volume can't recede to a sub-pixel speck (and so eye-space magnitudes stay
     // float32-stable). ~20× the largest extent still frames the whole volume comfortably.
     controls.maxDistance = frameExtent * 20;
+    // Pin the orbit pivot to the volume's bounds. With zoom-to-cursor, scrolling out with the cursor
+    // over empty background otherwise slides the target off into the void; the eye trails it at a fixed
+    // maxDistance and the volume recedes past float32 range and vanishes. Bounding the pivot to the box
+    // (the AABB is centred at the world origin with half-extents sizeSim/2) caps the eye's absolute
+    // distance from the data. See OrbitControls.targetBounds.
+    controls.targetBounds = {
+      min: new Vec3(-sizeSim.x * 0.5, -sizeSim.y * 0.5, -sizeSim.z * 0.5),
+      max: new Vec3(sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5),
+    };
     if (reframe) {
       if (viewMode === "volume") {
         controls.distance = frameExtent * 2.2;
@@ -2519,7 +2528,7 @@ export async function run(
 
   session.loop((dt) => {
     resizeDemoCanvas(canvas);
-    controls.update(dt);
+    controls.update(dt); // the orbit pivot is clamped to the volume bounds inside update() via targetBounds
     // Render on demand: the volume ray-march is expensive, so re-render only while something is actually
     // changing — otherwise a continuous 60 fps march saturates the GPU and janks the whole browser
     // (scrolling included). `renderFrames` is a small budget any interaction or still-converging process
@@ -2530,7 +2539,14 @@ export async function run(
       lastCam = camNow;
       emit("cameraChange");
     }
-    if (!camsEqual(camNow, lastRenderCam)) requestRender();
+    // Drive render-on-demand off the controls' own activity signal, NOT just camsEqual. camsEqual uses a
+    // relative tolerance (1e-4·(1+|a|+|b|)) that grows with coordinate magnitude: zoomed far out — or with
+    // a short/thin volume framed so the camera sits far along the thin axis — the offset components are
+    // large, the tolerance balloons to several world units, and a slow drag moves the pose less than that
+    // per frame, so camsEqual falsely reports "unchanged" and the canvas freezes mid-interaction while the
+    // UI keeps responding. isAnimating compares normalized directions + relative distance error, so it is
+    // scale-independent and stays true throughout any drag / damping catch-up.
+    if (controls.isAnimating || !camsEqual(camNow, lastRenderCam)) requestRender();
     if (canvas.width !== lastRenderW || canvas.height !== lastRenderH) requestRender();
     if (renderFrames <= 0) return;
     renderFrames -= 1;
@@ -2543,7 +2559,6 @@ export async function run(
     // the box and clipping its front — which read as the volume "inverting" when zoomed far out.
     // Projecting onto the view axis brackets the box correctly at any zoom/drift and keeps the near/far
     // ratio bounded so the inv(viewProj) DVR ray reconstruction stays float32-stable.
-    const boundR = 0.5 * Math.hypot(sizeSim.x, sizeSim.y, sizeSim.z) || extent * 0.5;
     const wm = camera.worldMatrix().elements;
     // Camera looks down its local -Z; world forward = -(worldZ axis) = -(column 2).
     let fx = -wm[8]!;
@@ -2554,7 +2569,19 @@ export async function run(
     fy /= flen;
     fz /= flen;
     const centerDepth = -(camera.position.x * fx + camera.position.y * fy + camera.position.z * fz);
-    const margin = boundR * 1.5 + extent * 0.05;
+    // Bracket the box's ACTUAL projected depth along the view axis (0.5·Σ size·|axisⁱ|), not the bounding
+    // sphere. A sphere-radius margin hugely over-brackets a thin/wide slab, forcing `near` to clamp to a
+    // tiny fraction of `far`; the resulting far/near precision skew reconstructs the DVR rays badly and
+    // reads as clipping / the volume inverting when zoomed out. The projected half-depth is orientation-
+    // aware and keeps the near/far ratio well-conditioned while still fully containing the box.
+    const projHalfDepth =
+      0.5 * (sizeSim.x * Math.abs(fx) + sizeSim.y * Math.abs(fy) + sizeSim.z * Math.abs(fz));
+    // Grow the margin with distance when zoomed far out: bracketing a fixed-size box from an ever-larger
+    // centerDepth drives far·near/(far−near) toward centerDepth² (past float32 range → the volume vanishes).
+    // Flooring the margin at ~5% of centerDepth keeps that term linear in centerDepth, so the box still
+    // renders (tiny) instead of disappearing. Up close the tight projected-depth term dominates (fixes the
+    // thin-slab clipping), so this only loosens the bracket at extreme zoom-out.
+    const margin = Math.max(projHalfDepth * 1.25 + extent * 0.02, centerDepth * 0.05);
     const far = Math.max(centerDepth + margin, margin * 2);
     // Clamp near above a small fraction of far so the ratio stays float32-friendly even when the eye is
     // inside (or very close to) the volume; never let it collapse to ~0.
@@ -2572,6 +2599,16 @@ export async function run(
     // view. Global stays fixed-direction. Must run before recordInto (uploads the light buffer).
     const rL = Math.hypot(wm[0]!, wm[1]!, wm[2]!) || 1;
     const uL = Math.hypot(wm[4]!, wm[5]!, wm[6]!) || 1;
+    // Feed the camera basis + FOV so the shader builds primary rays without invViewProj (which loses
+    // float32 precision at extreme zoom-out → the volume vanishes / inverts). Must match the projection
+    // above (42° vertical FOV, canvas aspect). fx/fy/fz is the unit camera forward computed earlier.
+    volumeRenderer.setCameraBasis(
+      [wm[0]! / rL, wm[1]! / rL, wm[2]! / rL],
+      [wm[4]! / uL, wm[5]! / uL, wm[6]! / uL],
+      [fx, fy, fz],
+      (42 * Math.PI) / 180,
+      canvas.width / Math.max(1, canvas.height),
+    );
     volumeRenderer.setLights(
       buildFrameLights(
         camera.position,
@@ -2581,21 +2618,16 @@ export async function run(
         extent,
       ),
     );
-    // Milestone 7.1: point the opacity shadow map at the primary shadow-casting light (a directional
-    // approximation). Global = its fixed sun direction; flashlight = toward the eye; stage = -forward.
-    // The map replaces the per-sample shadow march whenever shadows + a caster are active.
+    // Milestone 7.1: the opacity shadow map is a *directional* structure — exact only for the global
+    // "sun" light. For positional lights (flashlight at the eye, stage spots) the directional
+    // approximation misplaces occluders and stripes the shadows, so those fall back to the per-sample
+    // brute march (which marches toward the actual light position). Map on only when the global light is
+    // the caster.
     let shadowDir: [number, number, number] | null = null;
-    if (shadowOn) {
-      if (lightGlobalOn && shadowCastGlobal) {
-        const el = (lightElevation * Math.PI) / 180;
-        const az = (lightAzimuth * Math.PI) / 180;
-        shadowDir = [Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)];
-      } else if (lightFlashOn && shadowCastFlash) {
-        const l = Math.hypot(camera.position.x, camera.position.y, camera.position.z) || 1;
-        shadowDir = [camera.position.x / l, camera.position.y / l, camera.position.z / l];
-      } else if (lightStageOn && shadowCastStage) {
-        shadowDir = [-fx, -fy, -fz];
-      }
+    if (shadowOn && lightGlobalOn && shadowCastGlobal) {
+      const el = (lightElevation * Math.PI) / 180;
+      const az = (lightAzimuth * Math.PI) / 180;
+      shadowDir = [Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)];
     }
     volumeRenderer.setShadowMap(shadowDir !== null, shadowDir ?? [0.45, 0.85, 0.35]);
     // Measure plane depth in world units along the view axis. `measureDepth` is a 0..1 fraction across
