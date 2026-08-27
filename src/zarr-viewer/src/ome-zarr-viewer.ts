@@ -10,7 +10,6 @@ import { units } from "@zarr-viewer/core";
 import {
   openOmeZarr,
   httpStore,
-  fileSystemStore,
   physicalSizeQuantities,
   physicalSizeSim,
   volumeMaxExtentMeters,
@@ -30,13 +29,11 @@ import {
   VolumeRenderer,
   composeTransferFunction,
   OpacityCurveEditor,
-  DEFAULT_OPACITY_POINTS,
   colorMapNames,
   makeDirectionalLight,
   makeSpotLight,
   type GpuLight,
   type ColorMapName,
-  type OpacityPoint,
   type VolumeBlendMode,
   type VolumeViewMode,
   type ShaderConfigName,
@@ -66,19 +63,27 @@ import {
   savePreset,
   deletePreset,
 } from "./rendering-presets.js";
+import {
+  type WebGpuRenderingState,
+  type WebGpuCroppingState,
+  defaultRenderingState,
+  defaultCroppingState,
+  mergeDefined,
+} from "./viewer/RenderingState.js";
+import { mulMat4Vec4, niceFloor125, zarrUrlFromQuery, pickZarrStore } from "./viewer/util.js";
+import { autoWindow, buildEqualizeRemap, rebinThroughRemap } from "./viewer/histogram.js";
+import {
+  type PanelId,
+  section,
+  segBtn,
+  slider,
+  fmt,
+  colorRow,
+  escAttr,
+  rangeSlider,
+} from "./viewer/ui/html.js";
 
-const DEFAULT_ZARR = "/datasets/petiole.zarr";
-
-type PanelId =
-  | "data"
-  | "tf"
-  | "render"
-  | "slices"
-  | "crop"
-  | "measure"
-  | "postfx"
-  | "lighting"
-  | "presets";
+export type { WebGpuRenderingState, WebGpuCroppingState } from "./viewer/RenderingState.js";
 
 /** Change events emitted by a {@link WebGpuViewerInstance}. */
 export type WebGpuViewerEvent = "cameraChange" | "renderingChange" | "croppingChange";
@@ -92,86 +97,6 @@ export interface WebGpuCameraState {
   offset: [number, number, number];
   gazeUp: [number, number, number];
   distance: number;
-}
-
-/** Everything that shapes the volume's appearance (transfer function + render params + view mode). */
-export interface WebGpuRenderingState {
-  colorMap: ColorMapName;
-  colorLo: number;
-  colorHi: number;
-  equalizeOn: boolean;
-  equalizeClip: number;
-  opacityScale: number;
-  opacityPoints: OpacityPoint[];
-  densityScale: number;
-  exposure: number;
-  sampleDist: number;
-  blendMode: VolumeBlendMode;
-  gradOpacity: number;
-  gradScale: number;
-  lighting: number;
-  viewMode: VolumeViewMode;
-  // Post-processing FX (tonemap is always applied; the rest are toggle-gated).
-  fxOperator: ToneMapOperator;
-  fxExposure: number;
-  fxBloom: boolean;
-  fxBloomThreshold: number;
-  fxBloomIntensity: number;
-  fxFxaa: boolean;
-  fxSharpen: boolean;
-  fxSharpenAmount: number;
-  fxVignette: boolean;
-  fxVignetteAmount: number;
-  // Lighting: per-mode on/off + color (sRGB hex) + intensity, shading params, shadows, AO, half-res.
-  lightGlobalOn: boolean;
-  lightGlobalColor: string;
-  lightGlobalIntensity: number;
-  lightAzimuth: number;
-  lightElevation: number;
-  lightFlashOn: boolean;
-  lightFlashColor: string;
-  lightFlashIntensity: number;
-  lightStageOn: boolean;
-  lightStageColor: string;
-  lightStageIntensity: number;
-  lightAmbient: number;
-  lightSpecular: number;
-  lightRoughness: number;
-  shadowOn: boolean;
-  shadowQuality: number;
-  shadowStrength: number;
-  shadowSoftness: number;
-  shadowCastGlobal: boolean;
-  shadowCastFlash: boolean;
-  shadowCastStage: boolean;
-  aoOn: boolean;
-  aoRadius: number;
-  aoIntensity: number;
-  aoSamples: number;
-  flashConeDeg: number;
-  flashRange: number;
-  stageConeDeg: number;
-  stageRange: number;
-  halfRes: boolean;
-  temporalAA: boolean;
-  shaderConfig: ShaderConfigName;
-  measurePlaneOn: boolean;
-  measureDepth: number;
-  measurePlaneGray: number;
-  measurePlaneAlpha: number;
-}
-
-/** The ROI crop box plus the slice planes (positions, per-axis enables, overlay visibility). */
-export interface WebGpuCroppingState {
-  cropMin: [number, number, number];
-  cropMax: [number, number, number];
-  sliceX: number;
-  sliceY: number;
-  sliceZ: number;
-  enX: boolean;
-  enY: boolean;
-  enZ: boolean;
-  showPlanes: boolean;
 }
 
 /**
@@ -192,44 +117,6 @@ export interface WebGpuViewerInstance {
   dispose: () => void;
 }
 
-function mulMat4Vec4(
-  m: Mat4,
-  x: number,
-  y: number,
-  z: number,
-  w: number,
-): [number, number, number, number] {
-  const e = m.elements;
-  return [
-    e[0]! * x + e[4]! * y + e[8]! * z + e[12]! * w,
-    e[1]! * x + e[5]! * y + e[9]! * z + e[13]! * w,
-    e[2]! * x + e[6]! * y + e[10]! * z + e[14]! * w,
-    e[3]! * x + e[7]! * y + e[11]! * z + e[15]! * w,
-  ];
-}
-
-/** Largest "nice" 1/2/5·10ⁿ value ≤ x — for a scale bar whose length never exceeds its pixel budget. */
-function niceFloor125(x: number): number {
-  const exp = Math.floor(Math.log10(x));
-  const base = Math.pow(10, exp);
-  const f = x / base; // in [1, 10)
-  const m = f >= 5 ? 5 : f >= 2 ? 2 : 1;
-  return m * base;
-}
-
-function zarrUrlFromQuery(): string {
-  const q = new URLSearchParams(window.location.search).get("zarr");
-  return q && q.length > 0 ? q : DEFAULT_ZARR;
-}
-
-async function pickZarrStore(): Promise<Store | undefined> {
-  const w = window as Window & {
-    showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>;
-  };
-  if (typeof w.showDirectoryPicker !== "function") return undefined;
-  return fileSystemStore(await w.showDirectoryPicker());
-}
-
 export async function run(
   canvas: HTMLCanvasElement,
   options?: { zarrUrl?: string; hudMount?: HTMLElement },
@@ -245,83 +132,12 @@ export async function run(
   session.onDispose(() => ctx.device.destroy());
 
   const valueRange: [number, number] = [-40, 40];
-  let colorMap: ColorMapName = "bone";
-  let colorLo = 0.15;
-  let colorHi = 0.85;
-  let opacityScale = 1;
-  let opacityPoints: OpacityPoint[] = [...DEFAULT_OPACITY_POINTS];
-  // Auto-contrast: global contrast-limited histogram equalization (a CLAHE-style but non-adaptive
-  // remap) applied to the colormap sampling; off by default. Clip limit ≈ OpenCV CLAHE clipLimit.
-  let equalizeOn = false;
-  let equalizeClip = 2;
+  // Everything that shapes the volume's appearance (transfer function + render params + view mode).
+  // Everything that shapes the volume's appearance, and the ROI crop box + slice planes. Defaults
+  // (see defaultRenderingState/defaultCroppingState) reproduce the viewer's original look.
+  const rendering: WebGpuRenderingState = defaultRenderingState();
   let equalizeRemap: Float32Array | undefined; // CDF remap LUT while equalizeOn
-  let densityScale = 1.45;
-  let exposure = 1.2;
-  let sampleDist = 1;
-  let blendMode: VolumeBlendMode = "composite";
-  let gradOpacity = 0.25;
-  let gradScale = 0.12;
-  let lighting = 0.85;
-  let viewMode: VolumeViewMode = "volume";
-  // Post FX state. Tonemap is always applied (the HDR→display map + exposure); everything else is
-  // toggle-gated. Defaults reproduce today's look: ACES at exposure 0, all extras off.
-  let fxOperator: ToneMapOperator = "aces";
-  let fxExposure = 0;
-  let fxBloom = false;
-  let fxBloomThreshold = 1.1;
-  let fxBloomIntensity = 0.6;
-  let fxFxaa = false;
-  let fxSharpen = false;
-  let fxSharpenAmount = 0.5;
-  let fxVignette = false;
-  let fxVignetteAmount = 0.4;
-  // Lighting state. Defaults preserve today's look: one warm global directional; flashlight / stage /
-  // shadows / AO off, full-res. The light set is rebuilt per frame from the camera basis.
-  let lightGlobalOn = true;
-  let lightGlobalColor = "#fff2e0";
-  let lightGlobalIntensity = 1;
-  let lightAzimuth = 38; // degrees
-  let lightElevation = 56; // degrees
-  let lightFlashOn = false;
-  let lightFlashColor = "#ffffff";
-  let lightFlashIntensity = 1.2;
-  let lightStageOn = false;
-  let lightStageColor = "#cfe0ff";
-  let lightStageIntensity = 0.6;
-  let lightAmbient = 0.22;
-  let lightSpecular = 0.4;
-  let lightRoughness = 0.6;
-  let shadowOn = false;
-  let shadowQuality = 24;
-  let shadowStrength = 0.85;
-  let shadowSoftness = 0.3;
-  let aoOn = false;
-  let aoRadius = 0.08;
-  let aoIntensity = 0.7;
-  let aoSamples = 6;
-  let halfRes = false;
-  let temporalAA = false; // Milestone 5: accumulate a clean supersampled image while the camera is still
-  /** Named shader specialization; occupancy/tiles compile in fast/quality. Default baseline. */
-  let shaderConfig: ShaderConfigName = "baseline";
-  // Spot cone (outer half-angle, degrees) + range (× volume extent) for the flashlight / stage lights.
-  // The inner cone is derived at 0.7× the outer for a soft edge.
-  let flashConeDeg = 79;
-  let flashRange = 6;
-  let stageConeDeg = 86;
-  let stageRange = 8;
-  // Which modes cast shadows (perf: fewer casters = cheaper). Global + flashlight cast by default.
-  let shadowCastGlobal = true;
-  let shadowCastFlash = true;
-  let shadowCastStage = false;
-  let sliceX = 0.5;
-  let sliceY = 0.5;
-  let sliceZ = 0.5;
-  let enX = false;
-  let enY = false;
-  let enZ = false;
-  let showPlanes = false;
-  let cropMin: [number, number, number] = [0, 0, 0];
-  let cropMax: [number, number, number] = [1, 1, 1];
+  const cropping: WebGpuCroppingState = defaultCroppingState();
   const openSections = new Set<PanelId>(["tf", "render"]);
   let loading = false;
   // One-shot guard: apply the last-used rendering snapshot once, after this viewer's first level (and
@@ -336,13 +152,6 @@ export async function run(
   // looks sparse/blank. While a brick is up we march at its (floored) Nyquist step instead.
   let brickStep: number | undefined;
   let pickMode = false;
-  // Measure plane: a camera-linked fronto-parallel reference plane the edge rulers calibrate to. When
-  // off, the rulers use the orbit-pivot depth (exact at the volume center). When on, they use
-  // `measureDepth` (× extent) in front of the camera and a faint grid marks that plane.
-  let measurePlaneOn = false;
-  let measureDepth = 0.5; // 0..1 fraction across the volume's depth footprint (0 = front face, 1 = back)
-  let measurePlaneGray = 0.6; // plane greyscale value [0,1]
-  let measurePlaneAlpha = 0.35; // plane opacity [0,1]
   let measuring = false;
   let lastPick: PickedFeature | undefined;
   let pickStatus = "";
@@ -363,80 +172,16 @@ export async function run(
   };
 
   // Snapshot the rendering / cropping groups from the live closure state. Defined up here so the
-  // early error-path instances (below) can expose them too.
+  // early error-path instances (below) can expose them too. opacityPoints/cropMin/cropMax are
+  // defensively copied so a caller mutating the returned object can't corrupt internal state.
   const readRendering = (): WebGpuRenderingState => ({
-    colorMap,
-    colorLo,
-    colorHi,
-    equalizeOn,
-    equalizeClip,
-    opacityScale,
-    opacityPoints: opacityPoints.map((p) => [p[0], p[1]] as const),
-    densityScale,
-    exposure,
-    sampleDist,
-    blendMode,
-    gradOpacity,
-    gradScale,
-    lighting,
-    viewMode,
-    fxOperator,
-    fxExposure,
-    fxBloom,
-    fxBloomThreshold,
-    fxBloomIntensity,
-    fxFxaa,
-    fxSharpen,
-    fxSharpenAmount,
-    fxVignette,
-    fxVignetteAmount,
-    lightGlobalOn,
-    lightGlobalColor,
-    lightGlobalIntensity,
-    lightAzimuth,
-    lightElevation,
-    lightFlashOn,
-    lightFlashColor,
-    lightFlashIntensity,
-    lightStageOn,
-    lightStageColor,
-    lightStageIntensity,
-    lightAmbient,
-    lightSpecular,
-    lightRoughness,
-    shadowOn,
-    shadowQuality,
-    shadowStrength,
-    shadowSoftness,
-    shadowCastGlobal,
-    shadowCastFlash,
-    shadowCastStage,
-    aoOn,
-    aoRadius,
-    aoIntensity,
-    aoSamples,
-    flashConeDeg,
-    flashRange,
-    stageConeDeg,
-    stageRange,
-    halfRes,
-    temporalAA,
-    shaderConfig,
-    measurePlaneOn,
-    measureDepth,
-    measurePlaneGray,
-    measurePlaneAlpha,
+    ...rendering,
+    opacityPoints: rendering.opacityPoints.map((p) => [p[0], p[1]] as const),
   });
   const readCropping = (): WebGpuCroppingState => ({
-    cropMin: [cropMin[0], cropMin[1], cropMin[2]],
-    cropMax: [cropMax[0], cropMax[1], cropMax[2]],
-    sliceX,
-    sliceY,
-    sliceZ,
-    enX,
-    enY,
-    enZ,
-    showPlanes,
+    ...cropping,
+    cropMin: [cropping.cropMin[0], cropping.cropMin[1], cropping.cropMin[2]],
+    cropMax: [cropping.cropMax[0], cropping.cropMax[1], cropping.cropMax[2]],
   });
 
   // Minimal instance for the failure paths (bad store / no uploadable LOD) — real get/set exist only
@@ -494,17 +239,17 @@ export async function run(
 
   const volumeRenderer = new VolumeRenderer(ctx, {
     stepSize: baseStep,
-    densityScale,
+    densityScale: rendering.densityScale,
     // Safety cap only; the renderer derives per-frame step count from the box diagonal so the whole
     // depth is always marched (no backside clipping) regardless of orientation or sample distance.
     maxSteps: 4096,
-    exposure,
+    exposure: rendering.exposure,
     ambient: 0.22,
     clearColor: [0.015, 0.02, 0.035, 1],
-    blendMode,
-    gradientOpacity: gradOpacity,
-    gradientOpacityScale: gradScale,
-    lightingStrength: lighting,
+    blendMode: rendering.blendMode,
+    gradientOpacity: rendering.gradOpacity,
+    gradientOpacityScale: rendering.gradScale,
+    lightingStrength: rendering.lighting,
     // Render into a linear-HDR target so the post stack tonemaps once (the shader skips its inline
     // ACES+gamma). Both are construct-time only.
     colorFormat: "rgba16float",
@@ -520,13 +265,13 @@ export async function run(
     const effects: Effect[] = [];
     // HDR-space effects first (bloom operates on linear HDR), then the mandatory tonemap maps
     // HDR→sRGB LDR, then the LDR effects (fxaa → sharpen → vignette).
-    if (fxBloom) {
-      effects.push(bloom({ threshold: fxBloomThreshold, intensity: fxBloomIntensity }));
+    if (rendering.fxBloom) {
+      effects.push(bloom({ threshold: rendering.fxBloomThreshold, intensity: rendering.fxBloomIntensity }));
     }
-    effects.push(tonemap(fxOperator, { exposureStops: fxExposure }));
-    if (fxFxaa) effects.push(fxaa());
-    if (fxSharpen) effects.push(sharpen({ amount: fxSharpenAmount }));
-    if (fxVignette) effects.push(vignette({ amount: fxVignetteAmount }));
+    effects.push(tonemap(rendering.fxOperator, { exposureStops: rendering.fxExposure }));
+    if (rendering.fxFxaa) effects.push(fxaa());
+    if (rendering.fxSharpen) effects.push(sharpen({ amount: rendering.fxSharpenAmount }));
+    if (rendering.fxVignette) effects.push(vignette({ amount: rendering.fxVignetteAmount }));
     fxPipeline.setStack(effects);
   };
   rebuildFxStack();
@@ -549,19 +294,19 @@ export async function run(
     requestRender();
     taau.reset(); // lighting changed → restart temporal accumulation
     volumeRenderer.setLightingParams({
-      masterAmbient: lightAmbient,
-      specStrength: lightSpecular,
-      roughness: lightRoughness,
-      shadowEnable: shadowOn,
-      shadowSteps: shadowQuality,
-      shadowStrength,
-      shadowSoftness,
-      aoEnable: aoOn,
-      aoRadius,
-      aoIntensity,
-      aoSamples,
+      masterAmbient: rendering.lightAmbient,
+      specStrength: rendering.lightSpecular,
+      roughness: rendering.lightRoughness,
+      shadowEnable: rendering.shadowOn,
+      shadowSteps: rendering.shadowQuality,
+      shadowStrength: rendering.shadowStrength,
+      shadowSoftness: rendering.shadowSoftness,
+      aoEnable: rendering.aoOn,
+      aoRadius: rendering.aoRadius,
+      aoIntensity: rendering.aoIntensity,
+      aoSamples: rendering.aoSamples,
     });
-    fxPipeline.setRenderScale(halfRes ? 0.5 : 1);
+    fxPipeline.setRenderScale(rendering.halfRes ? 0.5 : 1);
   };
 
   // Rebuild the GPU light list from the enabled modes + the camera basis. Global is a fixed-direction
@@ -575,37 +320,37 @@ export async function run(
     extent: number,
   ): GpuLight[] => {
     const lights: GpuLight[] = [];
-    if (lightGlobalOn) {
-      const el = (lightElevation * Math.PI) / 180;
-      const az = (lightAzimuth * Math.PI) / 180;
+    if (rendering.lightGlobalOn) {
+      const el = (rendering.lightElevation * Math.PI) / 180;
+      const az = (rendering.lightAzimuth * Math.PI) / 180;
       const dir: [number, number, number] = [
         Math.cos(el) * Math.cos(az),
         Math.sin(el),
         Math.cos(el) * Math.sin(az),
       ];
-      const gl = makeDirectionalLight(dir, hexToLinearRgb(lightGlobalColor), lightGlobalIntensity);
-      gl.castShadows = shadowCastGlobal;
+      const gl = makeDirectionalLight(dir, hexToLinearRgb(rendering.lightGlobalColor), rendering.lightGlobalIntensity);
+      gl.castShadows = rendering.shadowCastGlobal;
       lights.push(gl);
     }
-    if (lightFlashOn) {
-      const outer = (flashConeDeg * Math.PI) / 180;
+    if (rendering.lightFlashOn) {
+      const outer = (rendering.flashConeDeg * Math.PI) / 180;
       // True camera headlight: positioned exactly at the eye (canvas center) and pointed forward along
       // the camera's view direction, so it tracks the camera 1:1. No offset, no pull-back.
       const fl = makeSpotLight(
         [eye.x, eye.y, eye.z],
         [fwd[0], fwd[1], fwd[2]], // forward into the scene (camera view direction)
-        hexToLinearRgb(lightFlashColor),
-        lightFlashIntensity,
-        { range: extent * flashRange, innerConeAngle: outer * 0.7, outerConeAngle: outer },
+        hexToLinearRgb(rendering.lightFlashColor),
+        rendering.lightFlashIntensity,
+        { range: extent * rendering.flashRange, innerConeAngle: outer * 0.7, outerConeAngle: outer },
       );
-      fl.castShadows = shadowCastFlash;
+      fl.castShadows = rendering.shadowCastFlash;
       lights.push(fl);
     }
-    if (lightStageOn) {
+    if (rendering.lightStageOn) {
       const d = extent * 2.2; // in front of the eye along the view axis
       const k = extent * 1.7; // corner spread
-      const col = hexToLinearRgb(lightStageColor);
-      const outer = (stageConeDeg * Math.PI) / 180;
+      const col = hexToLinearRgb(rendering.lightStageColor);
+      const outer = (rendering.stageConeDeg * Math.PI) / 180;
       const corners: [number, number][] = [
         [-1, -1],
         [1, -1],
@@ -618,12 +363,12 @@ export async function run(
           eye.y + fwd[1] * d + right[1] * k * sx + up[1] * k * sy,
           eye.z + fwd[2] * d + right[2] * k * sx + up[2] * k * sy,
         ];
-        const sl = makeSpotLight(pos, [-pos[0], -pos[1], -pos[2]], col, lightStageIntensity, {
-          range: extent * stageRange,
+        const sl = makeSpotLight(pos, [-pos[0], -pos[1], -pos[2]], col, rendering.lightStageIntensity, {
+          range: extent * rendering.stageRange,
           innerConeAngle: outer * 0.7,
           outerConeAngle: outer,
         });
-        sl.castShadows = shadowCastStage;
+        sl.castShadows = rendering.shadowCastStage;
         lights.push(sl);
       }
     }
@@ -654,7 +399,7 @@ export async function run(
   controls.filterPointer = (e) => {
     // In slice views, plain wheel scrubs the plane; Ctrl/Meta+wheel still zooms.
     // Trackpad sideways / Shift+wheel still reach OrbitControls for pan.
-    if (e instanceof WheelEvent && viewMode !== "volume" && !e.ctrlKey && !e.metaKey) {
+    if (e instanceof WheelEvent && rendering.viewMode !== "volume" && !e.ctrlKey && !e.metaKey) {
       if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.25) return true;
       return false;
     }
@@ -791,12 +536,12 @@ export async function run(
   });
 
   const cropIsSet = (): boolean =>
-    cropMin[0] > 0.001 ||
-    cropMin[1] > 0.001 ||
-    cropMin[2] > 0.001 ||
-    cropMax[0] < 0.999 ||
-    cropMax[1] < 0.999 ||
-    cropMax[2] < 0.999;
+    cropping.cropMin[0] > 0.001 ||
+    cropping.cropMin[1] > 0.001 ||
+    cropping.cropMin[2] > 0.001 ||
+    cropping.cropMax[0] < 0.999 ||
+    cropping.cropMax[1] < 0.999 ||
+    cropping.cropMax[2] < 0.999;
 
   // Ray ∩ volume box [-h,h]; returns [tNear, tFar] or null.
   const intersectRoiBox = (
@@ -899,7 +644,7 @@ export async function run(
       const cropSet = cropIsSet();
       // Crop box overrides the focal box; otherwise use the depth-bounded frustum slab.
       const roi: { min: [number, number, number]; max: [number, number, number] } | null = cropSet
-        ? { min: [cropMin[0], cropMin[1], cropMin[2]], max: [cropMax[0], cropMax[1], cropMax[2]] }
+        ? { min: [cropping.cropMin[0], cropping.cropMin[1], cropping.cropMin[2]], max: [cropping.cropMax[0], cropping.cropMax[1], cropping.cropMax[2]] }
         : focalRoiUvw();
       if (roi) {
         const vis = volumeRenderer.visibility;
@@ -1101,6 +846,14 @@ export async function run(
     if (lastRenderingSaveTimer) clearTimeout(lastRenderingSaveTimer);
   });
   const emitCropping = (): void => emit("croppingChange");
+  // Clear the crop box back to "no crop" (the full [0,1]^3 volume) and repaint.
+  const resetCrop = (): void => {
+    cropping.cropMin = [0, 0, 0];
+    cropping.cropMax = [1, 1, 1];
+    applyRender();
+    renderUi();
+    emitCropping();
+  };
   // Baseline for the render-loop camera poll: last pose we announced (or applied from a peer), so the
   // poll only emits on a real delta and never echoes a value pushed in via setCamera().
   let lastCam: WebGpuCameraState | null = null;
@@ -1129,92 +882,25 @@ export async function run(
 
   const applyTf = (): void => {
     const tf = composeTransferFunction({
-      opacity: opacityPoints,
-      colorMap,
-      colorRange: [colorLo, colorHi],
-      opacityScale,
+      opacity: rendering.opacityPoints,
+      colorMap: rendering.colorMap,
+      colorRange: [rendering.colorLo, rendering.colorHi],
+      opacityScale: rendering.opacityScale,
       samples: 48,
-      intensityRemap: equalizeOn ? equalizeRemap : undefined,
+      intensityRemap: rendering.equalizeOn ? equalizeRemap : undefined,
     });
     volumeRenderer.setTransferFunction(tf, 512);
     requestRender();
     taau.reset(); // transfer function / colormap changed → restart temporal accumulation
-    curveEditor?.setColorMap(colorMap);
-    curveEditor?.setPoints(opacityPoints);
-    curveEditor?.setColorRange([colorLo, colorHi]);
-  };
-
-  // --- Auto-contrast helpers (operate on the normalized [0,1] intensity histogram) ---------------
-  // Percentile auto-window (matches Seg Studio stretch.ts, default 2–98%). Bin 0 is skipped: uploadVolume
-  // zero-fills empty voxels, piling background mass into bin 0 which would bias the low percentile.
-  const autoWindow = (hist: Float32Array, loP = 0.02, hiP = 0.98): [number, number] => {
-    const n = hist.length;
-    let total = 0;
-    for (let i = 1; i < n; i++) total += hist[i]!;
-    if (total <= 0) return [colorLo, colorHi];
-    const loT = total * loP;
-    const hiT = total * hiP;
-    let loBin = 1;
-    let hiBin = n - 1;
-    let cum = 0;
-    for (let i = 1; i < n; i++) {
-      cum += hist[i]!;
-      if (cum >= loT) { loBin = i; break; }
-    }
-    cum = 0;
-    for (let i = 1; i < n; i++) {
-      cum += hist[i]!;
-      if (cum >= hiT) { hiBin = i; break; }
-    }
-    let lo = loBin / n;
-    let hi = hiBin / n;
-    if (hi - lo < 0.02) {
-      const mid = (lo + hi) / 2;
-      lo = Math.max(0, mid - 0.01);
-      hi = Math.min(1, mid + 0.01);
-    }
-    return [lo, hi];
-  };
-
-  // Contrast-limited (global) histogram equalization → a normalized CDF remap LUT. Bins are clipped to
-  // clip×mean and the excess redistributed (OpenCV-style), background bin 0 ignored.
-  const buildEqualizeRemap = (hist: Float32Array, clip: number): Float32Array => {
-    const n = hist.length;
-    const work = new Float32Array(n);
-    let total = 0;
-    for (let i = 1; i < n; i++) { work[i] = hist[i]!; total += hist[i]!; }
-    const lut = new Float32Array(n);
-    if (total <= 0) {
-      for (let i = 0; i < n; i++) lut[i] = i / (n - 1);
-      return lut;
-    }
-    const mean = total / (n - 1);
-    const limit = Math.max(mean, clip * mean);
-    let excess = 0;
-    for (let i = 1; i < n; i++) if (work[i]! > limit) { excess += work[i]! - limit; work[i] = limit; }
-    const add = excess / (n - 1);
-    let sum = 0;
-    for (let i = 1; i < n; i++) { work[i] = work[i]! + add; sum += work[i]!; }
-    let cum = 0;
-    for (let i = 0; i < n; i++) { cum += work[i]!; lut[i] = sum > 0 ? cum / sum : i / (n - 1); }
-    return lut;
-  };
-
-  // Move each bin's mass to its remapped position → the displayed (equalized) histogram.
-  const rebinThroughRemap = (hist: Float32Array, remap: Float32Array): Float32Array => {
-    const n = hist.length;
-    const out = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      const dst = Math.min(n - 1, Math.max(0, Math.round(remap[i]! * (n - 1))));
-      out[dst] += hist[i]!;
-    }
-    return out;
+    curveEditor?.setColorMap(rendering.colorMap);
+    curveEditor?.setPoints(rendering.opacityPoints);
+    curveEditor?.setColorRange([rendering.colorLo, rendering.colorHi]);
   };
 
   // Recompute the equalize remap + displayed histogram from the raw distribution and current toggle.
   const recomputeEqualize = (): void => {
-    if (equalizeOn && rawHistogram) {
-      equalizeRemap = buildEqualizeRemap(rawHistogram, equalizeClip);
+    if (rendering.equalizeOn && rawHistogram) {
+      equalizeRemap = buildEqualizeRemap(rawHistogram, rendering.equalizeClip);
       histogram = rebinThroughRemap(rawHistogram, equalizeRemap);
     } else {
       equalizeRemap = undefined;
@@ -1226,22 +912,22 @@ export async function run(
     requestRender();
     taau.reset(); // any render-setting change → restart temporal accumulation
     volumeRenderer.setParams({
-      densityScale,
-      exposure,
-      stepSize: Math.min(brickStep ?? baseStep, baseStep) * sampleDist,
-      blendMode,
-      gradientOpacity: gradOpacity,
-      gradientOpacityScale: gradScale,
-      lightingStrength: lighting,
+      densityScale: rendering.densityScale,
+      exposure: rendering.exposure,
+      stepSize: Math.min(brickStep ?? baseStep, baseStep) * rendering.sampleDist,
+      blendMode: rendering.blendMode,
+      gradientOpacity: rendering.gradOpacity,
+      gradientOpacityScale: rendering.gradScale,
+      lightingStrength: rendering.lighting,
     });
-    volumeRenderer.setViewMode(viewMode);
-    volumeRenderer.setSlices(sliceX, sliceY, sliceZ);
-    volumeRenderer.setSliceEnabled("x", enX);
-    volumeRenderer.setSliceEnabled("y", enY);
-    volumeRenderer.setSliceEnabled("z", enZ);
-    volumeRenderer.setSlicePlanesVisible(showPlanes);
-    volumeRenderer.setCrop(cropMin, cropMax);
-    volumeRenderer.setShaderConfig(shaderConfig);
+    volumeRenderer.setViewMode(rendering.viewMode);
+    volumeRenderer.setSlices(cropping.sliceX, cropping.sliceY, cropping.sliceZ);
+    volumeRenderer.setSliceEnabled("x", cropping.enX);
+    volumeRenderer.setSliceEnabled("y", cropping.enY);
+    volumeRenderer.setSliceEnabled("z", cropping.enZ);
+    volumeRenderer.setSlicePlanesVisible(cropping.showPlanes);
+    volumeRenderer.setCrop(cropping.cropMin, cropping.cropMax);
+    volumeRenderer.setShaderConfig(rendering.shaderConfig);
     // Visibility feedback drives Milestone 1's ray-guided streaming (steers the ROI shrink toward the
     // most-looked-at region). Only consulted once the camera settles (ROI_HINT_SETTLE), so it no longer
     // thrashes. The per-sample accumulation is a bounded atomicAdd below the empty-space skip.
@@ -1251,17 +937,17 @@ export async function run(
   /** Frame camera looking along the active slice normal (itk-vtk style). */
   const frameSliceCamera = (): void => {
     const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
-    const px = (sliceX - 0.5) * sizeSim.x;
-    const py = (sliceY - 0.5) * sizeSim.y;
-    const pz = (sliceZ - 0.5) * sizeSim.z;
+    const px = (cropping.sliceX - 0.5) * sizeSim.x;
+    const py = (cropping.sliceY - 0.5) * sizeSim.y;
+    const pz = (cropping.sliceZ - 0.5) * sizeSim.z;
     const dist = extent * 1.65;
-    if (viewMode === "xPlane") {
+    if (rendering.viewMode === "xPlane") {
       controls.target.set(px, 0, 0);
       camera.position.set(px + dist, py * 0.05, pz * 0.05);
-    } else if (viewMode === "yPlane") {
+    } else if (rendering.viewMode === "yPlane") {
       controls.target.set(0, py, 0);
       camera.position.set(px * 0.05, py + dist, pz * 0.05);
-    } else if (viewMode === "zPlane") {
+    } else if (rendering.viewMode === "zPlane") {
       controls.target.set(0, 0, pz);
       camera.position.set(px * 0.05, py * 0.05, pz + dist);
     } else {
@@ -1273,33 +959,46 @@ export async function run(
   };
 
   const enterViewMode = (mode: VolumeViewMode, reframe = true): void => {
-    viewMode = mode;
+    rendering.viewMode = mode;
     if (mode === "xPlane") {
-      enX = true;
-      showPlanes = true;
+      cropping.enX = true;
+      cropping.showPlanes = true;
     } else if (mode === "yPlane") {
-      enY = true;
-      showPlanes = true;
+      cropping.enY = true;
+      cropping.showPlanes = true;
     } else if (mode === "zPlane") {
-      enZ = true;
-      showPlanes = true;
+      cropping.enZ = true;
+      cropping.showPlanes = true;
     }
     applyRender();
     if (reframe) frameSliceCamera();
   };
 
+  // Switch view mode (and, for the plane modes, the slice it enables) then notify listeners — view
+  // mode carries both a render mode and slice enables/overlays, so both change events fire together.
+  const setViewModeAndEmit = (
+    mode: VolumeViewMode,
+    opts?: { openSlices?: boolean; skipRenderUi?: boolean },
+  ): void => {
+    enterViewMode(mode, true);
+    if (opts?.openSlices) openSections.add("slices");
+    if (!opts?.skipRenderUi) renderUi();
+    emitRendering();
+    emitCropping();
+  };
+
   const activeSlice = (): { axis: "x" | "y" | "z"; value: number } | null => {
-    if (viewMode === "xPlane") return { axis: "x", value: sliceX };
-    if (viewMode === "yPlane") return { axis: "y", value: sliceY };
-    if (viewMode === "zPlane") return { axis: "z", value: sliceZ };
+    if (rendering.viewMode === "xPlane") return { axis: "x", value: cropping.sliceX };
+    if (rendering.viewMode === "yPlane") return { axis: "y", value: cropping.sliceY };
+    if (rendering.viewMode === "zPlane") return { axis: "z", value: cropping.sliceZ };
     return null;
   };
 
   const setActiveSlice = (v: number): void => {
     const clamped = Math.min(1, Math.max(0, v));
-    if (viewMode === "xPlane") sliceX = clamped;
-    else if (viewMode === "yPlane") sliceY = clamped;
-    else if (viewMode === "zPlane") sliceZ = clamped;
+    if (rendering.viewMode === "xPlane") cropping.sliceX = clamped;
+    else if (rendering.viewMode === "yPlane") cropping.sliceY = clamped;
+    else if (rendering.viewMode === "zPlane") cropping.sliceZ = clamped;
     else return;
     applyRender();
   };
@@ -1318,76 +1017,17 @@ export async function run(
   // deliberately touches only appearance — never camera or cropping. Callers decide whether to emit.
   const applyRenderingState = (state: Partial<WebGpuRenderingState>): void => {
     requestRender();
-    if (state.colorMap !== undefined) colorMap = state.colorMap;
-    if (state.colorLo !== undefined) colorLo = state.colorLo;
-    if (state.colorHi !== undefined) colorHi = state.colorHi;
-    if (state.opacityScale !== undefined) opacityScale = state.opacityScale;
-    if (Array.isArray(state.opacityPoints)) {
-      opacityPoints = state.opacityPoints.map((p) => [p[0], p[1]] as const);
+    // shaderConfig gets its own runtime validation (state may come from untyped localStorage/preset
+    // JSON) — strip it from the generic merge unless it's one of the three known-valid names.
+    const { shaderConfig: rawShaderConfig, opacityPoints: rawOpacityPoints, ...rest } = state;
+    mergeDefined(rendering, rest);
+    if (rawShaderConfig === "baseline" || rawShaderConfig === "fast" || rawShaderConfig === "quality") {
+      rendering.shaderConfig = rawShaderConfig;
     }
-    if (state.densityScale !== undefined) densityScale = state.densityScale;
-    if (state.exposure !== undefined) exposure = state.exposure;
-    if (state.sampleDist !== undefined) sampleDist = state.sampleDist;
-    if (state.blendMode !== undefined) blendMode = state.blendMode;
-    if (state.gradOpacity !== undefined) gradOpacity = state.gradOpacity;
-    if (state.gradScale !== undefined) gradScale = state.gradScale;
-    if (state.lighting !== undefined) lighting = state.lighting;
-    if (state.viewMode !== undefined) viewMode = state.viewMode;
-    // FX
-    fxOperator = state.fxOperator ?? fxOperator;
-    fxExposure = state.fxExposure ?? fxExposure;
-    fxBloom = state.fxBloom ?? fxBloom;
-    fxBloomThreshold = state.fxBloomThreshold ?? fxBloomThreshold;
-    fxBloomIntensity = state.fxBloomIntensity ?? fxBloomIntensity;
-    fxFxaa = state.fxFxaa ?? fxFxaa;
-    fxSharpen = state.fxSharpen ?? fxSharpen;
-    fxSharpenAmount = state.fxSharpenAmount ?? fxSharpenAmount;
-    fxVignette = state.fxVignette ?? fxVignette;
-    fxVignetteAmount = state.fxVignetteAmount ?? fxVignetteAmount;
-    // Lighting
-    lightGlobalOn = state.lightGlobalOn ?? lightGlobalOn;
-    lightGlobalColor = state.lightGlobalColor ?? lightGlobalColor;
-    lightGlobalIntensity = state.lightGlobalIntensity ?? lightGlobalIntensity;
-    lightAzimuth = state.lightAzimuth ?? lightAzimuth;
-    lightElevation = state.lightElevation ?? lightElevation;
-    lightFlashOn = state.lightFlashOn ?? lightFlashOn;
-    lightFlashColor = state.lightFlashColor ?? lightFlashColor;
-    lightFlashIntensity = state.lightFlashIntensity ?? lightFlashIntensity;
-    lightStageOn = state.lightStageOn ?? lightStageOn;
-    lightStageColor = state.lightStageColor ?? lightStageColor;
-    lightStageIntensity = state.lightStageIntensity ?? lightStageIntensity;
-    lightAmbient = state.lightAmbient ?? lightAmbient;
-    lightSpecular = state.lightSpecular ?? lightSpecular;
-    lightRoughness = state.lightRoughness ?? lightRoughness;
-    shadowOn = state.shadowOn ?? shadowOn;
-    shadowQuality = state.shadowQuality ?? shadowQuality;
-    shadowStrength = state.shadowStrength ?? shadowStrength;
-    shadowSoftness = state.shadowSoftness ?? shadowSoftness;
-    shadowCastGlobal = state.shadowCastGlobal ?? shadowCastGlobal;
-    shadowCastFlash = state.shadowCastFlash ?? shadowCastFlash;
-    shadowCastStage = state.shadowCastStage ?? shadowCastStage;
-    aoOn = state.aoOn ?? aoOn;
-    aoRadius = state.aoRadius ?? aoRadius;
-    aoIntensity = state.aoIntensity ?? aoIntensity;
-    aoSamples = state.aoSamples ?? aoSamples;
-    flashConeDeg = state.flashConeDeg ?? flashConeDeg;
-    flashRange = state.flashRange ?? flashRange;
-    stageConeDeg = state.stageConeDeg ?? stageConeDeg;
-    stageRange = state.stageRange ?? stageRange;
-    halfRes = state.halfRes ?? halfRes;
-    temporalAA = state.temporalAA ?? temporalAA;
-    taau.setEnabled(temporalAA);
-    if (state.shaderConfig === "baseline" || state.shaderConfig === "fast" || state.shaderConfig === "quality") {
-      shaderConfig = state.shaderConfig;
+    if (Array.isArray(rawOpacityPoints)) {
+      rendering.opacityPoints = rawOpacityPoints.map((p) => [p[0], p[1]] as const);
     }
-    // Measure plane
-    measurePlaneOn = state.measurePlaneOn ?? measurePlaneOn;
-    measureDepth = state.measureDepth ?? measureDepth;
-    measurePlaneGray = state.measurePlaneGray ?? measurePlaneGray;
-    measurePlaneAlpha = state.measurePlaneAlpha ?? measurePlaneAlpha;
-    // Equalize
-    equalizeOn = state.equalizeOn ?? equalizeOn;
-    equalizeClip = state.equalizeClip ?? equalizeClip;
+    taau.setEnabled(rendering.temporalAA);
     recomputeEqualize(); // rebuild the remap + displayed histogram from this viewer's own data
     applyTf();
     applyRender();
@@ -1421,7 +1061,7 @@ export async function run(
       }
     }
     if (histogram) curveEditor?.setHistogram(histogram);
-    if (equalizeOn) applyTf(); // the remap changed with the new level's distribution
+    if (rendering.equalizeOn) applyTf(); // the remap changed with the new level's distribution
     const [sx, sy, sz] = source.spacingAt(level);
     baseStep = Math.max(
       Math.max(
@@ -1463,7 +1103,7 @@ export async function run(
       max: new Vec3(sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5),
     };
     if (reframe) {
-      if (viewMode === "volume") {
+      if (rendering.viewMode === "volume") {
         controls.distance = frameExtent * 2.2;
         camera.position.set(frameExtent * 1.2, frameExtent * 0.85, frameExtent * 1.2);
         controls.syncFromNode();
@@ -1532,8 +1172,8 @@ export async function run(
         return;
       }
       lastPick = feature;
-      cropMin = [...feature.cropMin] as [number, number, number];
-      cropMax = [...feature.cropMax] as [number, number, number];
+      cropping.cropMin = [...feature.cropMin] as [number, number, number];
+      cropping.cropMax = [...feature.cropMax] as [number, number, number];
       applyRender();
       const u3 = um3();
       pickStatus = `Selected ${feature.voxelCount.toLocaleString()} voxels · ${feature.volume.to(u3).toExponential(3)} ${u3.symbol}`;
@@ -1546,62 +1186,6 @@ export async function run(
       renderUi();
     }
   };
-
-  const section = (id: PanelId, title: string, body: string): string =>
-    `<details class="whud__section" data-section="${id}" ${openSections.has(id) ? "open" : ""}>` +
-    `<summary>${title}</summary>` +
-    `<div class="whud__section-body">${body}</div>` +
-    `</details>`;
-
-  const segBtn = (attr: string, val: string, label: string, active: boolean, disabled = false): string =>
-    `<button type="button" ${attr}="${val}" class="whud__seg-btn${active ? " whud__seg-btn--active" : ""}"${
-      disabled ? " disabled" : ""
-    }>${label}</button>`;
-
-  const slider = (
-    id: string,
-    label: string,
-    value: number,
-    min: number,
-    max: number,
-    step: number,
-  ): string =>
-    `<label class="whud__slider">` +
-    `<span>${label}</span>` +
-    `<input data-slider="${id}" type="range" min="${min}" max="${max}" step="${step}" value="${value}"/>` +
-    `<span data-val="${id}" class="whud__value">${fmt(value)}</span></label>`;
-
-  function fmt(v: number): string {
-    return Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
-  }
-
-  const colorRow = (id: string, label: string, value: string): string =>
-    `<label class="whud__row" style="font-size:11px;align-items:center;gap:8px">${label} ` +
-    `<input type="color" data-color="${id}" value="${value}" style="width:32px;height:20px;padding:0;border:none;background:none;cursor:pointer"/></label>`;
-
-  // Escape a user-supplied preset name for safe interpolation into HTML attribute + text contexts.
-  const escAttr = (s: string): string =>
-    s
-      .replace(/&/g, "&amp;")
-      .replace(/"/g, "&quot;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-
-  // Dual-thumb [lo, hi] range slider. `group` scopes the pair (e.g. "color", "cropX") so one delegated
-  // input handler drives every range: two overlaid range inputs, a visual track/fill, and a value label.
-  const rangeSlider = (
-    group: string,
-    label: string,
-    lo: number,
-    hi: number,
-    step = 0.005,
-  ): string =>
-    `<div class="whud__range" data-range-group="${group}">` +
-    `<div class="whud__range-track"><div class="whud__range-fill" data-range-fill style="left:${lo * 100}%;width:${(hi - lo) * 100}%"></div></div>` +
-    `<input class="whud__range-input" type="range" min="0" max="1" step="${step}" value="${lo}" data-range="${group}:lo" aria-label="${label} low"/>` +
-    `<input class="whud__range-input" type="range" min="0" max="1" step="${step}" value="${hi}" data-range="${group}:hi" aria-label="${label} high"/>` +
-    `</div>` +
-    `<div class="whud__range-labels"><span>${label}</span><span data-range-vals>${fmt(lo)} – ${fmt(hi)}</span></div>`;
 
   const renderUi = (): void => {
     requestRender(); // catch-all: any HUD interaction that rebuilds the panel also repaints the canvas
@@ -1639,42 +1223,42 @@ export async function run(
 
     // TF section
     const maps = colorMapNames()
-      .map((m) => `<option value="${m}" ${m === colorMap ? "selected" : ""}>${m}</option>`)
+      .map((m) => `<option value="${m}" ${m === rendering.colorMap ? "selected" : ""}>${m}</option>`)
       .join("");
     const tfBody = [
       `<label class="whud__row" style="font-size:11px">Colormap <select id="cmap" class="whud__select">${maps}</select></label>`,
-      slider("opacityScale", "Opacity ×", opacityScale, 0.05, 2, 0.01),
+      slider("opacityScale", "Opacity ×", rendering.opacityScale, 0.05, 2, 0.01),
       `<div class="whud__hint">Opacity curve (drag · dbl-click add) · volume histogram behind</div>`,
       `<canvas id="opacity-curve" style="width:100%;height:84px;display:block;touch-action:none;cursor:crosshair"></canvas>`,
       // Dual-thumb color-range slider under the graph — both heads set [colorLo, colorHi] together.
-      rangeSlider("color", "Color range", colorLo, colorHi, 0.005),
+      rangeSlider("color", "Color range", rendering.colorLo, rendering.colorHi, 0.005),
       // Auto contrast: percentile auto-window + global contrast-limited equalization.
       `<div class="whud__row" style="gap:8px;margin-top:4px">` +
         `<button type="button" data-act="autoContrast" class="whud__seg-btn">Auto</button>` +
-        `<label class="whud__check" style="margin:0"><input type="checkbox" data-chk="equalizeOn" ${equalizeOn ? "checked" : ""}/> Equalize</label>` +
+        `<label class="whud__check" style="margin:0"><input type="checkbox" data-chk="equalizeOn" ${rendering.equalizeOn ? "checked" : ""}/> Equalize</label>` +
         `</div>`,
-      slider("equalizeClip", "Clip limit", equalizeClip, 1, 8, 0.5),
+      slider("equalizeClip", "Clip limit", rendering.equalizeClip, 1, 8, 0.5),
     ].join("");
 
     // Render section
     const blends: VolumeBlendMode[] = ["composite", "mip", "minip", "average"];
     const blendBtns = blends
-      .map((b) => segBtn("data-blend", b, b, blendMode === b))
+      .map((b) => segBtn("data-blend", b, b, rendering.blendMode === b))
       .join("");
     const renderBody = [
       `<div class="whud__seg">${blendBtns}</div>`,
       `<div class="whud__hint" style="margin-top:6px">Shader config</div>`,
       `<div class="whud__seg">${(["baseline", "fast", "quality"] as const)
-        .map((c) => segBtn("data-shader", c, c, shaderConfig === c))
+        .map((c) => segBtn("data-shader", c, c, rendering.shaderConfig === c))
         .join("")}</div>`,
       `<div class="whud__hint">baseline = plain march. fast/quality = empty-space leap + tiled draw (faster on data with air margins). quality adds cinematic shading (multi-scatter / ambient) — arriving with M7; identical to fast until then.</div>`,
       `<button type="button" data-act="exportPng" class="whud__seg-btn" style="margin-top:6px">Export PNG (stamped)</button>`,
-      slider("sampleDist", "Sample dist", sampleDist, 0.35, 3, 0.05),
-      slider("density", "Density", densityScale, 0.2, 4, 0.05),
-      slider("exposure", "Exposure", exposure, 0.2, 4, 0.05),
-      slider("gradOp", "Grad opacity", gradOpacity, 0, 1, 0.01),
-      slider("gradScale", "Grad scale", gradScale, 0.02, 0.5, 0.01),
-      slider("lighting", "Lighting", lighting, 0, 1, 0.01),
+      slider("sampleDist", "Sample dist", rendering.sampleDist, 0.35, 3, 0.05),
+      slider("density", "Density", rendering.densityScale, 0.2, 4, 0.05),
+      slider("exposure", "Exposure", rendering.exposure, 0.2, 4, 0.05),
+      slider("gradOp", "Grad opacity", rendering.gradOpacity, 0, 1, 0.01),
+      slider("gradScale", "Grad scale", rendering.gradScale, 0.02, 0.5, 0.01),
+      slider("lighting", "Lighting", rendering.lighting, 0, 1, 0.01),
     ].join("");
 
     // Slices section
@@ -1685,7 +1269,7 @@ export async function run(
       ["zPlane", "Z (axial)"],
     ];
     const modeBtns = modes
-      .map(([m, lab]) => segBtn("data-view", m, lab, viewMode === m))
+      .map(([m, lab]) => segBtn("data-view", m, lab, rendering.viewMode === m))
       .join("");
     const active = activeSlice();
     const [nx, ny, nz] = source.dimensionsAt(level);
@@ -1706,15 +1290,15 @@ export async function run(
       `<div class="whud__seg">${modeBtns}</div>`,
       primary,
       `<details style="margin-top:8px"><summary style="cursor:pointer;color:var(--whud-muted);font-size:11px">Overlays &amp; all axes</summary>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="showPlanes" ${showPlanes ? "checked" : ""}/> Show plane overlays in 3D</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="showPlanes" ${cropping.showPlanes ? "checked" : ""}/> Show plane overlays in 3D</label>`,
       `<div class="whud__row">`,
-      `<label class="whud__check"><input type="checkbox" data-chk="enX" ${enX ? "checked" : ""}/> X</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="enY" ${enY ? "checked" : ""}/> Y</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="enZ" ${enZ ? "checked" : ""}/> Z</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="enX" ${cropping.enX ? "checked" : ""}/> X</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="enY" ${cropping.enY ? "checked" : ""}/> Y</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="enZ" ${cropping.enZ ? "checked" : ""}/> Z</label>`,
       `</div>`,
-      slider("sliceX", "X", sliceX, 0, 1, 0.005),
-      slider("sliceY", "Y", sliceY, 0, 1, 0.005),
-      slider("sliceZ", "Z", sliceZ, 0, 1, 0.005),
+      slider("sliceX", "X", cropping.sliceX, 0, 1, 0.005),
+      slider("sliceY", "Y", cropping.sliceY, 0, 1, 0.005),
+      slider("sliceZ", "Z", cropping.sliceZ, 0, 1, 0.005),
       `<button type="button" data-act="frameSlice" class="whud__seg-btn" style="margin-top:6px">Reframe to slice</button>`,
       `</details>`,
     ].join("");
@@ -1722,9 +1306,9 @@ export async function run(
     // Crop section — one dual-thumb [min, max] slider per axis (ROI in UVW 0–1).
     const cropBody = [
       `<div class="whud__hint">ROI crop (UVW 0–1)</div>`,
-      rangeSlider("cropX", "X", cropMin[0], cropMax[0], 0.01),
-      rangeSlider("cropY", "Y", cropMin[1], cropMax[1], 0.01),
-      rangeSlider("cropZ", "Z", cropMin[2], cropMax[2], 0.01),
+      rangeSlider("cropX", "X", cropping.cropMin[0], cropping.cropMax[0], 0.01),
+      rangeSlider("cropY", "Y", cropping.cropMin[1], cropping.cropMax[1], 0.01),
+      rangeSlider("cropZ", "Z", cropping.cropMin[2], cropping.cropMax[2], 0.01),
       `<button type="button" data-act="resetCrop" class="whud__seg-btn" style="margin-top:6px">Reset crop</button>`,
     ].join("");
 
@@ -1741,10 +1325,10 @@ export async function run(
         ].join("")
       : "";
     const measureBody = [
-      `<label class="whud__check"><input type="checkbox" data-chk="measurePlaneOn" ${measurePlaneOn ? "checked" : ""}/> Measure plane (camera-linked ruler)</label>`,
-      slider("measureDepth", "Plane depth (front→back)", measureDepth, 0, 1, 0.01),
-      slider("measureGray", "Plane gray", measurePlaneGray, 0, 1, 0.02),
-      slider("measureAlpha", "Plane opacity", measurePlaneAlpha, 0, 1, 0.02),
+      `<label class="whud__check"><input type="checkbox" data-chk="measurePlaneOn" ${rendering.measurePlaneOn ? "checked" : ""}/> Measure plane (camera-linked ruler)</label>`,
+      slider("measureDepth", "Plane depth (front→back)", rendering.measureDepth, 0, 1, 0.01),
+      slider("measureGray", "Plane gray", rendering.measurePlaneGray, 0, 1, 0.02),
+      slider("measureAlpha", "Plane opacity", rendering.measurePlaneAlpha, 0, 1, 0.02),
       `<div class="whud__hint">A grey sheet that sweeps from the volume's front face (0) to its back face (1) along the view axis, tracking zoom; the volume in front of it occludes it and it dims volume behind, so you can read depth. Rulers calibrate to this plane; off = exact at the volume center.</div>`,
       `<div class="whud__hint" style="margin-top:8px">Click a structure to grow a connected component and measure its physical volume (current LOD).</div>`,
       `<label class="whud__check"><input type="checkbox" data-chk="pickMode" ${pickMode ? "checked" : ""}/> Pick mode (or Ctrl+click)</label>`,
@@ -1757,57 +1341,57 @@ export async function run(
     // Post FX section — tonemap (always on) + toggle-gated bloom / FXAA / sharpen / vignette.
     const tmOps: ToneMapOperator[] = ["aces", "reinhard", "reinhard-extended"];
     const tmOptions = tmOps
-      .map((o) => `<option value="${o}" ${o === fxOperator ? "selected" : ""}>${o}</option>`)
+      .map((o) => `<option value="${o}" ${o === rendering.fxOperator ? "selected" : ""}>${o}</option>`)
       .join("");
     const postfxBody = [
       `<label class="whud__row" style="font-size:11px">Tonemap <select id="fxop" class="whud__select">${tmOptions}</select></label>`,
-      slider("fxExposure", "Exposure (stops)", fxExposure, -4, 4, 0.05),
-      `<label class="whud__check"><input type="checkbox" data-chk="fxBloom" ${fxBloom ? "checked" : ""}/> Bloom</label>`,
-      slider("fxBloomThreshold", "Bloom threshold", fxBloomThreshold, 0, 3, 0.05),
-      slider("fxBloomIntensity", "Bloom intensity", fxBloomIntensity, 0, 2, 0.05),
-      `<label class="whud__check"><input type="checkbox" data-chk="fxFxaa" ${fxFxaa ? "checked" : ""}/> FXAA (anti-alias edges)</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="fxSharpen" ${fxSharpen ? "checked" : ""}/> Sharpen</label>`,
-      slider("fxSharpenAmount", "Sharpen amount", fxSharpenAmount, 0, 2, 0.05),
-      `<label class="whud__check"><input type="checkbox" data-chk="fxVignette" ${fxVignette ? "checked" : ""}/> Vignette</label>`,
-      slider("fxVignetteAmount", "Vignette amount", fxVignetteAmount, 0, 1, 0.02),
+      slider("fxExposure", "Exposure (stops)", rendering.fxExposure, -4, 4, 0.05),
+      `<label class="whud__check"><input type="checkbox" data-chk="fxBloom" ${rendering.fxBloom ? "checked" : ""}/> Bloom</label>`,
+      slider("fxBloomThreshold", "Bloom threshold", rendering.fxBloomThreshold, 0, 3, 0.05),
+      slider("fxBloomIntensity", "Bloom intensity", rendering.fxBloomIntensity, 0, 2, 0.05),
+      `<label class="whud__check"><input type="checkbox" data-chk="fxFxaa" ${rendering.fxFxaa ? "checked" : ""}/> FXAA (anti-alias edges)</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="fxSharpen" ${rendering.fxSharpen ? "checked" : ""}/> Sharpen</label>`,
+      slider("fxSharpenAmount", "Sharpen amount", rendering.fxSharpenAmount, 0, 2, 0.05),
+      `<label class="whud__check"><input type="checkbox" data-chk="fxVignette" ${rendering.fxVignette ? "checked" : ""}/> Vignette</label>`,
+      slider("fxVignetteAmount", "Vignette amount", rendering.fxVignetteAmount, 0, 1, 0.02),
     ].join("");
 
     // Lighting section — three modes (global / camera flashlight / 4-corner stage) each with color +
     // intensity, shared shading params, volumetric shadows, ambient occlusion, and a half-res lever.
     const lightingBody = [
-      `<label class="whud__check"><input type="checkbox" data-chk="lightGlobalOn" ${lightGlobalOn ? "checked" : ""}/> Global directional</label>`,
-      colorRow("lightGlobalColor", "Color", lightGlobalColor),
-      slider("lightGlobalIntensity", "Intensity", lightGlobalIntensity, 0, 4, 0.05),
-      slider("lightAzimuth", "Azimuth°", lightAzimuth, 0, 360, 1),
-      slider("lightElevation", "Elevation°", lightElevation, -90, 90, 1),
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightFlashOn" ${lightFlashOn ? "checked" : ""}/> Camera flashlight</label>`,
-      colorRow("lightFlashColor", "Color", lightFlashColor),
-      slider("lightFlashIntensity", "Intensity", lightFlashIntensity, 0, 4, 0.05),
-      slider("flashConeDeg", "Cone°", flashConeDeg, 10, 89, 1),
-      slider("flashRange", "Range ×ext", flashRange, 1, 20, 0.5),
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightStageOn" ${lightStageOn ? "checked" : ""}/> Stage lights (4 corners)</label>`,
-      colorRow("lightStageColor", "Color", lightStageColor),
-      slider("lightStageIntensity", "Intensity", lightStageIntensity, 0, 4, 0.05),
-      slider("stageConeDeg", "Cone°", stageConeDeg, 10, 89, 1),
-      slider("stageRange", "Range ×ext", stageRange, 1, 20, 0.5),
+      `<label class="whud__check"><input type="checkbox" data-chk="lightGlobalOn" ${rendering.lightGlobalOn ? "checked" : ""}/> Global directional</label>`,
+      colorRow("lightGlobalColor", "Color", rendering.lightGlobalColor),
+      slider("lightGlobalIntensity", "Intensity", rendering.lightGlobalIntensity, 0, 4, 0.05),
+      slider("lightAzimuth", "Azimuth°", rendering.lightAzimuth, 0, 360, 1),
+      slider("lightElevation", "Elevation°", rendering.lightElevation, -90, 90, 1),
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightFlashOn" ${rendering.lightFlashOn ? "checked" : ""}/> Camera flashlight</label>`,
+      colorRow("lightFlashColor", "Color", rendering.lightFlashColor),
+      slider("lightFlashIntensity", "Intensity", rendering.lightFlashIntensity, 0, 4, 0.05),
+      slider("flashConeDeg", "Cone°", rendering.flashConeDeg, 10, 89, 1),
+      slider("flashRange", "Range ×ext", rendering.flashRange, 1, 20, 0.5),
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="lightStageOn" ${rendering.lightStageOn ? "checked" : ""}/> Stage lights (4 corners)</label>`,
+      colorRow("lightStageColor", "Color", rendering.lightStageColor),
+      slider("lightStageIntensity", "Intensity", rendering.lightStageIntensity, 0, 4, 0.05),
+      slider("stageConeDeg", "Cone°", rendering.stageConeDeg, 10, 89, 1),
+      slider("stageRange", "Range ×ext", rendering.stageRange, 1, 20, 0.5),
       `<div class="whud__hint" style="margin-top:6px">Shading</div>`,
-      slider("lightAmbient", "Ambient", lightAmbient, 0, 1, 0.01),
-      slider("lightSpecular", "Specular", lightSpecular, 0, 2, 0.05),
-      slider("lightRoughness", "Roughness", lightRoughness, 0, 1, 0.02),
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="shadowOn" ${shadowOn ? "checked" : ""}/> Shadows</label>`,
-      slider("shadowQuality", "Shadow steps", shadowQuality, 4, 64, 1),
-      slider("shadowStrength", "Shadow strength", shadowStrength, 0, 1, 0.02),
-      slider("shadowSoftness", "Shadow softness", shadowSoftness, 0, 1, 0.02),
+      slider("lightAmbient", "Ambient", rendering.lightAmbient, 0, 1, 0.01),
+      slider("lightSpecular", "Specular", rendering.lightSpecular, 0, 2, 0.05),
+      slider("lightRoughness", "Roughness", rendering.lightRoughness, 0, 1, 0.02),
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="shadowOn" ${rendering.shadowOn ? "checked" : ""}/> Shadows</label>`,
+      slider("shadowQuality", "Shadow steps", rendering.shadowQuality, 4, 64, 1),
+      slider("shadowStrength", "Shadow strength", rendering.shadowStrength, 0, 1, 0.02),
+      slider("shadowSoftness", "Shadow softness", rendering.shadowSoftness, 0, 1, 0.02),
       `<div class="whud__hint" style="margin-top:4px">Casters (fewer = faster)</div>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastGlobal" ${shadowCastGlobal ? "checked" : ""}/> Global</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastFlash" ${shadowCastFlash ? "checked" : ""}/> Flashlight</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastStage" ${shadowCastStage ? "checked" : ""}/> Stage</label>`,
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="aoOn" ${aoOn ? "checked" : ""}/> Ambient occlusion</label>`,
-      slider("aoRadius", "AO radius", aoRadius, 0.01, 0.3, 0.01),
-      slider("aoIntensity", "AO intensity", aoIntensity, 0, 1, 0.02),
-      slider("aoSamples", "AO samples", aoSamples, 1, 16, 1),
-      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${halfRes ? "checked" : ""}/> Half resolution</label>`,
-      `<label class="whud__check"><input type="checkbox" data-chk="temporalAA" ${temporalAA ? "checked" : ""}/> Temporal AA (accumulate when still)</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastGlobal" ${rendering.shadowCastGlobal ? "checked" : ""}/> Global</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastFlash" ${rendering.shadowCastFlash ? "checked" : ""}/> Flashlight</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="shadowCastStage" ${rendering.shadowCastStage ? "checked" : ""}/> Stage</label>`,
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="aoOn" ${rendering.aoOn ? "checked" : ""}/> Ambient occlusion</label>`,
+      slider("aoRadius", "AO radius", rendering.aoRadius, 0.01, 0.3, 0.01),
+      slider("aoIntensity", "AO intensity", rendering.aoIntensity, 0, 1, 0.02),
+      slider("aoSamples", "AO samples", rendering.aoSamples, 1, 16, 1),
+      `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${rendering.halfRes ? "checked" : ""}/> Half resolution</label>`,
+      `<label class="whud__check"><input type="checkbox" data-chk="temporalAA" ${rendering.temporalAA ? "checked" : ""}/> Temporal AA (accumulate when still)</label>`,
       `<label class="whud__check"><input type="checkbox" data-chk="roiEnabled" ${roiEnabled ? "checked" : ""}/> High-res ROI (stream visible detail)</label>`,
       `<div id="roiProgressWrap" style="margin-top:6px;${roiProgress ? "" : "display:none"}">` +
         `<div style="display:flex;justify-content:space-between;font-size:10px;opacity:0.85">` +
@@ -1853,15 +1437,15 @@ export async function run(
         `aria-label="${collapsed ? "Expand panel" : "Collapse panel"}">${collapsed ? "\u2039" : "\u203A"}</button>` +
         `</div>`,
       `<div class="whud__status">L${level} · ${dx}×${dy}×${dz}${loading ? " · loading…" : ""}${pickMode ? " · PICK" : ""}${brickLevel !== undefined ? ` · ROI L${brickLevel}` : ""}</div>`,
-      section("data", "Data", dataBody),
-      section("tf", "Transfer Function", tfBody),
-      section("render", "Render", renderBody),
-      section("lighting", "Lighting", lightingBody),
-      section("slices", "Slices", slicesBody),
-      section("crop", "Crop", cropBody),
-      section("measure", "Measure", measureBody),
-      section("postfx", "Post FX", postfxBody),
-      section("presets", "Presets", presetsBody),
+      section(openSections, "data", "Data", dataBody),
+      section(openSections, "tf", "Transfer Function", tfBody),
+      section(openSections, "render", "Render", renderBody),
+      section(openSections, "lighting", "Lighting", lightingBody),
+      section(openSections, "slices", "Slices", slicesBody),
+      section(openSections, "crop", "Crop", cropBody),
+      section(openSections, "measure", "Measure", measureBody),
+      section(openSections, "postfx", "Post FX", postfxBody),
+      section(openSections, "presets", "Presets", presetsBody),
       `<div class="whud__hint">Pan: Space+drag / Shift / middle / right · wheel zooms to cursor · P / Ctrl+click pick · [ ] LOD · O open</div>`,
     ].join("");
 
@@ -1877,11 +1461,11 @@ export async function run(
     if (!collapsed && openSections.has("tf")) {
       const c = ui.querySelector<HTMLCanvasElement>("#opacity-curve");
       if (c) {
-        curveEditor = new OpacityCurveEditor(c, opacityPoints, {
-          colorMap,
-          colorRange: [colorLo, colorHi],
+        curveEditor = new OpacityCurveEditor(c, rendering.opacityPoints, {
+          colorMap: rendering.colorMap,
+          colorRange: [rendering.colorLo, rendering.colorHi],
           onChange: (pts) => {
-            opacityPoints = pts.map((p) => [p[0], p[1]] as const);
+            rendering.opacityPoints = pts.map((p) => [p[0], p[1]] as const);
             applyTf();
             emitRendering();
           },
@@ -1907,14 +1491,14 @@ export async function run(
       return;
     }
     if (btn.dataset.blend) {
-      blendMode = btn.dataset.blend as VolumeBlendMode;
+      rendering.blendMode = btn.dataset.blend as VolumeBlendMode;
       applyRender();
       renderUi();
       emitRendering();
       return;
     }
     if (btn.dataset.shader) {
-      shaderConfig = btn.dataset.shader as ShaderConfigName;
+      rendering.shaderConfig = btn.dataset.shader as ShaderConfigName;
       applyRender();
       renderUi();
       emitRendering();
@@ -1929,27 +1513,18 @@ export async function run(
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `tomo-${shaderConfig}.png`;
+        a.download = `tomo-${rendering.shaderConfig}.png`;
         a.click();
         URL.revokeObjectURL(url);
       })();
       return;
     }
     if (btn.dataset.view) {
-      enterViewMode(btn.dataset.view as VolumeViewMode, true);
-      openSections.add("slices");
-      renderUi();
-      // View mode carries both a render mode and slice enables/overlays.
-      emitRendering();
-      emitCropping();
+      setViewModeAndEmit(btn.dataset.view as VolumeViewMode, { openSlices: true });
       return;
     }
     if (btn.dataset.act === "resetCrop") {
-      cropMin = [0, 0, 0];
-      cropMax = [1, 1, 1];
-      applyRender();
-      renderUi();
-      emitCropping();
+      resetCrop();
       return;
     }
     if (btn.dataset.act === "frameSlice") {
@@ -1959,7 +1534,10 @@ export async function run(
     if (btn.dataset.act === "autoContrast") {
       // Percentile auto-window from the true distribution → color levels; refresh UI + slider thumbs.
       if (rawHistogram) {
-        [colorLo, colorHi] = autoWindow(rawHistogram);
+        [rendering.colorLo, rendering.colorHi] = autoWindow(rawHistogram, [
+          rendering.colorLo,
+          rendering.colorHi,
+        ]);
         applyTf();
         renderUi();
         emitRendering();
@@ -2001,23 +1579,19 @@ export async function run(
     if (btn.dataset.act === "clearPick") {
       lastPick = undefined;
       pickStatus = "";
-      cropMin = [0, 0, 0];
-      cropMax = [1, 1, 1];
-      applyRender();
-      renderUi();
-      emitCropping();
+      resetCrop();
     }
   });
 
   ui.addEventListener("change", (e) => {
     const t = e.target as HTMLSelectElement;
     if (t.id === "cmap") {
-      colorMap = t.value as ColorMapName;
+      rendering.colorMap = t.value as ColorMapName;
       applyTf();
-      curveEditor?.setColorMap(colorMap);
+      curveEditor?.setColorMap(rendering.colorMap);
       emitRendering();
     } else if (t.id === "fxop") {
-      fxOperator = t.value as ToneMapOperator;
+      rendering.fxOperator = t.value as ToneMapOperator;
       rebuildFxStack();
       emitRendering();
     } else if (t.id === "presetSelect") {
@@ -2076,10 +1650,10 @@ export async function run(
     const t = e.target as HTMLInputElement;
     if (t.dataset.chk) {
       const on = t.checked;
-      if (t.dataset.chk === "showPlanes") showPlanes = on;
-      if (t.dataset.chk === "enX") enX = on;
-      if (t.dataset.chk === "enY") enY = on;
-      if (t.dataset.chk === "enZ") enZ = on;
+      if (t.dataset.chk === "showPlanes") cropping.showPlanes = on;
+      if (t.dataset.chk === "enX") cropping.enX = on;
+      if (t.dataset.chk === "enY") cropping.enY = on;
+      if (t.dataset.chk === "enZ") cropping.enZ = on;
       if (t.dataset.chk === "pickMode") {
         pickMode = on;
         canvas.style.cursor = pickMode ? "crosshair" : "";
@@ -2092,16 +1666,16 @@ export async function run(
         t.dataset.chk === "fxSharpen" ||
         t.dataset.chk === "fxVignette"
       ) {
-        if (t.dataset.chk === "fxBloom") fxBloom = on;
-        else if (t.dataset.chk === "fxFxaa") fxFxaa = on;
-        else if (t.dataset.chk === "fxSharpen") fxSharpen = on;
-        else if (t.dataset.chk === "fxVignette") fxVignette = on;
+        if (t.dataset.chk === "fxBloom") rendering.fxBloom = on;
+        else if (t.dataset.chk === "fxFxaa") rendering.fxFxaa = on;
+        else if (t.dataset.chk === "fxSharpen") rendering.fxSharpen = on;
+        else if (t.dataset.chk === "fxVignette") rendering.fxVignette = on;
         rebuildFxStack();
         emitRendering();
         return;
       }
       if (t.dataset.chk === "equalizeOn") {
-        equalizeOn = on;
+        rendering.equalizeOn = on;
         recomputeEqualize();
         applyTf();
         renderUi(); // refresh the histogram (equalized vs raw) + curve editor
@@ -2109,7 +1683,7 @@ export async function run(
         return;
       }
       if (t.dataset.chk === "measurePlaneOn") {
-        measurePlaneOn = on; // the render loop reads this live; just emit for links/share
+        rendering.measurePlaneOn = on; // the render loop reads this live; just emit for links/share
         emitRendering();
         return;
       }
@@ -2130,16 +1704,16 @@ export async function run(
         t.dataset.chk === "shadowCastFlash" ||
         t.dataset.chk === "shadowCastStage"
       ) {
-        if (t.dataset.chk === "lightGlobalOn") lightGlobalOn = on;
-        else if (t.dataset.chk === "lightFlashOn") lightFlashOn = on;
-        else if (t.dataset.chk === "lightStageOn") lightStageOn = on;
-        else if (t.dataset.chk === "shadowOn") shadowOn = on;
-        else if (t.dataset.chk === "aoOn") aoOn = on;
-        else if (t.dataset.chk === "halfRes") halfRes = on;
-        else if (t.dataset.chk === "temporalAA") { temporalAA = on; taau.setEnabled(on); }
-        else if (t.dataset.chk === "shadowCastGlobal") shadowCastGlobal = on;
-        else if (t.dataset.chk === "shadowCastFlash") shadowCastFlash = on;
-        else if (t.dataset.chk === "shadowCastStage") shadowCastStage = on;
+        if (t.dataset.chk === "lightGlobalOn") rendering.lightGlobalOn = on;
+        else if (t.dataset.chk === "lightFlashOn") rendering.lightFlashOn = on;
+        else if (t.dataset.chk === "lightStageOn") rendering.lightStageOn = on;
+        else if (t.dataset.chk === "shadowOn") rendering.shadowOn = on;
+        else if (t.dataset.chk === "aoOn") rendering.aoOn = on;
+        else if (t.dataset.chk === "halfRes") rendering.halfRes = on;
+        else if (t.dataset.chk === "temporalAA") { rendering.temporalAA = on; taau.setEnabled(on); }
+        else if (t.dataset.chk === "shadowCastGlobal") rendering.shadowCastGlobal = on;
+        else if (t.dataset.chk === "shadowCastFlash") rendering.shadowCastFlash = on;
+        else if (t.dataset.chk === "shadowCastStage") rendering.shadowCastStage = on;
         applyLighting();
         emitRendering();
         return;
@@ -2150,9 +1724,9 @@ export async function run(
     }
     if (t.dataset.color) {
       const cid = t.dataset.color;
-      if (cid === "lightGlobalColor") lightGlobalColor = t.value;
-      else if (cid === "lightFlashColor") lightFlashColor = t.value;
-      else if (cid === "lightStageColor") lightStageColor = t.value;
+      if (cid === "lightGlobalColor") rendering.lightGlobalColor = t.value;
+      else if (cid === "lightFlashColor") rendering.lightFlashColor = t.value;
+      else if (cid === "lightStageColor") rendering.lightStageColor = t.value;
       emitRendering();
       return;
     }
@@ -2182,15 +1756,15 @@ export async function run(
       const vals = wrap.nextElementSibling?.querySelector("[data-range-vals]");
       if (vals) vals.textContent = `${fmt(lo)} – ${fmt(hi)}`;
       if (group === "color") {
-        colorLo = lo;
-        colorHi = hi;
+        rendering.colorLo = lo;
+        rendering.colorHi = hi;
         applyTf();
-        curveEditor?.setColorRange([colorLo, colorHi]);
+        curveEditor?.setColorRange([rendering.colorLo, rendering.colorHi]);
         emitRendering();
       } else if (group === "cropX" || group === "cropY" || group === "cropZ") {
         const axis = group === "cropX" ? 0 : group === "cropY" ? 1 : 2;
-        cropMin[axis] = lo;
-        cropMax[axis] = hi;
+        cropping.cropMin[axis] = lo;
+        cropping.cropMax[axis] = hi;
         applyRender();
         emitCropping();
       }
@@ -2203,48 +1777,48 @@ export async function run(
     if (lab) lab.textContent = fmt(v);
     switch (id) {
       case "opacityScale":
-        opacityScale = v;
+        rendering.opacityScale = v;
         applyTf();
         break;
       case "measureDepth":
-        measureDepth = v; // the render loop reads these live (ruler + plane depth/appearance)
+        rendering.measureDepth = v; // the render loop reads these live (ruler + plane depth/appearance)
         break;
       case "measureGray":
-        measurePlaneGray = v;
+        rendering.measurePlaneGray = v;
         break;
       case "measureAlpha":
-        measurePlaneAlpha = v;
+        rendering.measurePlaneAlpha = v;
         break;
       case "equalizeClip":
-        equalizeClip = v;
-        if (equalizeOn) {
+        rendering.equalizeClip = v;
+        if (rendering.equalizeOn) {
           recomputeEqualize();
           applyTf();
           if (histogram) curveEditor?.setHistogram(histogram);
         }
         break;
       case "sampleDist":
-        sampleDist = v;
+        rendering.sampleDist = v;
         applyRender();
         break;
       case "density":
-        densityScale = v;
+        rendering.densityScale = v;
         applyRender();
         break;
       case "exposure":
-        exposure = v;
+        rendering.exposure = v;
         applyRender();
         break;
       case "gradOp":
-        gradOpacity = v;
+        rendering.gradOpacity = v;
         applyRender();
         break;
       case "gradScale":
-        gradScale = v;
+        rendering.gradScale = v;
         applyRender();
         break;
       case "lighting":
-        lighting = v;
+        rendering.lighting = v;
         applyRender();
         break;
       case "activeSlice":
@@ -2268,100 +1842,100 @@ export async function run(
         }
         break;
       case "sliceX":
-        sliceX = v;
+        cropping.sliceX = v;
         applyRender();
         break;
       case "sliceY":
-        sliceY = v;
+        cropping.sliceY = v;
         applyRender();
         break;
       case "sliceZ":
-        sliceZ = v;
+        cropping.sliceZ = v;
         applyRender();
         break;
       case "fxExposure":
-        fxExposure = v;
+        rendering.fxExposure = v;
         rebuildFxStack();
         break;
       case "fxBloomThreshold":
-        fxBloomThreshold = v;
+        rendering.fxBloomThreshold = v;
         rebuildFxStack();
         break;
       case "fxBloomIntensity":
-        fxBloomIntensity = v;
+        rendering.fxBloomIntensity = v;
         rebuildFxStack();
         break;
       case "fxSharpenAmount":
-        fxSharpenAmount = v;
+        rendering.fxSharpenAmount = v;
         rebuildFxStack();
         break;
       case "fxVignetteAmount":
-        fxVignetteAmount = v;
+        rendering.fxVignetteAmount = v;
         rebuildFxStack();
         break;
       case "lightGlobalIntensity":
-        lightGlobalIntensity = v;
+        rendering.lightGlobalIntensity = v;
         break;
       case "lightAzimuth":
-        lightAzimuth = v;
+        rendering.lightAzimuth = v;
         break;
       case "lightElevation":
-        lightElevation = v;
+        rendering.lightElevation = v;
         break;
       case "lightFlashIntensity":
-        lightFlashIntensity = v;
+        rendering.lightFlashIntensity = v;
         break;
       case "lightStageIntensity":
-        lightStageIntensity = v;
+        rendering.lightStageIntensity = v;
         break;
       case "lightAmbient":
-        lightAmbient = v;
+        rendering.lightAmbient = v;
         applyLighting();
         break;
       case "lightSpecular":
-        lightSpecular = v;
+        rendering.lightSpecular = v;
         applyLighting();
         break;
       case "lightRoughness":
-        lightRoughness = v;
+        rendering.lightRoughness = v;
         applyLighting();
         break;
       case "shadowQuality":
-        shadowQuality = v;
+        rendering.shadowQuality = v;
         applyLighting();
         break;
       case "shadowStrength":
-        shadowStrength = v;
+        rendering.shadowStrength = v;
         applyLighting();
         break;
       case "aoRadius":
-        aoRadius = v;
+        rendering.aoRadius = v;
         applyLighting();
         break;
       case "aoIntensity":
-        aoIntensity = v;
+        rendering.aoIntensity = v;
         applyLighting();
         break;
       case "shadowSoftness":
-        shadowSoftness = v;
+        rendering.shadowSoftness = v;
         applyLighting();
         break;
       case "aoSamples":
-        aoSamples = v;
+        rendering.aoSamples = v;
         applyLighting();
         break;
       // Cone/range feed buildFrameLights (rebuilt per frame) — just store the value.
       case "flashConeDeg":
-        flashConeDeg = v;
+        rendering.flashConeDeg = v;
         break;
       case "flashRange":
-        flashRange = v;
+        rendering.flashRange = v;
         break;
       case "stageConeDeg":
-        stageConeDeg = v;
+        rendering.stageConeDeg = v;
         break;
       case "stageRange":
-        stageRange = v;
+        rendering.stageRange = v;
         break;
       default:
         break;
@@ -2396,12 +1970,12 @@ export async function run(
 
   // Slice scrub with wheel in plane views.
   const onSliceWheel = (e: WheelEvent): void => {
-    if (viewMode === "volume" || e.ctrlKey || e.metaKey) return;
+    if (rendering.viewMode === "volume" || e.ctrlKey || e.metaKey) return;
     e.preventDefault();
     const n =
-      viewMode === "xPlane"
+      rendering.viewMode === "xPlane"
         ? source.dimensionsAt(level)[0]!
-        : viewMode === "yPlane"
+        : rendering.viewMode === "yPlane"
           ? source.dimensionsAt(level)[1]!
           : source.dimensionsAt(level)[2]!;
     const step = 1 / Math.max(n, 2);
@@ -2435,29 +2009,13 @@ export async function run(
       if (e.code === "BracketLeft" && idx < levels.length - 1) applyLevel(levels[idx + 1]!);
       else if (e.code === "BracketRight" && idx > 0) applyLevel(levels[idx - 1]!);
       else if (e.code === "Digit1") {
-        enterViewMode("xPlane", true);
-        openSections.add("slices");
-        renderUi();
-        emitRendering();
-        emitCropping();
+        setViewModeAndEmit("xPlane", { openSlices: true });
       } else if (e.code === "Digit2") {
-        enterViewMode("yPlane", true);
-        openSections.add("slices");
-        renderUi();
-        emitRendering();
-        emitCropping();
+        setViewModeAndEmit("yPlane", { openSlices: true });
       } else if (e.code === "Digit3") {
-        enterViewMode("zPlane", true);
-        openSections.add("slices");
-        renderUi();
-        emitRendering();
-        emitCropping();
+        setViewModeAndEmit("zPlane", { openSlices: true });
       } else if (e.code === "Digit4") {
-        enterViewMode("volume", true);
-        openSections.add("slices");
-        renderUi();
-        emitRendering();
-        emitCropping();
+        setViewModeAndEmit("volume", { openSlices: true });
       } else if (e.code === "KeyF") {
         frameSliceCamera();
       } else if (e.code === "KeyP") {
@@ -2466,17 +2024,15 @@ export async function run(
         openSections.add("measure");
         renderUi();
       } else if (e.code === "KeyS") {
-        showPlanes = !showPlanes;
-        if (showPlanes) {
-          enX = enY = enZ = true;
+        cropping.showPlanes = !cropping.showPlanes;
+        if (cropping.showPlanes) {
+          cropping.enX = cropping.enY = cropping.enZ = true;
         }
         applyRender();
         renderUi();
         emitCropping();
       } else if (e.code === "KeyR") {
-        enterViewMode("volume", true);
-        emitRendering();
-        emitCropping();
+        setViewModeAndEmit("volume", { skipRenderUi: true });
       } else if (e.code === "KeyO") {
         const next = await pickZarrStore();
         if (!next) return;
@@ -2491,13 +2047,9 @@ export async function run(
         lastRegion = null;
         if (levels.length) applyLevel(finestTargetLevel(), true);
       } else if (e.code === "KeyE") {
-        cropMin = [0, 0, 0];
-        cropMax = [1, 1, 1];
         lastPick = undefined;
         pickStatus = "";
-        applyRender();
-        renderUi();
-        emitCropping();
+        resetCrop();
       }
     })();
   });
@@ -2624,9 +2176,9 @@ export async function run(
     // brute march (which marches toward the actual light position). Map on only when the global light is
     // the caster.
     let shadowDir: [number, number, number] | null = null;
-    if (shadowOn && lightGlobalOn && shadowCastGlobal) {
-      const el = (lightElevation * Math.PI) / 180;
-      const az = (lightAzimuth * Math.PI) / 180;
+    if (rendering.shadowOn && rendering.lightGlobalOn && rendering.shadowCastGlobal) {
+      const el = (rendering.lightElevation * Math.PI) / 180;
+      const az = (rendering.lightAzimuth * Math.PI) / 180;
       shadowDir = [Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)];
     }
     volumeRenderer.setShadowMap(shadowDir !== null, shadowDir ?? [0.45, 0.85, 0.35]);
@@ -2640,24 +2192,24 @@ export async function run(
       0.5 * (sizeSim.x * Math.abs(fx) + sizeSim.y * Math.abs(fy) + sizeSim.z * Math.abs(fz));
     const frontDepth = Math.max(centerDepth - halfDepth, near);
     const backDepth = Math.max(centerDepth + halfDepth, frontDepth + 1e-6);
-    const planeT = Math.min(1, Math.max(0, measureDepth));
+    const planeT = Math.min(1, Math.max(0, rendering.measureDepth));
     const planeDepth = frontDepth + planeT * (backDepth - frontDepth);
     updateRoi(dt);
     // Adaptive sampling: coarsen the ray step while navigating (camera moving) for a smooth framerate,
     // then refine once settled. `roiIdle` is seconds since the camera last moved (updated in updateRoi).
     // Coarsen instantly for responsiveness; ease back to the configured `sampleDist` over ~0.4 s so the
     // sharpening isn't a visible pop. max(NAV_SAMPLE_DIST, sampleDist) keeps a coarse slider still coarse.
-    const navTarget = roiIdle < NAV_SETTLE ? Math.max(NAV_SAMPLE_DIST, sampleDist) : sampleDist;
+    const navTarget = roiIdle < NAV_SETTLE ? Math.max(NAV_SAMPLE_DIST, rendering.sampleDist) : rendering.sampleDist;
     if (navTarget > navSampleDist) navSampleDist = navTarget;
     else navSampleDist += (navTarget - navSampleDist) * Math.min(1, dt * 8);
     volumeRenderer.setParams({ stepSize: Math.min(brickStep ?? baseStep, baseStep) * navSampleDist });
     // Measure plane: depth-composited grey sheet at `planeDepth` along the view axis. Must run before
     // recordInto (writes the frame uniform).
     volumeRenderer.setMeasurePlane({
-      enabled: measurePlaneOn,
+      enabled: rendering.measurePlaneOn,
       depth: planeDepth,
-      gray: measurePlaneGray,
-      alpha: measurePlaneAlpha,
+      gray: rendering.measurePlaneGray,
+      alpha: rendering.measurePlaneAlpha,
       forward: [fx, fy, fz],
     });
     // Volume → linear HDR, then the post stack to the swapchain (one encoder / one submit). The DOM
@@ -2672,11 +2224,11 @@ export async function run(
     // the projection sub-pixel so successive converged frames supersample; the un-jittered viewProj still
     // drives ROI/overlay.
     let renderViewProj = viewProj;
-    if (temporalAA) {
+    if (rendering.temporalAA) {
       // "Settled" = camera stopped AND the adaptive step has finished refining. On the moving→settled
       // edge, reseed accumulation so the sharp frames replace the coarse in-motion history; a moving view
       // keeps converging via reprojection rather than resetting.
-      const settled = roiIdle >= NAV_SETTLE && Math.abs(navSampleDist - sampleDist) < 0.02;
+      const settled = roiIdle >= NAV_SETTLE && Math.abs(navSampleDist - rendering.sampleDist) < 0.02;
       if (settled && !taauPrevSettled) taau.reset();
       taauPrevSettled = settled;
       // Reprojection inputs use the UN-jittered matrices (jitter is only for the render's sub-pixel
@@ -2721,7 +2273,7 @@ export async function run(
     // orbit-pivot distance by default, or the camera-linked measure plane depth (a fraction across the
     // volume's view-axis footprint) when the plane is on (the plane itself is rendered by the volume
     // shader). ~80px major spacing.
-    const measureDist = measurePlaneOn ? planeDepth : controls.distance;
+    const measureDist = rendering.measurePlaneOn ? planeDepth : controls.distance;
     let ruler: {
       majorPx: number;
       minorPerMajor: number;
@@ -2757,8 +2309,8 @@ export async function run(
     lastRenderCam = camNow;
     lastRenderW = canvas.width;
     lastRenderH = canvas.height;
-    const adaptiveEasing = Math.abs(navSampleDist - sampleDist) > 0.005;
-    const taauConverging = temporalAA && taau.sampleCount < taau.maxAccum;
+    const adaptiveEasing = Math.abs(navSampleDist - rendering.sampleDist) > 0.005;
+    const taauConverging = rendering.temporalAA && taau.sampleCount < taau.maxAccum;
     const brickFading = brickBlendCurrent !== brickBlendTarget;
     if (adaptiveEasing || taauConverging || brickFading) requestRender();
   });
@@ -2780,15 +2332,10 @@ export async function run(
     setRendering: applyRenderingState,
     getCropping: readCropping,
     setCropping: (state) => {
-      cropMin = [state.cropMin[0], state.cropMin[1], state.cropMin[2]];
-      cropMax = [state.cropMax[0], state.cropMax[1], state.cropMax[2]];
-      sliceX = state.sliceX;
-      sliceY = state.sliceY;
-      sliceZ = state.sliceZ;
-      enX = state.enX;
-      enY = state.enY;
-      enZ = state.enZ;
-      showPlanes = state.showPlanes;
+      Object.assign(cropping, state);
+      // Defensive copies so a caller mutating their own `state` object afterward can't reach in.
+      cropping.cropMin = [state.cropMin[0], state.cropMin[1], state.cropMin[2]];
+      cropping.cropMax = [state.cropMax[0], state.cropMax[1], state.cropMax[2]];
       applyRender();
       renderUi();
     },
