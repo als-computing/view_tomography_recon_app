@@ -149,11 +149,15 @@ export function scaleColor4(out: MutableColor4, c: Color4Like, s: number): Mutab
 
 /** Component-wise `out = a * b` (modulate). */
 export function multiplyColor3(out: MutableColor3, a: Color3Like, b: Color3Like): MutableColor3 {
-  const A = writeColor3([0, 0, 0], a);
-  const B = writeColor3([0, 0, 0], b);
-  out[0] = A[0] * B[0];
-  out[1] = A[1] * B[1];
-  out[2] = A[2] * B[2];
+  const ax = isColor3Tuple(a) ? a[0] : a.x;
+  const ay = isColor3Tuple(a) ? a[1] : a.y;
+  const az = isColor3Tuple(a) ? a[2] : a.z;
+  const bx = isColor3Tuple(b) ? b[0] : b.x;
+  const by = isColor3Tuple(b) ? b[1] : b.y;
+  const bz = isColor3Tuple(b) ? b[2] : b.z;
+  out[0] = ax * bx;
+  out[1] = ay * by;
+  out[2] = az * bz;
   return out;
 }
 
@@ -164,11 +168,15 @@ export function lerpColor3(
   b: Color3Like,
   t: number,
 ): MutableColor3 {
-  const A = writeColor3([0, 0, 0], a);
-  const B = writeColor3([0, 0, 0], b);
-  out[0] = A[0] + (B[0] - A[0]) * t;
-  out[1] = A[1] + (B[1] - A[1]) * t;
-  out[2] = A[2] + (B[2] - A[2]) * t;
+  const ax = isColor3Tuple(a) ? a[0] : a.x;
+  const ay = isColor3Tuple(a) ? a[1] : a.y;
+  const az = isColor3Tuple(a) ? a[2] : a.z;
+  const bx = isColor3Tuple(b) ? b[0] : b.x;
+  const by = isColor3Tuple(b) ? b[1] : b.y;
+  const bz = isColor3Tuple(b) ? b[2] : b.z;
+  out[0] = ax + (bx - ax) * t;
+  out[1] = ay + (by - ay) * t;
+  out[2] = az + (bz - az) * t;
   return out;
 }
 
@@ -179,12 +187,18 @@ export function lerpColor4(
   b: Color4Like,
   t: number,
 ): MutableColor4 {
-  const A = writeColor4([0, 0, 0, 1], a);
-  const B = writeColor4([0, 0, 0, 1], b);
-  out[0] = A[0] + (B[0] - A[0]) * t;
-  out[1] = A[1] + (B[1] - A[1]) * t;
-  out[2] = A[2] + (B[2] - A[2]) * t;
-  out[3] = A[3] + (B[3] - A[3]) * t;
+  const ax = isColor4Tuple(a) || isColor3Tuple(a) ? a[0] : a.x;
+  const ay = isColor4Tuple(a) || isColor3Tuple(a) ? a[1] : a.y;
+  const az = isColor4Tuple(a) || isColor3Tuple(a) ? a[2] : a.z;
+  const aw = isColor4Tuple(a) ? a[3] : isColor3Tuple(a) ? 1 : "w" in a ? a.w : 1;
+  const bx = isColor4Tuple(b) || isColor3Tuple(b) ? b[0] : b.x;
+  const by = isColor4Tuple(b) || isColor3Tuple(b) ? b[1] : b.y;
+  const bz = isColor4Tuple(b) || isColor3Tuple(b) ? b[2] : b.z;
+  const bw = isColor4Tuple(b) ? b[3] : isColor3Tuple(b) ? 1 : "w" in b ? b.w : 1;
+  out[0] = ax + (bx - ax) * t;
+  out[1] = ay + (by - ay) * t;
+  out[2] = az + (bz - az) * t;
+  out[3] = aw + (bw - aw) * t;
   return out;
 }
 

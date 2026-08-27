@@ -5,29 +5,19 @@
  */
 
 import { SCIVIS_MAPS, type ColorStop } from "./sciviscolor-maps.js";
-
-/** RGB sample in linear [0, 1]. */
-export type Rgb = readonly [number, number, number];
+import { lerpColor3, type Color3 } from "../../math/color.js";
 
 /** A named colormap: `t` in `[0, 1]` → RGB. */
-export type ColorMapFn = (t: number) => Rgb;
+export type ColorMapFn = (t: number) => Color3;
 
-function lerp3(a: Rgb, b: Rgb, u: number): Rgb {
-  return [
-    a[0] + (b[0] - a[0]) * u,
-    a[1] + (b[1] - a[1]) * u,
-    a[2] + (b[2] - a[2]) * u,
-  ];
-}
-
-function sampleStops(stops: readonly Rgb[], t: number): Rgb {
+function sampleStops(stops: readonly Color3[], t: number): Color3 {
   const x = Math.min(1, Math.max(0, t));
   const n = stops.length;
   if (n === 0) return [0, 0, 0];
   if (n === 1) return stops[0]!;
   const f = x * (n - 1);
   const i = Math.min(n - 2, Math.floor(f));
-  return lerp3(stops[i]!, stops[i + 1]!, f - i);
+  return lerpColor3([0, 0, 0], stops[i]!, stops[i + 1]!, f - i);
 }
 
 /** Built-in (evenly-spaced) colormap names. */
@@ -47,7 +37,7 @@ export type BuiltinColorMapName =
  */
 export type ColorMapName = BuiltinColorMapName | (string & {});
 
-const MAPS: Record<BuiltinColorMapName, readonly Rgb[]> = {
+const MAPS: Record<BuiltinColorMapName, readonly Color3[]> = {
   grayscale: [
     [0, 0, 0],
     [1, 1, 1],
@@ -104,7 +94,7 @@ const MAPS: Record<BuiltinColorMapName, readonly Rgb[]> = {
 };
 
 /** Sample a positioned-stop colormap (SciVisColor maps have non-uniform x positions). */
-function samplePositioned(stops: readonly ColorStop[], t: number): Rgb {
+function samplePositioned(stops: readonly ColorStop[], t: number): Color3 {
   const x = Math.min(1, Math.max(0, t));
   const n = stops.length;
   if (n === 0) return [0, 0, 0];
@@ -125,7 +115,7 @@ function samplePositioned(stops: readonly ColorStop[], t: number): Rgb {
 }
 
 /** Sample a named colormap — a built-in (evenly-spaced) or a SciVisColor map (positioned stops). */
-export function sampleColorMap(name: ColorMapName, t: number): Rgb {
+export function sampleColorMap(name: ColorMapName, t: number): Color3 {
   const builtin = MAPS[name as BuiltinColorMapName];
   if (builtin) return sampleStops(builtin, t);
   const scivis = SCIVIS_MAPS[name];

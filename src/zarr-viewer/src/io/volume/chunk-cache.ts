@@ -31,8 +31,13 @@ export class DecodedChunkCache {
     return v;
   }
 
-  /** Insert/replace a chunk, evicting the least-recently-used entries to stay under budget. */
+  /**
+   * Insert/replace a chunk, evicting the least-recently-used entries to stay under budget.
+   * A chunk larger than the entire budget is rejected outright — `budgetBytes` is a hard cap, so
+   * admitting it would otherwise leave the cache permanently over budget (nothing left to evict).
+   */
   public set(key: string, chunk: VolumeChunk): void {
+    if (chunkBytes(chunk) > this.budgetBytes) return;
     const existing = this.map.get(key);
     if (existing) {
       this.bytes -= chunkBytes(existing);

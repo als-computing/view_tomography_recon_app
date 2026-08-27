@@ -28,7 +28,7 @@
       }
       // Fallback when no origin was injected: match zarr requests by path.
       return resolved.href.includes('zarr');
-    } catch (e) {
+    } catch (_e) {
       return false;
     }
   };
@@ -43,7 +43,7 @@
       const payload = JSON.parse(atob(base64));
       if (typeof payload.exp !== 'number') return true;
       return Date.now() >= payload.exp * 1000 - skewSeconds * 1000;
-    } catch (e) {
+    } catch (_e) {
       return true;
     }
   };

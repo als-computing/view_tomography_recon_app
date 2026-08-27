@@ -7,7 +7,7 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 export default [
   // Ignore build output — including the vendored WebGPU renderer's own standalone build under
   // src/zarr-viewer/ (its source is TypeScript and isn't linted here anyway).
-  { ignores: ['dist', '**/dist', 'src/zarr-viewer/node_modules'] },
+  { ignores: ['dist', '**/dist', 'src/zarr-viewer/node_modules', '.vite'] },
   {
     files: ['**/*.{js,jsx}'],
     languageOptions: {
@@ -31,6 +31,12 @@ export default [
       ...react.configs['jsx-runtime'].rules,
       ...reactHooks.configs.recommended.rules,
       'react/jsx-no-target-blank': 'off',
+      // Props are documented via JSDoc (see component file headers) rather than
+      // PropTypes throughout this codebase; the prop-types package isn't a dependency.
+      'react/prop-types': 'off',
+      // `_`-prefixed names mark an intentionally unused binding (matches the
+      // convention already used on the TypeScript side under src/zarr-viewer/).
+      'no-unused-vars': ['error', { argsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' }],
       'react-refresh/only-export-components': [
         'warn',
         { allowConstantExport: true },

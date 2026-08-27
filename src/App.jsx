@@ -12,7 +12,7 @@
  * @return {JSX.Element}
  */
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Header } from './Header';
 import './App.css';
 

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ['main']
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build root app
+        run: npm run build
+
+      - name: Install zarr-viewer dependencies
+        working-directory: src/zarr-viewer
+        run: npm ci
+
+      - name: Typecheck zarr-viewer
+        working-directory: src/zarr-viewer
+        run: npm run typecheck
+
+      - name: Test zarr-viewer
+        working-directory: src/zarr-viewer
+        run: npm test
+
+      - name: Build zarr-viewer
+        working-directory: src/zarr-viewer
+        run: npm run build

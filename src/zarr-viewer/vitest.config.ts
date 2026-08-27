@@ -16,7 +16,7 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["src/render/accel/test/**/*.spec.ts"],
+    include: ["src/**/test/**/*.spec.ts"],
     environment: "node",
   },
 });

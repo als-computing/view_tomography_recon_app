@@ -12,7 +12,7 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "noUnusedLocals": false,
-    "noUnusedParameters": false,
+    "noUnusedParameters": true,
     "paths": {
       "@zarr-viewer/core": ["./src/core/index.ts"],
       "@zarr-viewer/math": ["./src/math/index.ts"],
