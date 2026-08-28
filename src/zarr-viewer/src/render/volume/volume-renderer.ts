@@ -11,22 +11,14 @@ import { Mat4, asColor3, type Color3, type Color3Like, type Color4Like } from "@
 import type { GpuContext } from "../device/context.js";
 import { ManagedBuffer } from "../resources/buffer.js";
 import { ManagedTexture } from "../resources/texture.js";
-import { PipelineCache } from "../resources/pipeline.js";
 import { toGpuColor } from "../color.js";
 import { TransferFunction } from "./transfer-function.js";
-import {
-  VOLUME_FRAME_UNIFORM_SIZE,
-  VOLUME_BACKGROUND_WGSL,
-  volumeRaymarchWgsl,
-} from "../shaders/volume-raymarch.js";
-import { LightingEnvironment, type GpuLight } from "../lighting/index.js";
+import { VOLUME_FRAME_UNIFORM_SIZE } from "../shaders/volume-raymarch.js";
+import type { GpuLight } from "../lighting/index.js";
 import { type ShaderConfigName, specializationFor } from "../accel/shader-config.js";
 import { hashTransferFunction, type RenderProvenance } from "../accel/provenance.js";
-import { VisibilityFeedback, VIS_GRID_DEFAULT } from "../accel/visibility.js";
-import { OccupancyGrid } from "../accel/occupancy.js";
-import { TileCompactor, TILE_SIZE } from "../accel/tiles.js";
-import { ShadowMap } from "../accel/shadow-map.js";
-import { aabbScreenBbox } from "./volume-math.js";
+import type { VisibilityFeedback } from "../accel/visibility.js";
+import { VolumeAcceleration } from "../accel/volume-acceleration.js";
 import { computeProvenance, approximateShadingBanner } from "./volume-provenance.js";
 import {
   applyLiquidShading,
@@ -36,32 +28,16 @@ import {
   type MeasurePlaneParams,
 } from "./volume-shading-params.js";
 import { applyVolumeLighting, type VolumeLightingParams } from "./volume-lighting.js";
+import {
+  writeVolumeFrameUniform,
+  type VolumeBlendMode,
+  type VolumeViewMode,
+} from "./volume-uniforms.js";
+import { VolumePipeline, VOLUME_DEPTH_FORMAT } from "./volume-pipeline.js";
+import { VolumeBindings } from "./volume-bindings.js";
 
-/**
- * Second render target of the volume pass (Milestone 5.1): the transmittance-weighted depth centroid,
- * normalized by the far plane. Consumed by TAAU reprojection; a single filterable channel is enough.
- */
-export const VOLUME_DEPTH_FORMAT: GPUTextureFormat = "r16float";
-
-/** Volume blend / compositing mode (itk-vtk `setImageBlendMode`). */
-export type VolumeBlendMode = "composite" | "mip" | "minip" | "average";
-
-/** Primary view mode. */
-export type VolumeViewMode = "volume" | "xPlane" | "yPlane" | "zPlane";
-
-const BLEND_MODE_ID: Record<VolumeBlendMode, number> = {
-  composite: 0,
-  mip: 1,
-  minip: 2,
-  average: 3,
-};
-
-const VIEW_MODE_ID: Record<VolumeViewMode, number> = {
-  volume: 0,
-  xPlane: 1,
-  yPlane: 2,
-  zPlane: 3,
-};
+export type { VolumeBlendMode, VolumeViewMode } from "./volume-uniforms.js";
+export { VOLUME_DEPTH_FORMAT } from "./volume-pipeline.js";
 
 /** Options for {@link VolumeRenderer}. */
 export interface VolumeRendererOptions {
@@ -104,7 +80,8 @@ export interface VolumeRendererOptions {
  * Ray-marches a volume each frame from an explicit view/projection.
  */
 export class VolumeRenderer implements Disposable {
-  private readonly cache: PipelineCache;
+  private readonly pipelineMgr: VolumePipeline;
+  private readonly bindings: VolumeBindings;
   private readonly clearColor: GPUColor;
   /** Color format the ray-march pipeline renders into (swapchain format by default). */
   public readonly colorFormat: GPUTextureFormat;
@@ -147,37 +124,18 @@ export class VolumeRenderer implements Disposable {
   private lastLut: Uint8Array | undefined;
   private lastLutSize = 512;
   private tfHash = "lut:00000000";
-  private dirtyOccMinMax = true;
-  private dirtyOccTf = true;
-  private bindGroupLayout: GPUBindGroupLayout | undefined;
-  private pipelineLayout: GPUPipelineLayout | undefined;
-  private bgPipeline: GPURenderPipeline | undefined;
-  private bgBindGroup: GPUBindGroup | undefined;
-  private occupancy: OccupancyGrid | undefined;
-  private readonly vis: VisibilityFeedback;
-  private readonly tiles: TileCompactor;
-  private dummyOcc: ManagedBuffer;
-  private dummyPrefix: ManagedBuffer;
-  private dummyTiles: ManagedBuffer;
+  // Occupancy grid, tile compactor, visibility feedback, opacity shadow map, and the multi-light
+  // storage buffer, plus their rebuild bookkeeping — see render/accel/volume-acceleration.ts.
+  private readonly acceleration: VolumeAcceleration;
   // Milestone 3.1 pre-integration: cumulative-extinction LUT (rebuilt with the TF); dummy when unused.
   private tPreintBuffer: ManagedBuffer | undefined;
   private dummyPreint: ManagedBuffer;
-  // Milestone 7.1: light-space opacity shadow map (rebuilt on demand from TF / density / light dir).
-  private readonly shadowMap: ShadowMap;
-  private shadowMapEnabled = false;
-  private shadowMapBuilt = false;
-  private dirtyShadow = true;
-  private shadowLightDir: [number, number, number] = [0.45, 0.85, 0.35];
-  private readonly worldToLight = new Float32Array(16);
   // Far-plane distance used to normalize the depth-centroid output (Milestone 5.1 TAAU reprojection).
   private reprojectFar = 1;
 
-  // Multi-light shading (prism lighting library). The light list is rebuilt per frame by the viewer
-  // (global / camera flashlight / stage) and uploaded to this storage buffer; the control params
-  // below drive the shader's shadow-ray and ambient-occlusion marching.
-  private readonly lightEnv: LightingEnvironment;
   private disposed = false;
-  private numLights = 0;
+  // Multi-light shading (prism lighting library) formula params: the light list itself lives on
+  // `acceleration`; these scalars drive the shader's shadow-ray and ambient-occlusion marching.
   private masterAmbient = 0.22;
   private specStrength = 0.4;
   private roughnessL = 0.6;
@@ -203,13 +161,8 @@ export class VolumeRenderer implements Disposable {
   private tanHalfFovY = Math.tan((42 * Math.PI) / 180 / 2);
   private camAspect = 1;
 
-  private pipeline: GPURenderPipeline | undefined;
-  private frameUniform: ManagedBuffer | undefined;
-  private bindGroup: GPUBindGroup | undefined;
   private volumeTex: ManagedTexture | undefined;
   private tfTex: ManagedTexture | undefined;
-  private volumeSampler: GPUSampler | undefined;
-  private tfSampler: GPUSampler | undefined;
   // High-res ROI brick composited over the coarse volume (null = none; coarse tex is bound as a dummy).
   private brickTex: ManagedTexture | undefined;
   private brickEnabled = false;
@@ -224,7 +177,8 @@ export class VolumeRenderer implements Disposable {
     public readonly ctx: GpuContext,
     options: VolumeRendererOptions = {},
   ) {
-    this.cache = new PipelineCache(ctx.device);
+    this.pipelineMgr = new VolumePipeline(ctx);
+    this.bindings = new VolumeBindings(ctx.device);
     this.clearColor = toGpuColor(options.clearColor ?? [0.02, 0.03, 0.05, 1]);
     this.colorFormat = options.colorFormat ?? ctx.format;
     this.linearOutput = options.linearOutput ?? false;
@@ -250,43 +204,19 @@ export class VolumeRenderer implements Disposable {
     this.gradientOpacityScale = options.gradientOpacityScale ?? 0.15;
     this.lightingStrength = options.lightingStrength ?? 1;
     this.masterAmbient = this.ambient;
-    // Storage buffer of packed lights (bound at binding 5). Small capacity: this viewer uses at most
-    // ~6 procedural lights (1 global + 1 flashlight + 4 stage).
-    this.lightEnv = new LightingEnvironment(ctx.device, 16);
+    this.acceleration = new VolumeAcceleration(ctx.device);
     if (options.liquidShading) this.setLiquidShading(options.liquidShading);
-    this.vis = new VisibilityFeedback(ctx.device, [
-      VIS_GRID_DEFAULT,
-      VIS_GRID_DEFAULT,
-      VIS_GRID_DEFAULT,
-    ]);
-    this.tiles = new TileCompactor(ctx.device);
-    this.dummyOcc = OccupancyGrid.dummy(ctx.device);
-    this.dummyPrefix = OccupancyGrid.dummyPrefix(ctx.device);
-    this.dummyTiles = TileCompactor.dummyTiles(ctx.device);
     this.dummyPreint = new ManagedBuffer(
       ctx.device,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       8,
     );
-    this.shadowMap = new ShadowMap(ctx.device);
   }
 
   public setVolume(texture: ManagedTexture): void {
     this.volumeTex = texture;
-    this.bindGroup = undefined;
-    const size = texture.desc.size;
-    const same =
-      this.occupancy &&
-      this.occupancy.grid[0] === Math.max(1, Math.ceil(size[0] / this.occupancy.cellSize)) &&
-      this.occupancy.grid[1] === Math.max(1, Math.ceil(size[1] / this.occupancy.cellSize)) &&
-      this.occupancy.grid[2] === Math.max(1, Math.ceil(size[2] / this.occupancy.cellSize));
-    if (!same) {
-      this.occupancy?.dispose();
-      this.occupancy = new OccupancyGrid(this.ctx.device, size);
-    }
-    this.dirtyOccMinMax = true;
-    this.dirtyOccTf = true;
-    this.dirtyShadow = true;
+    this.bindings.invalidate();
+    this.acceleration.notifyVolumeChanged(texture.desc.size);
   }
 
   /**
@@ -295,13 +225,7 @@ export class VolumeRenderer implements Disposable {
    * rebuilds on the next pre-pass; unchanged inputs cost nothing.
    */
   public setShadowMap(enabled: boolean, lightDir: readonly [number, number, number]): void {
-    const dot =
-      lightDir[0] * this.shadowLightDir[0] +
-      lightDir[1] * this.shadowLightDir[1] +
-      lightDir[2] * this.shadowLightDir[2];
-    if (enabled !== this.shadowMapEnabled || dot < 0.9995) this.dirtyShadow = true;
-    this.shadowMapEnabled = enabled;
-    this.shadowLightDir = [lightDir[0], lightDir[1], lightDir[2]];
+    this.acceleration.setShadowMap(enabled, lightDir);
   }
 
   /**
@@ -320,7 +244,7 @@ export class VolumeRenderer implements Disposable {
       this.brickMin = [worldMin[0], worldMin[1], worldMin[2]];
       this.brickMax = [worldMax[0], worldMax[1], worldMax[2]];
     }
-    this.bindGroup = undefined; // texture binding changed
+    this.bindings.invalidate(); // texture binding changed
   }
 
   /** Fade weight [0,1] for the brick (drives smooth zoom-out); no bind-group rebuild. */
@@ -353,8 +277,8 @@ export class VolumeRenderer implements Disposable {
     this.lastLut = lut;
     this.lastLutSize = lutSize;
     this.tfHash = hashTransferFunction(lut);
-    this.dirtyOccTf = true;
-    this.dirtyShadow = true;
+    this.acceleration.markOccupancyTfDirty();
+    this.acceleration.markShadowDirty();
     // Milestone 3.1: cumulative extinction LUT T(d) = ∫₀^d α(x) dx (trapezoidal), kept f32 for the
     // cancellation-prone ratio form. Rebuilt with the TF; consumed by the quality shader's pre-integration.
     const tCurve = new Float32Array(lutSize);
@@ -369,7 +293,7 @@ export class VolumeRenderer implements Disposable {
     }
     this.tPreintBuffer?.dispose();
     this.tPreintBuffer = ManagedBuffer.fromData(this.ctx.device, GPUBufferUsage.STORAGE, tCurve);
-    this.bindGroup = undefined;
+    this.bindings.invalidate();
   }
 
   /**
@@ -400,8 +324,7 @@ export class VolumeRenderer implements Disposable {
    * procedural studio environment (`envRadiance`/`background`).
    */
   public setLights(lights: readonly GpuLight[]): void {
-    this.lightEnv.setLights(lights);
-    this.numLights = this.lightEnv.lightCount;
+    this.acceleration.setLights(lights);
   }
 
   /**
@@ -457,8 +380,8 @@ export class VolumeRenderer implements Disposable {
   public setShaderConfig(name: ShaderConfigName): void {
     if (this.shaderConfig === name) return;
     this.shaderConfig = name;
-    this.pipeline = undefined;
-    this.bindGroup = undefined;
+    this.pipelineMgr.invalidatePipeline();
+    this.bindings.invalidate();
   }
 
   public getShaderConfig(): ShaderConfigName {
@@ -468,12 +391,12 @@ export class VolumeRenderer implements Disposable {
   /** Enable ray-guided vis-bin accumulation (default off). */
   public setVisibilityFeedback(enabled: boolean): void {
     this.visEnabled = enabled;
-    this.vis.enabled = enabled;
+    this.acceleration.setVisibilityEnabled(enabled);
   }
 
   /** Latest decoded vis-bin weights, or `undefined` before the first readback. */
   public get visibility(): VisibilityFeedback {
-    return this.vis;
+    return this.acceleration.visibilityFeedback;
   }
 
   /** Early-ray-termination alpha threshold in `(0, 1]` (default `0.995`). */
@@ -524,62 +447,31 @@ export class VolumeRenderer implements Disposable {
     eye: { x: number; y: number; z: number },
   ): void {
     const spec = specializationFor(this.shaderConfig);
-    this.ensurePipeline();
+    this.pipelineMgr.ensure(this.shaderConfig, this.colorFormat);
     this.writeUniforms(viewProj, eye, { clear: true });
-    if (spec.occupancy && this.occupancy && this.volumeTex) {
-      if (this.dirtyOccMinMax) {
-        this.occupancy.rebuildMinMax(encoder, this.volumeTex);
-        this.dirtyOccMinMax = false;
-        this.dirtyOccTf = true;
-      }
-      if (this.dirtyOccTf && this.lastLut) {
-        this.occupancy.rebuildForTransferFunction(encoder, this.lastLut, this.lastLutSize);
-        this.dirtyOccTf = false;
-        this.bindGroup = undefined;
-      }
-    }
-    if (spec.tiles && this.frameUniform) {
-      const bbox = aabbScreenBbox(viewProj, this.internalWidth, this.internalHeight, this.boxHalf, TILE_SIZE);
-      const rebuilt = this.tiles.record(
-        encoder,
-        this.frameUniform.gpu,
-        spec.occupancy ? this.occupancy : undefined,
-        this.dummyOcc.gpu,
-        this.internalWidth,
-        this.internalHeight,
-        bbox,
-      );
-      if (rebuilt) this.bindGroup = undefined;
-    }
-    // Milestone 7.1: rebuild the opacity shadow map only when dirty (TF / density / light dir changed)
-    // and shadows are on. Render-on-demand keeps this off the idle path.
-    if (
-      this.shadowMapEnabled &&
-      this.shadowEnable &&
-      this.dirtyShadow &&
-      this.volumeTex &&
-      this.tfTex &&
-      this.tfSampler
-    ) {
-      const t = this.shadowMap.rebuild(encoder, this.volumeTex, this.tfTex, this.tfSampler, {
-        lightDir: this.shadowLightDir,
-        boxHalf: this.boxHalf,
-        densityScale: this.densityScale,
-        sigmaMul: 12,
-        cropMin: this.cropMin,
-        cropMax: this.cropMax,
-      });
-      this.worldToLight.set(t.worldToLightUvw);
-      this.shadowMapBuilt = true;
-      this.dirtyShadow = false;
-    }
-    this.vis.recordCopy(encoder);
+    const bindGroupDirty = this.acceleration.runPrePasses(encoder, {
+      viewProj,
+      spec,
+      volumeTex: this.volumeTex,
+      lastLut: this.lastLut,
+      lastLutSize: this.lastLutSize,
+      frameUniformGpu: this.pipelineMgr.uniformBuffer.gpu,
+      internalWidth: this.internalWidth,
+      internalHeight: this.internalHeight,
+      boxHalf: this.boxHalf,
+      tfTex: this.tfTex,
+      tfSampler: this.pipelineMgr.tfSamplerHandle,
+      shadowEnable: this.shadowEnable,
+      densityScale: this.densityScale,
+      cropMin: this.cropMin,
+      cropMax: this.cropMax,
+    });
+    if (bindGroupDirty) this.bindings.invalidate();
   }
-
 
   /** Map pending vis-bin readback. Must run after the encoder that copied it has been submitted. */
   public afterSubmit(): void {
-    this.vis.afterSubmit();
+    this.acceleration.afterSubmit();
   }
 
   /**
@@ -626,14 +518,16 @@ export class VolumeRenderer implements Disposable {
     // The shadow map excludes cropped-away material, so a crop change invalidates it (only when it
     // actually changed — setCrop is re-called every applyRender).
     if (nmin.some((v, i) => v !== this.cropMin[i]) || nmax.some((v, i) => v !== this.cropMax[i])) {
-      this.dirtyShadow = true;
+      this.acceleration.markShadowDirty();
     }
     this.cropMin = nmin;
     this.cropMax = nmax;
   }
 
   public resetCrop(): void {
-    if (this.cropMin[0] !== 0 || this.cropMin[1] !== 0 || this.cropMin[2] !== 0) this.dirtyShadow = true;
+    if (this.cropMin[0] !== 0 || this.cropMin[1] !== 0 || this.cropMin[2] !== 0) {
+      this.acceleration.markShadowDirty();
+    }
     this.cropMin = [0, 0, 0];
     this.cropMax = [1, 1, 1];
   }
@@ -678,7 +572,7 @@ export class VolumeRenderer implements Disposable {
     if (params.stepSize !== undefined) this.stepSize = params.stepSize;
     if (params.densityScale !== undefined && params.densityScale !== this.densityScale) {
       this.densityScale = params.densityScale;
-      this.dirtyShadow = true; // τ scales with density → the shadow map must rebuild
+      this.acceleration.markShadowDirty(); // τ scales with density → the shadow map must rebuild
     }
     if (params.maxSteps !== undefined) this.maxSteps = params.maxSteps;
     if (params.exposure !== undefined) this.exposure = params.exposure;
@@ -742,25 +636,40 @@ export class VolumeRenderer implements Disposable {
     eye: { x: number; y: number; z: number },
     options: { clear?: boolean } = {},
   ): void {
-    if (!this.volumeTex || !this.tfTex) {
+    const volumeTex = this.volumeTex;
+    const tfTex = this.tfTex;
+    if (!volumeTex || !tfTex) {
       // Not ready yet (volume/TF still uploading) — skip this frame instead of throwing every tick.
       return;
     }
-    this.ensurePipeline();
+    this.pipelineMgr.ensure(this.shaderConfig, this.colorFormat);
     this.frameIndex++;
     this.writeUniforms(viewProj, eye, options);
-    this.ensureBindGroup();
 
     const spec = specializationFor(this.shaderConfig);
-    if (spec.tiles && this.bgPipeline && this.bgBindGroup) {
-      pass.setPipeline(this.bgPipeline);
-      pass.setBindGroup(0, this.bgBindGroup);
+    const bindGroup = this.bindings.ensure({
+      layout: this.pipelineMgr.layout,
+      frameUniform: this.pipelineMgr.uniformBuffer,
+      volumeTex,
+      volumeSampler: this.pipelineMgr.sampler,
+      tfTex,
+      tfSampler: this.pipelineMgr.tfSamplerHandle,
+      brickTex: this.brickTex,
+      preintBuffer: this.tPreintBuffer ?? this.dummyPreint,
+      spec,
+      acceleration: this.acceleration,
+    });
+
+    const background = this.pipelineMgr.background;
+    if (spec.tiles && background) {
+      pass.setPipeline(background.pipeline);
+      pass.setBindGroup(0, background.bindGroup);
       pass.draw(3);
     }
-    pass.setPipeline(this.pipeline!);
-    pass.setBindGroup(0, this.bindGroup!);
+    pass.setPipeline(this.pipelineMgr.renderPipeline);
+    pass.setBindGroup(0, bindGroup);
     if (spec.tiles) {
-      pass.drawIndirect(this.tiles.drawIndirectBuffer, 0);
+      pass.drawIndirect(this.acceleration.tileDrawIndirectBuffer, 0);
     } else {
       pass.draw(3);
     }
@@ -774,323 +683,82 @@ export class VolumeRenderer implements Disposable {
     this.invViewProj.copy(viewProj);
     if (!this.invViewProj.invert()) return;
 
-    // Key light for the procedural studio env (background / dielectric): the first directional in
-    // the light list, or a sensible default when none is set.
-    const keyDir = this.lightEnv.keyLightDirection;
-    const keyRad = this.lightEnv.keyLightRadiance;
-    const klen = Math.hypot(keyDir[0], keyDir[1], keyDir[2]) || 1;
-
-    let flags = 0;
-    if (this.sliceEnableX) flags |= 1;
-    if (this.sliceEnableY) flags |= 2;
-    if (this.sliceEnableZ) flags |= 4;
-    if (this.showSlicePlanes) flags |= 8;
-    flags |= (VIEW_MODE_ID[this.viewMode] & 3) << 4;
-
-    const clear = options.clear !== false;
-    const alphaComposite = clear ? 0 : 1;
-
-    const d = this.frameData;
-    this.invViewProj.toArray(d, 0);
-    d[16] = eye.x;
-    d[17] = eye.y;
-    d[18] = eye.z;
-    d[19] = this.frameIndex;
-    // Never let the step be so fine that the hard iteration cap can't cross the volume — otherwise the
-    // far side is left unsampled and the volume appears to vanish. Floor the step at the budget-limited
-    // minimum (diagonal / usable steps) so the ray always reaches the far face; a requested step finer
-    // than that is clamped up (as fine as the budget allows). This makes any caller-set step (e.g. the
-    // fine ROI-brick step) safe regardless of box size / sample-distance.
-    const diagonal =
-      2 * Math.hypot(this.boxHalf[0], this.boxHalf[1], this.boxHalf[2]);
-    const minStep = diagonal / Math.max(this.maxSteps - 8, 1);
-    const effStep = Math.max(this.stepSize, minStep, 5e-4);
-    d[20] = effStep;
-    d[21] = this.densityScale;
-    const neededSteps = Math.ceil(diagonal / effStep) + 8;
-    d[22] = Math.min(this.maxSteps, neededSteps);
-    d[23] = this.exposure;
-    d[24] = keyDir[0] / klen;
-    d[25] = keyDir[1] / klen;
-    d[26] = keyDir[2] / klen;
-    d[27] = this.masterAmbient;
-    d[28] = keyRad[0];
-    d[29] = keyRad[1];
-    d[30] = keyRad[2];
-    d[31] = this.specularPower;
-    d[32] = this.boxHalf[0];
-    d[33] = this.boxHalf[1];
-    d[34] = this.boxHalf[2];
-    d[35] = BLEND_MODE_ID[this.blendMode];
-    d[36] = this.gradientOpacity;
-    d[37] = this.gradientOpacityScale;
-    d[38] = this.lightingStrength;
-    d[39] = this.liquidEnabled ? 1 : 0;
-    d[40] = this.cropMin[0];
-    d[41] = this.cropMin[1];
-    d[42] = this.cropMin[2];
-    d[43] = 0;
-    d[44] = this.cropMax[0];
-    d[45] = this.cropMax[1];
-    d[46] = this.cropMax[2];
-    d[47] = 0;
-    d[48] = this.sliceX;
-    d[49] = this.sliceY;
-    d[50] = this.sliceZ;
-    d[51] = flags;
-    d[52] = this.liquidIor;
-    d[53] = this.liquidRoughness;
-    d[54] = this.liquidEnvIntensity;
-    d[55] = this.liquidAbsorptionScale;
-    d[56] = alphaComposite;
-    d[57] = this.linearOutput ? 1 : 0; // Frame.composite.y → linear-HDR output flag
-    d[58] = this.earlyRayTermination;
-    d[59] = 0;
-    // lightCtl0: numLights, masterAmbient, specStrength, roughness
-    d[60] = this.numLights;
-    d[61] = this.masterAmbient;
-    d[62] = this.specStrength;
-    d[63] = this.roughnessL;
-    // lightCtl1: shadowEnable, shadowSteps, shadowStrength, shadowSoftness
-    d[64] = this.shadowEnable ? 1 : 0;
-    d[65] = this.shadowSteps;
-    d[66] = this.shadowStrength;
-    d[67] = this.shadowSoftness;
-    // lightCtl2: aoEnable, aoRadius, aoIntensity, aoSamples
-    d[68] = this.aoEnable ? 1 : 0;
-    d[69] = this.aoRadius;
-    d[70] = this.aoIntensity;
-    d[71] = this.aoSamples;
-    // measurePlane: enable, depth (world along view axis), gray, alpha
-    d[72] = this.measurePlaneEnabled ? 1 : 0;
-    d[73] = this.measurePlaneDepth;
-    d[74] = this.measurePlaneGray;
-    d[75] = this.measurePlaneAlpha;
-    // measureFwd: camera forward (world, unit)
-    d[76] = this.measureForward[0];
-    d[77] = this.measureForward[1];
-    d[78] = this.measureForward[2];
-    d[79] = 0;
-    // brickMin: ROI brick world min, w = enable
-    d[80] = this.brickMin[0];
-    d[81] = this.brickMin[1];
-    d[82] = this.brickMin[2];
-    d[83] = this.brickEnabled ? 1 : 0;
-    // brickMax: ROI brick world max, w = brickBlend fade weight
-    d[84] = this.brickMax[0];
-    d[85] = this.brickMax[1];
-    d[86] = this.brickMax[2];
-    d[87] = this.brickBlend;
-    const occ = this.occupancy?.grid ?? [1, 1, 1];
-    d[88] = occ[0]!;
-    d[89] = occ[1]!;
-    d[90] = occ[2]!;
-    d[91] = 0;
-    d[92] = this.vis.grid[0];
-    d[93] = this.vis.grid[1];
-    d[94] = this.vis.grid[2];
-    d[95] = this.visEnabled ? 1 : 0;
-    d[96] = this.internalWidth;
-    d[97] = this.internalHeight;
-    d[98] = TILE_SIZE;
-    d[99] = 0;
-    // worldToLight mat4 (Milestone 7.1) at floats 100..115, then shadowCtl at 116.
-    for (let k = 0; k < 16; k++) d[100 + k] = this.worldToLight[k]!;
-    d[116] = this.shadowMapEnabled && this.shadowMapBuilt ? 1 : 0;
-    d[117] = this.reprojectFar; // shadowCtl.y → depth-centroid normalization (TAAU)
-    d[118] = 0;
-    d[119] = 0;
-    // camRight: camera right axis (world, unit), w = tan(halfFovY) * aspect (horizontal half-extent)
-    d[120] = this.camRight[0];
-    d[121] = this.camRight[1];
-    d[122] = this.camRight[2];
-    d[123] = this.tanHalfFovY * this.camAspect;
-    // camUp: camera up axis (world, unit), w = tan(halfFovY) (vertical half-extent)
-    d[124] = this.camUp[0];
-    d[125] = this.camUp[1];
-    d[126] = this.camUp[2];
-    d[127] = this.tanHalfFovY;
-    this.frameUniform!.write(d);
+    writeVolumeFrameUniform(this.frameData, this.invViewProj, this.acceleration, {
+      eye,
+      clear: options.clear !== false,
+      frameIndex: this.frameIndex,
+      boxHalf: this.boxHalf,
+      maxSteps: this.maxSteps,
+      stepSize: this.stepSize,
+      densityScale: this.densityScale,
+      exposure: this.exposure,
+      masterAmbient: this.masterAmbient,
+      specularPower: this.specularPower,
+      blendMode: this.blendMode,
+      gradientOpacity: this.gradientOpacity,
+      gradientOpacityScale: this.gradientOpacityScale,
+      lightingStrength: this.lightingStrength,
+      liquidEnabled: this.liquidEnabled,
+      liquidIor: this.liquidIor,
+      liquidRoughness: this.liquidRoughness,
+      liquidEnvIntensity: this.liquidEnvIntensity,
+      liquidAbsorptionScale: this.liquidAbsorptionScale,
+      cropMin: this.cropMin,
+      cropMax: this.cropMax,
+      sliceX: this.sliceX,
+      sliceY: this.sliceY,
+      sliceZ: this.sliceZ,
+      sliceEnableX: this.sliceEnableX,
+      sliceEnableY: this.sliceEnableY,
+      sliceEnableZ: this.sliceEnableZ,
+      showSlicePlanes: this.showSlicePlanes,
+      viewMode: this.viewMode,
+      linearOutput: this.linearOutput,
+      earlyRayTermination: this.earlyRayTermination,
+      specStrength: this.specStrength,
+      roughnessL: this.roughnessL,
+      shadowEnable: this.shadowEnable,
+      shadowSteps: this.shadowSteps,
+      shadowStrength: this.shadowStrength,
+      shadowSoftness: this.shadowSoftness,
+      aoEnable: this.aoEnable,
+      aoRadius: this.aoRadius,
+      aoIntensity: this.aoIntensity,
+      aoSamples: this.aoSamples,
+      measurePlaneEnabled: this.measurePlaneEnabled,
+      measurePlaneDepth: this.measurePlaneDepth,
+      measurePlaneGray: this.measurePlaneGray,
+      measurePlaneAlpha: this.measurePlaneAlpha,
+      measureForward: this.measureForward,
+      brickMin: this.brickMin,
+      brickMax: this.brickMax,
+      brickEnabled: this.brickEnabled,
+      brickBlend: this.brickBlend,
+      visEnabled: this.visEnabled,
+      internalWidth: this.internalWidth,
+      internalHeight: this.internalHeight,
+      reprojectFar: this.reprojectFar,
+      camRight: this.camRight,
+      camUp: this.camUp,
+      camAspect: this.camAspect,
+      tanHalfFovY: this.tanHalfFovY,
+    });
+    this.pipelineMgr.uniformBuffer.write(this.frameData);
   }
 
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.frameUniform?.dispose();
+    this.pipelineMgr.dispose();
     this.tfTex?.dispose();
-    this.lightEnv.dispose();
-    this.occupancy?.dispose();
-    this.vis.dispose();
-    this.tiles.dispose();
-    this.dummyOcc.dispose();
-    this.dummyPrefix.dispose();
-    this.dummyTiles.dispose();
+    this.acceleration.dispose();
     this.tPreintBuffer?.dispose();
     this.dummyPreint.dispose();
-    this.shadowMap.dispose();
-    this.frameUniform = undefined;
     this.tfTex = undefined;
     this.volumeTex = undefined;
-    this.pipeline = undefined;
-    this.bindGroup = undefined;
-    this.occupancy = undefined;
+    this.bindings.invalidate();
   }
 
-  private ensurePipeline(): void {
-    if (!this.bindGroupLayout) {
-      const visFrag = GPUShaderStage.FRAGMENT;
-      const visVert = GPUShaderStage.VERTEX;
-      this.bindGroupLayout = this.ctx.device.createBindGroupLayout({
-        label: "volume-raymarch",
-        entries: [
-          { binding: 0, visibility: visVert | visFrag, buffer: { type: "uniform" } },
-          { binding: 1, visibility: visFrag, texture: { sampleType: "float", viewDimension: "3d" } },
-          { binding: 2, visibility: visFrag, sampler: { type: "filtering" } },
-          { binding: 3, visibility: visFrag, texture: { sampleType: "float", viewDimension: "2d" } },
-          { binding: 4, visibility: visFrag, sampler: { type: "filtering" } },
-          { binding: 5, visibility: visFrag, buffer: { type: "read-only-storage" } },
-          { binding: 6, visibility: visFrag, texture: { sampleType: "float", viewDimension: "3d" } },
-          { binding: 7, visibility: visFrag, buffer: { type: "storage" } },
-          { binding: 8, visibility: visVert | visFrag, buffer: { type: "read-only-storage" } },
-          { binding: 9, visibility: visFrag, buffer: { type: "read-only-storage" } },
-          { binding: 10, visibility: visVert | visFrag, buffer: { type: "read-only-storage" } },
-          { binding: 11, visibility: visFrag, buffer: { type: "read-only-storage" } },
-          { binding: 12, visibility: visFrag, texture: { sampleType: "float", viewDimension: "3d" } },
-        ],
-      });
-      this.pipelineLayout = this.ctx.device.createPipelineLayout({
-        bindGroupLayouts: [this.bindGroupLayout],
-      });
-    }
-    if (!this.frameUniform) {
-      this.frameUniform = new ManagedBuffer(
-        this.ctx.device,
-        GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        VOLUME_FRAME_UNIFORM_SIZE,
-      );
-    }
-    if (!this.volumeSampler) {
-      this.volumeSampler = this.ctx.device.createSampler({
-        magFilter: "linear",
-        minFilter: "linear",
-        addressModeU: "clamp-to-edge",
-        addressModeV: "clamp-to-edge",
-        addressModeW: "clamp-to-edge",
-      });
-    }
-    if (!this.tfSampler) {
-      this.tfSampler = this.ctx.device.createSampler({
-        magFilter: "linear",
-        minFilter: "linear",
-        addressModeU: "clamp-to-edge",
-        addressModeV: "clamp-to-edge",
-      });
-    }
-    if (!this.bgPipeline) {
-      const bgLayout = this.ctx.device.createBindGroupLayout({
-        label: "volume-bg",
-        entries: [
-          { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-        ],
-      });
-      const bgMod = this.cache.getModule("volume-background", VOLUME_BACKGROUND_WGSL);
-      this.bgPipeline = this.cache.getRenderPipeline({
-        label: "volume-background",
-        layout: this.ctx.device.createPipelineLayout({ bindGroupLayouts: [bgLayout] }),
-        vertex: { module: bgMod, entryPoint: "vs_main" },
-        fragment: {
-          module: bgMod,
-          entryPoint: "fs_main",
-          targets: [{ format: this.colorFormat }, { format: VOLUME_DEPTH_FORMAT }],
-        },
-        primitive: { topology: "triangle-list" },
-      });
-      this.bgBindGroup = this.ctx.device.createBindGroup({
-        layout: bgLayout,
-        entries: [{ binding: 0, resource: { buffer: this.frameUniform.gpu } }],
-      });
-    }
-    if (this.pipeline) return;
-    const spec = specializationFor(this.shaderConfig);
-    const key = `volume-raymarch-${this.shaderConfig}`;
-    const wgsl = volumeRaymarchWgsl(spec);
-    const module = this.cache.getModule(key, wgsl);
-    const blend = {
-      color: {
-        srcFactor: "src-alpha" as GPUBlendFactor,
-        dstFactor: "one-minus-src-alpha" as GPUBlendFactor,
-        operation: "add" as GPUBlendOperation,
-      },
-      alpha: {
-        srcFactor: "one" as GPUBlendFactor,
-        dstFactor: "one-minus-src-alpha" as GPUBlendFactor,
-        operation: "add" as GPUBlendOperation,
-      },
-    };
-    this.pipeline = this.cache.getRenderPipeline({
-      label: key,
-      layout: this.pipelineLayout!,
-      vertex: { module, entryPoint: "vs_main" },
-      fragment: {
-        module,
-        entryPoint: "fs_main",
-        targets: [{ format: this.colorFormat, blend }, { format: VOLUME_DEPTH_FORMAT }],
-      },
-      primitive: { topology: "triangle-list" },
-    });
-    // Warm the other named configs asynchronously so a mid-session switch doesn't hitch.
-    for (const name of ["fast", "quality"] as const) {
-      if (name === this.shaderConfig) continue;
-      const nSpec = specializationFor(name);
-      const nKey = `volume-raymarch-${name}`;
-      const nWgsl = volumeRaymarchWgsl(nSpec);
-      const nMod = this.cache.getModule(nKey, nWgsl);
-      void this.ctx.device.createRenderPipelineAsync({
-        label: nKey,
-        layout: this.pipelineLayout!,
-        vertex: { module: nMod, entryPoint: "vs_main" },
-        fragment: {
-          module: nMod,
-          entryPoint: "fs_main",
-          targets: [{ format: this.colorFormat, blend }, { format: VOLUME_DEPTH_FORMAT }],
-        },
-        primitive: { topology: "triangle-list" },
-      }).catch(() => {
-        /* warm compile is best-effort */
-      });
-    }
-  }
-
-  private ensureBindGroup(): void {
-    if (this.bindGroup) return;
-    const spec = specializationFor(this.shaderConfig);
-    const occBuf = spec.occupancy && this.occupancy ? this.occupancy.cellsGpu : this.dummyOcc.gpu;
-    const prefixBuf =
-      spec.occupancy && this.occupancy?.prefixGpu ? this.occupancy.prefixGpu : this.dummyPrefix.gpu;
-    const tileBuf = spec.tiles ? this.tiles.compactedBuffer : this.dummyTiles.gpu;
-    this.bindGroup = this.ctx.device.createBindGroup({
-      label: "volume",
-      layout: this.bindGroupLayout!,
-      entries: [
-        { binding: 0, resource: { buffer: this.frameUniform!.gpu } },
-        { binding: 1, resource: this.volumeTex!.createView({ dimension: "3d" }) },
-        { binding: 2, resource: this.volumeSampler! },
-        { binding: 3, resource: this.tfTex!.createView({ dimension: "2d" }) },
-        { binding: 4, resource: this.tfSampler! },
-        { binding: 5, resource: { buffer: this.lightEnv.gpu } },
-        {
-          binding: 6,
-          resource: (this.brickTex ?? this.volumeTex!).createView({ dimension: "3d" }),
-        },
-        { binding: 7, resource: { buffer: this.vis.writeBuffer } },
-        { binding: 8, resource: { buffer: occBuf } },
-        { binding: 9, resource: { buffer: prefixBuf } },
-        { binding: 10, resource: { buffer: tileBuf } },
-        { binding: 11, resource: { buffer: (this.tPreintBuffer ?? this.dummyPreint).gpu } },
-        { binding: 12, resource: this.shadowMap.texture.createView({ dimension: "3d" }) },
-      ],
-    });
-  }
 }
 
 function clamp01(v: number): number {

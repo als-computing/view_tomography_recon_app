@@ -1,0 +1,280 @@
+/**
+ * Aggregates `VolumeRenderer`'s acceleration-structure GPU resources — occupancy grid, tile
+ * compactor, visibility feedback, opacity shadow map, and the multi-light storage buffer — plus
+ * their rebuild bookkeeping (dirty flags, resize policy). `VolumeRenderer` owns shading state
+ * (crop, TF, camera, blend mode, …) and drives this aggregate through {@link notifyVolumeChanged}
+ * and {@link runPrePasses}; this module owns nothing about *how* the volume is shaded, only the
+ * structures that make marching it fast.
+ *
+ * @packageDocumentation
+ */
+
+import type { Disposable } from "@zarr-viewer/core";
+import type { Mat4 } from "@zarr-viewer/math";
+import { ManagedBuffer } from "../resources/buffer.js";
+import type { ManagedTexture } from "../resources/texture.js";
+import { LightingEnvironment, type GpuLight } from "../lighting/index.js";
+import type { ShaderSpecialization } from "./shader-config.js";
+import { VisibilityFeedback, VIS_GRID_DEFAULT } from "./visibility.js";
+import { OccupancyGrid } from "./occupancy.js";
+import { TileCompactor, TILE_SIZE } from "./tiles.js";
+import { ShadowMap } from "./shadow-map.js";
+import { aabbScreenBbox } from "../volume/volume-math.js";
+
+/** Per-frame inputs {@link VolumeAcceleration.runPrePasses} needs but doesn't own. */
+export interface VolumeAccelerationFrameCtx {
+  viewProj: Mat4;
+  spec: ShaderSpecialization;
+  volumeTex: ManagedTexture | undefined;
+  lastLut: Uint8Array | undefined;
+  lastLutSize: number;
+  frameUniformGpu: GPUBuffer | undefined;
+  internalWidth: number;
+  internalHeight: number;
+  boxHalf: readonly [number, number, number];
+  tfTex: ManagedTexture | undefined;
+  tfSampler: GPUSampler | undefined;
+  shadowEnable: boolean;
+  densityScale: number;
+  cropMin: readonly [number, number, number];
+  cropMax: readonly [number, number, number];
+}
+
+/** GPU buffers `VolumeRenderer`'s bind group needs, resolved against the active shader spec. */
+export interface VolumeAccelerationBuffers {
+  occBuf: GPUBuffer;
+  prefixBuf: GPUBuffer;
+  tileBuf: GPUBuffer;
+}
+
+export class VolumeAcceleration implements Disposable {
+  private occupancy: OccupancyGrid | undefined;
+  private readonly dummyOcc: ManagedBuffer;
+  private readonly dummyPrefix: ManagedBuffer;
+  private readonly vis: VisibilityFeedback;
+  private readonly tiles: TileCompactor;
+  private readonly dummyTiles: ManagedBuffer;
+  private readonly shadowMap: ShadowMap;
+  private readonly lightEnv: LightingEnvironment;
+  private disposed = false;
+
+  private dirtyOccMinMax = true;
+  private dirtyOccTf = true;
+  private dirtyShadow = true;
+  private shadowMapEnabled = false;
+  private shadowMapBuilt = false;
+  private shadowLightDir: [number, number, number] = [0.45, 0.85, 0.35];
+  private readonly worldToLightBuf = new Float32Array(16);
+
+  public constructor(private readonly device: GPUDevice) {
+    // Storage buffer of packed lights (bound at binding 5). Small capacity: this viewer uses at
+    // most ~6 procedural lights (1 global + 1 flashlight + 4 stage).
+    this.lightEnv = new LightingEnvironment(device, 16);
+    this.vis = new VisibilityFeedback(device, [
+      VIS_GRID_DEFAULT,
+      VIS_GRID_DEFAULT,
+      VIS_GRID_DEFAULT,
+    ]);
+    this.tiles = new TileCompactor(device);
+    this.dummyOcc = OccupancyGrid.dummy(device);
+    this.dummyPrefix = OccupancyGrid.dummyPrefix(device);
+    this.dummyTiles = TileCompactor.dummyTiles(device);
+    this.shadowMap = new ShadowMap(device);
+  }
+
+  /** The visibility-feedback bin accumulator (public: the viewer reads back `lastWeights`). */
+  public get visibilityFeedback(): VisibilityFeedback {
+    return this.vis;
+  }
+
+  public setVisibilityEnabled(enabled: boolean): void {
+    this.vis.enabled = enabled;
+  }
+
+  public get visGrid(): readonly [number, number, number] {
+    return this.vis.grid;
+  }
+
+  public get visWriteBuffer(): GPUBuffer {
+    return this.vis.writeBuffer;
+  }
+
+  public get occupancyGrid(): readonly [number, number, number] {
+    return this.occupancy?.grid ?? [1, 1, 1];
+  }
+
+  public get lightBuffer(): GPUBuffer {
+    return this.lightEnv.gpu;
+  }
+
+  public get lightCount(): number {
+    return this.lightEnv.lightCount;
+  }
+
+  public get keyLightDirection(): readonly [number, number, number] {
+    return this.lightEnv.keyLightDirection;
+  }
+
+  public get keyLightRadiance(): readonly [number, number, number] {
+    return this.lightEnv.keyLightRadiance;
+  }
+
+  public setLights(lights: readonly GpuLight[]): void {
+    this.lightEnv.setLights(lights);
+  }
+
+  /** `worldToLight` mat4 (Milestone 7.1), read into the frame uniform each frame. */
+  public get worldToLight(): Float32Array {
+    return this.worldToLightBuf;
+  }
+
+  /** Whether the shadow map is both enabled and has a built representation to sample. */
+  public get shadowActive(): boolean {
+    return this.shadowMapEnabled && this.shadowMapBuilt;
+  }
+
+  public get shadowMapTexture(): ManagedTexture {
+    return this.shadowMap.texture;
+  }
+
+  /**
+   * Enable/point the opacity shadow map (Milestone 7.1). A meaningful change of direction (or the
+   * enable) marks the map dirty so it rebuilds on the next pre-pass; unchanged inputs cost nothing.
+   */
+  public setShadowMap(enabled: boolean, lightDir: readonly [number, number, number]): void {
+    const dot =
+      lightDir[0] * this.shadowLightDir[0] +
+      lightDir[1] * this.shadowLightDir[1] +
+      lightDir[2] * this.shadowLightDir[2];
+    if (enabled !== this.shadowMapEnabled || dot < 0.9995) this.dirtyShadow = true;
+    this.shadowMapEnabled = enabled;
+    this.shadowLightDir = [lightDir[0], lightDir[1], lightDir[2]];
+  }
+
+  /** Mark the shadow map dirty (crop / density / TF changed) without touching enable/direction. */
+  public markShadowDirty(): void {
+    this.dirtyShadow = true;
+  }
+
+  /** Mark the TF-dependent occupancy activity dirty (called from `setTransferFunction`). */
+  public markOccupancyTfDirty(): void {
+    this.dirtyOccTf = true;
+  }
+
+  /**
+   * Resize (or keep) the occupancy grid for a new volume texture, and mark every acceleration
+   * structure dirty. Called from `VolumeRenderer.setVolume`.
+   */
+  public notifyVolumeChanged(size: readonly [number, number, number]): void {
+    const same =
+      this.occupancy &&
+      this.occupancy.grid[0] === Math.max(1, Math.ceil(size[0] / this.occupancy.cellSize)) &&
+      this.occupancy.grid[1] === Math.max(1, Math.ceil(size[1] / this.occupancy.cellSize)) &&
+      this.occupancy.grid[2] === Math.max(1, Math.ceil(size[2] / this.occupancy.cellSize));
+    if (!same) {
+      this.occupancy?.dispose();
+      this.occupancy = new OccupancyGrid(this.device, size);
+    }
+    this.dirtyOccMinMax = true;
+    this.dirtyOccTf = true;
+    this.dirtyShadow = true;
+  }
+
+  /** Resolve the bind-group buffers for the active shader spec (dummy fallback when a feature is off). */
+  public bindBuffers(spec: ShaderSpecialization): VolumeAccelerationBuffers {
+    return {
+      occBuf: spec.occupancy && this.occupancy ? this.occupancy.cellsGpu : this.dummyOcc.gpu,
+      prefixBuf:
+        spec.occupancy && this.occupancy?.prefixGpu ? this.occupancy.prefixGpu : this.dummyPrefix.gpu,
+      tileBuf: spec.tiles ? this.tiles.compactedBuffer : this.dummyTiles.gpu,
+    };
+  }
+
+  public get tileDrawIndirectBuffer(): GPUBuffer {
+    return this.tiles.drawIndirectBuffer;
+  }
+
+  /**
+   * Occupancy rebuild + tile classify + vis-bin copy + on-demand shadow-map rebuild. Call on the
+   * same encoder, before the volume render pass. Returns `true` when a rebuild happened that
+   * invalidates the caller's bind group (occupancy TF activity or tile buffer resized).
+   */
+  public runPrePasses(encoder: GPUCommandEncoder, ctx: VolumeAccelerationFrameCtx): boolean {
+    let bindGroupDirty = false;
+    const { spec } = ctx;
+    if (spec.occupancy && this.occupancy && ctx.volumeTex) {
+      if (this.dirtyOccMinMax) {
+        this.occupancy.rebuildMinMax(encoder, ctx.volumeTex);
+        this.dirtyOccMinMax = false;
+        this.dirtyOccTf = true;
+      }
+      if (this.dirtyOccTf && ctx.lastLut) {
+        this.occupancy.rebuildForTransferFunction(encoder, ctx.lastLut, ctx.lastLutSize);
+        this.dirtyOccTf = false;
+        bindGroupDirty = true;
+      }
+    }
+    if (spec.tiles && ctx.frameUniformGpu) {
+      const bbox = aabbScreenBbox(
+        ctx.viewProj,
+        ctx.internalWidth,
+        ctx.internalHeight,
+        ctx.boxHalf,
+        TILE_SIZE,
+      );
+      const rebuilt = this.tiles.record(
+        encoder,
+        ctx.frameUniformGpu,
+        spec.occupancy ? this.occupancy : undefined,
+        this.dummyOcc.gpu,
+        ctx.internalWidth,
+        ctx.internalHeight,
+        bbox,
+      );
+      if (rebuilt) bindGroupDirty = true;
+    }
+    // Milestone 7.1: rebuild the opacity shadow map only when dirty (TF / density / light dir
+    // changed) and shadows are on. Render-on-demand keeps this off the idle path.
+    if (
+      this.shadowMapEnabled &&
+      ctx.shadowEnable &&
+      this.dirtyShadow &&
+      ctx.volumeTex &&
+      ctx.tfTex &&
+      ctx.tfSampler
+    ) {
+      const t = this.shadowMap.rebuild(encoder, ctx.volumeTex, ctx.tfTex, ctx.tfSampler, {
+        lightDir: this.shadowLightDir,
+        boxHalf: ctx.boxHalf,
+        densityScale: ctx.densityScale,
+        sigmaMul: 12,
+        cropMin: ctx.cropMin,
+        cropMax: ctx.cropMax,
+      });
+      this.worldToLightBuf.set(t.worldToLightUvw);
+      this.shadowMapBuilt = true;
+      this.dirtyShadow = false;
+    }
+    this.vis.recordCopy(encoder);
+    return bindGroupDirty;
+  }
+
+  /** Map pending vis-bin readback. Must run after the encoder that copied it has been submitted. */
+  public afterSubmit(): void {
+    this.vis.afterSubmit();
+  }
+
+  public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.lightEnv.dispose();
+    this.occupancy?.dispose();
+    this.vis.dispose();
+    this.tiles.dispose();
+    this.dummyOcc.dispose();
+    this.dummyPrefix.dispose();
+    this.dummyTiles.dispose();
+    this.shadowMap.dispose();
+    this.occupancy = undefined;
+  }
+}
