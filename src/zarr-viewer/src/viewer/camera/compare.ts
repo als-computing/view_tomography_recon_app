@@ -7,8 +7,8 @@
 
 /**
  * The subset of `WebGpuCameraState`'s shape this comparison needs. A structural type (rather than
- * importing `WebGpuCameraState` from `ome-zarr-viewer.ts`) so this module has no dependency on the
- * file that imports it.
+ * importing `WebGpuCameraState` from `WebGpuVolumeViewer.ts`) so this module has no dependency on
+ * the file that imports it.
  */
 export interface CameraPoseLike {
   readonly target: readonly [number, number, number];

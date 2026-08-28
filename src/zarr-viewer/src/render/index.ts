@@ -15,12 +15,13 @@ export { BrickLoader, chooseBrickRegion } from "./volume/brick-loader.js";
 export type { BrickResult, BrickRequest, BrickLoaderOptions } from "./volume/brick-loader.js";
 
 export { VolumeRenderer } from "./volume/volume-renderer.js";
+export type { VolumeRendererOptions, VolumeBlendMode, VolumeViewMode } from "./volume/volume-renderer.js";
 export type {
-  VolumeRendererOptions,
-  VolumeBlendMode,
-  VolumeViewMode,
   LiquidShadingParams,
-} from "./volume/volume-renderer.js";
+  MeasurePlaneParams,
+  LegacyLightParams,
+} from "./volume/volume-shading-params.js";
+export type { VolumeLightingParams } from "./volume/volume-lighting.js";
 
 export {
   specializationFor,

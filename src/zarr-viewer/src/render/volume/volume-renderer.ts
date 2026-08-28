@@ -20,16 +20,22 @@ import {
   volumeRaymarchWgsl,
 } from "../shaders/volume-raymarch.js";
 import { LightingEnvironment, type GpuLight } from "../lighting/index.js";
-import {
-  type ShaderConfigName,
-  specializationFor,
-  approximateShadingLabel,
-} from "../accel/shader-config.js";
+import { type ShaderConfigName, specializationFor } from "../accel/shader-config.js";
 import { hashTransferFunction, type RenderProvenance } from "../accel/provenance.js";
 import { VisibilityFeedback, VIS_GRID_DEFAULT } from "../accel/visibility.js";
 import { OccupancyGrid } from "../accel/occupancy.js";
 import { TileCompactor, TILE_SIZE } from "../accel/tiles.js";
 import { ShadowMap } from "../accel/shadow-map.js";
+import { aabbScreenBbox } from "./volume-math.js";
+import { computeProvenance, approximateShadingBanner } from "./volume-provenance.js";
+import {
+  applyLiquidShading,
+  applyMeasurePlane,
+  applyLegacyLight,
+  type LiquidShadingParams,
+  type MeasurePlaneParams,
+} from "./volume-shading-params.js";
+import { applyVolumeLighting, type VolumeLightingParams } from "./volume-lighting.js";
 
 /**
  * Second render target of the volume pass (Milestone 5.1): the transmittance-weighted depth centroid,
@@ -42,20 +48,6 @@ export type VolumeBlendMode = "composite" | "mip" | "minip" | "average";
 
 /** Primary view mode. */
 export type VolumeViewMode = "volume" | "xPlane" | "yPlane" | "zPlane";
-
-/** Dielectric liquid shading for CGI-style water / oil / steam volumes. */
-export interface LiquidShadingParams {
-  /** Enable Fresnel + env + Beer dielectric path (default false = legacy TF Phong). */
-  enabled?: boolean;
-  /** Index of refraction (water ≈ 1.333, oil ≈ 1.47). Default `1.333`. */
-  ior?: number;
-  /** Microfacet roughness for free-surface specular. Default `0.04`. */
-  roughness?: number;
-  /** Scales procedural studio environment. Default `1.2`. */
-  envIntensity?: number;
-  /** Beer–Lambert absorption path scale. Default `2.5`. */
-  absorptionScale?: number;
-}
 
 const BLEND_MODE_ID: Record<VolumeBlendMode, number> = {
   composite: 0,
@@ -183,7 +175,8 @@ export class VolumeRenderer implements Disposable {
   // Multi-light shading (prism lighting library). The light list is rebuilt per frame by the viewer
   // (global / camera flashlight / stage) and uploaded to this storage buffer; the control params
   // below drive the shader's shadow-ray and ambient-occlusion marching.
-  private lightEnv: LightingEnvironment | undefined;
+  private readonly lightEnv: LightingEnvironment;
+  private disposed = false;
   private numLights = 0;
   private masterAmbient = 0.22;
   private specStrength = 0.4;
@@ -384,17 +377,21 @@ export class VolumeRenderer implements Disposable {
    * Beer–Lambert absorption). When disabled, uses the legacy TF Blinn-Phong path.
    */
   public setLiquidShading(params: LiquidShadingParams): void {
-    if (params.enabled !== undefined) this.liquidEnabled = params.enabled;
-    if (params.ior !== undefined) this.liquidIor = Math.min(3.5, Math.max(1.0, params.ior));
-    if (params.roughness !== undefined) {
-      this.liquidRoughness = Math.min(1, Math.max(0.012, params.roughness));
-    }
-    if (params.envIntensity !== undefined) {
-      this.liquidEnvIntensity = Math.max(0, params.envIntensity);
-    }
-    if (params.absorptionScale !== undefined) {
-      this.liquidAbsorptionScale = Math.max(0.05, params.absorptionScale);
-    }
+    const next = applyLiquidShading(
+      {
+        enabled: this.liquidEnabled,
+        ior: this.liquidIor,
+        roughness: this.liquidRoughness,
+        envIntensity: this.liquidEnvIntensity,
+        absorptionScale: this.liquidAbsorptionScale,
+      },
+      params,
+    );
+    this.liquidEnabled = next.enabled;
+    this.liquidIor = next.ior;
+    this.liquidRoughness = next.roughness;
+    this.liquidEnvIntensity = next.envIntensity;
+    this.liquidAbsorptionScale = next.absorptionScale;
   }
 
   /**
@@ -403,8 +400,8 @@ export class VolumeRenderer implements Disposable {
    * procedural studio environment (`envRadiance`/`background`).
    */
   public setLights(lights: readonly GpuLight[]): void {
-    this.lightEnv!.setLights(lights);
-    this.numLights = this.lightEnv!.lightCount;
+    this.lightEnv.setLights(lights);
+    this.numLights = this.lightEnv.lightCount;
   }
 
   /**
@@ -412,45 +409,44 @@ export class VolumeRenderer implements Disposable {
    * `depth` is world distance from the eye along `forward` (a unit view-axis vector); `gray`/`alpha` in
    * [0,1]. Call each frame with the current camera forward so the plane tracks the view.
    */
-  public setMeasurePlane(params: {
-    enabled: boolean;
-    depth: number;
-    gray: number;
-    alpha: number;
-    forward: readonly [number, number, number];
-  }): void {
-    this.measurePlaneEnabled = params.enabled;
-    this.measurePlaneDepth = params.depth;
-    this.measurePlaneGray = params.gray;
-    this.measurePlaneAlpha = params.alpha;
-    this.measureForward = [params.forward[0], params.forward[1], params.forward[2]];
+  public setMeasurePlane(params: MeasurePlaneParams): void {
+    const next = applyMeasurePlane(params);
+    this.measurePlaneEnabled = next.enabled;
+    this.measurePlaneDepth = next.depth;
+    this.measurePlaneGray = next.gray;
+    this.measurePlaneAlpha = next.alpha;
+    this.measureForward = next.forward;
   }
 
   /** Shadow / AO / master-ambient / specular controls for the multi-light path. */
-  public setLightingParams(params: {
-    masterAmbient?: number;
-    specStrength?: number;
-    roughness?: number;
-    shadowEnable?: boolean;
-    shadowSteps?: number;
-    shadowStrength?: number;
-    shadowSoftness?: number;
-    aoEnable?: boolean;
-    aoRadius?: number;
-    aoIntensity?: number;
-    aoSamples?: number;
-  }): void {
-    if (params.masterAmbient !== undefined) this.masterAmbient = params.masterAmbient;
-    if (params.specStrength !== undefined) this.specStrength = params.specStrength;
-    if (params.roughness !== undefined) this.roughnessL = params.roughness;
-    if (params.shadowEnable !== undefined) this.shadowEnable = params.shadowEnable;
-    if (params.shadowSteps !== undefined) this.shadowSteps = Math.max(0, Math.round(params.shadowSteps));
-    if (params.shadowStrength !== undefined) this.shadowStrength = params.shadowStrength;
-    if (params.shadowSoftness !== undefined) this.shadowSoftness = params.shadowSoftness;
-    if (params.aoEnable !== undefined) this.aoEnable = params.aoEnable;
-    if (params.aoRadius !== undefined) this.aoRadius = params.aoRadius;
-    if (params.aoIntensity !== undefined) this.aoIntensity = params.aoIntensity;
-    if (params.aoSamples !== undefined) this.aoSamples = Math.max(0, Math.round(params.aoSamples));
+  public setLightingParams(params: VolumeLightingParams): void {
+    const next = applyVolumeLighting(
+      {
+        masterAmbient: this.masterAmbient,
+        specStrength: this.specStrength,
+        roughnessL: this.roughnessL,
+        shadowEnable: this.shadowEnable,
+        shadowSteps: this.shadowSteps,
+        shadowStrength: this.shadowStrength,
+        shadowSoftness: this.shadowSoftness,
+        aoEnable: this.aoEnable,
+        aoRadius: this.aoRadius,
+        aoIntensity: this.aoIntensity,
+        aoSamples: this.aoSamples,
+      },
+      params,
+    );
+    this.masterAmbient = next.masterAmbient;
+    this.specStrength = next.specStrength;
+    this.roughnessL = next.roughnessL;
+    this.shadowEnable = next.shadowEnable;
+    this.shadowSteps = next.shadowSteps;
+    this.shadowStrength = next.shadowStrength;
+    this.shadowSoftness = next.shadowSoftness;
+    this.aoEnable = next.aoEnable;
+    this.aoRadius = next.aoRadius;
+    this.aoIntensity = next.aoIntensity;
+    this.aoSamples = next.aoSamples;
   }
 
   public setBlendMode(mode: VolumeBlendMode): void {
@@ -543,7 +539,7 @@ export class VolumeRenderer implements Disposable {
       }
     }
     if (spec.tiles && this.frameUniform) {
-      const bbox = this.aabbScreenBbox(viewProj, this.internalWidth, this.internalHeight);
+      const bbox = aabbScreenBbox(viewProj, this.internalWidth, this.internalHeight, this.boxHalf, TILE_SIZE);
       const rebuilt = this.tiles.record(
         encoder,
         this.frameUniform.gpu,
@@ -580,70 +576,35 @@ export class VolumeRenderer implements Disposable {
     this.vis.recordCopy(encoder);
   }
 
-  /**
-   * Screen-space pixel bounding box of the volume AABB, for conservative tile classification. Projects
-   * the 8 box corners with `viewProj`; returns `null` when any corner is at/behind the camera (the box
-   * can't be reliably bounded on screen → the caller keeps every tile that frame). Padded by one tile.
-   */
-  private aabbScreenBbox(
-    viewProj: Mat4,
-    w: number,
-    h: number,
-  ): { minX: number; minY: number; maxX: number; maxY: number } | null {
-    const e = viewProj.elements;
-    const [hx, hy, hz] = this.boxHalf;
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (let i = 0; i < 8; i++) {
-      const x = i & 1 ? hx : -hx;
-      const y = i & 2 ? hy : -hy;
-      const z = i & 4 ? hz : -hz;
-      const cx = e[0]! * x + e[4]! * y + e[8]! * z + e[12]!;
-      const cy = e[1]! * x + e[5]! * y + e[9]! * z + e[13]!;
-      const cw = e[3]! * x + e[7]! * y + e[11]! * z + e[15]!;
-      if (cw <= 1e-6) return null; // corner at/behind the camera — can't bound; keep all tiles
-      const px = ((cx / cw) * 0.5 + 0.5) * w;
-      // The fragment shader reconstructs rays with ndc.y = 2·py/h − 1 (y-flipped from standard clip),
-      // so a point renders at py = (ndc.y + 1)/2·h — match that, or the bbox is vertically mirrored.
-      const py = ((cy / cw) * 0.5 + 0.5) * h;
-      minX = Math.min(minX, px);
-      maxX = Math.max(maxX, px);
-      minY = Math.min(minY, py);
-      maxY = Math.max(maxY, py);
-    }
-    const pad = TILE_SIZE; // never clip at the very edge
-    return {
-      minX: Math.max(0, minX - pad),
-      minY: Math.max(0, minY - pad),
-      maxX: Math.min(w, maxX + pad),
-      maxY: Math.min(h, maxY + pad),
-    };
-  }
 
   /** Map pending vis-bin readback. Must run after the encoder that copied it has been submitted. */
   public afterSubmit(): void {
     this.vis.afterSubmit();
   }
 
-  /** Provenance block for PNG export / screenshot stamping. */
-  public provenance(renderScale: number, extras?: Partial<RenderProvenance>): RenderProvenance {
-    const spec = specializationFor(this.shaderConfig);
-    return {
-      shaderConfig: this.shaderConfig,
-      multiScatterOctaves: spec.multiScatterOctaves,
-      taauFrames: 0,
-      shadowMode: this.shadowEnable ? "macrocell-sweep" : "none",
-      transferFunction: this.tfHash,
+  /**
+   * Provenance block for PNG export / screenshot stamping. `taauFrames` must be supplied by the
+   * caller — this renderer doesn't own the TAAU accumulator (it lives in the viewer, rebuilt per
+   * frame from the camera).
+   */
+  public provenance(
+    renderScale: number,
+    taauFrames: number,
+    extras?: Partial<RenderProvenance>,
+  ): RenderProvenance {
+    return computeProvenance(
+      this.shaderConfig,
+      this.tfHash,
       renderScale,
-      ...extras,
-    };
+      taauFrames,
+      this.shadowEnable,
+      extras,
+    );
   }
 
   /** Visible approximate-shading banner, or `null` when none is active. */
   public approximateShadingBanner(): string | null {
-    return approximateShadingLabel(specializationFor(this.shaderConfig));
+    return approximateShadingBanner(this.shaderConfig);
   }
 
   public setViewMode(mode: VolumeViewMode): void {
@@ -721,12 +682,19 @@ export class VolumeRenderer implements Disposable {
     }
     if (params.maxSteps !== undefined) this.maxSteps = params.maxSteps;
     if (params.exposure !== undefined) this.exposure = params.exposure;
-    if (params.ambient !== undefined) this.ambient = params.ambient;
-    if (params.specularPower !== undefined) this.specularPower = params.specularPower;
-    if (params.lightDirection) {
-      this.lightDirection = [...params.lightDirection] as [number, number, number];
-    }
-    if (params.lightColor) this.lightColor = asColor3(params.lightColor);
+    const nextLight = applyLegacyLight(
+      {
+        ambient: this.ambient,
+        specularPower: this.specularPower,
+        lightDirection: this.lightDirection,
+        lightColor: this.lightColor,
+      },
+      params,
+    );
+    this.ambient = nextLight.ambient;
+    this.specularPower = nextLight.specularPower;
+    this.lightDirection = nextLight.lightDirection;
+    this.lightColor = nextLight.lightColor;
     if (params.blendMode) this.blendMode = params.blendMode;
     if (params.gradientOpacity !== undefined) this.gradientOpacity = params.gradientOpacity;
     if (params.gradientOpacityScale !== undefined) {
@@ -808,8 +776,8 @@ export class VolumeRenderer implements Disposable {
 
     // Key light for the procedural studio env (background / dielectric): the first directional in
     // the light list, or a sensible default when none is set.
-    const keyDir = this.lightEnv!.keyLightDirection;
-    const keyRad = this.lightEnv!.keyLightRadiance;
+    const keyDir = this.lightEnv.keyLightDirection;
+    const keyRad = this.lightEnv.keyLightRadiance;
     const klen = Math.hypot(keyDir[0], keyDir[1], keyDir[2]) || 1;
 
     let flags = 0;
@@ -946,9 +914,11 @@ export class VolumeRenderer implements Disposable {
   }
 
   public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     this.frameUniform?.dispose();
     this.tfTex?.dispose();
-    this.lightEnv?.dispose();
+    this.lightEnv.dispose();
     this.occupancy?.dispose();
     this.vis.dispose();
     this.tiles.dispose();
@@ -960,7 +930,6 @@ export class VolumeRenderer implements Disposable {
     this.shadowMap.dispose();
     this.frameUniform = undefined;
     this.tfTex = undefined;
-    this.lightEnv = undefined;
     this.volumeTex = undefined;
     this.pipeline = undefined;
     this.bindGroup = undefined;
@@ -1108,7 +1077,7 @@ export class VolumeRenderer implements Disposable {
         { binding: 2, resource: this.volumeSampler! },
         { binding: 3, resource: this.tfTex!.createView({ dimension: "2d" }) },
         { binding: 4, resource: this.tfSampler! },
-        { binding: 5, resource: { buffer: this.lightEnv!.gpu } },
+        { binding: 5, resource: { buffer: this.lightEnv.gpu } },
         {
           binding: 6,
           resource: (this.brickTex ?? this.volumeTex!).createView({ dimension: "3d" }),

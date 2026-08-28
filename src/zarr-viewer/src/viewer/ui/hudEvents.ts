@@ -145,7 +145,7 @@ export function bindHudClick(ctx: HudEventContext): void {
       void (async () => {
         const blob = await stampCanvasPng(
           ctx.canvas,
-          ctx.volumeRenderer.provenance(ctx.fxPipeline.renderScale),
+          ctx.volumeRenderer.provenance(ctx.fxPipeline.renderScale, ctx.taau.sampleCount),
         );
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");

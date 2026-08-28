@@ -35,8 +35,14 @@ export interface ShaderSpecialization {
   preIntegrate: boolean;
 }
 
-/** Human-readable shadow representation names for provenance stamps. */
-export type ShadowRepresentation = "none" | "macrocell-sweep" | "fom" | "avsm";
+/**
+ * Human-readable shadow representation names for provenance stamps. `light-axis-sweep` is the one
+ * currently implemented ({@link ../shadow-map.js}): a light-space opacity map built by marching along
+ * the light axis — softer / lower depth-resolution than AVSM, but robust and cheap. `macrocell-sweep`,
+ * `fom`, and `avsm` are named for future representations discussed in the acceleration plan; do not
+ * report them unless the corresponding implementation actually exists.
+ */
+export type ShadowRepresentation = "none" | "light-axis-sweep" | "macrocell-sweep" | "fom" | "avsm";
 
 /**
  * Compile-time features for `name`. `baseline` matches the pre-acceleration shader; `fast` and
