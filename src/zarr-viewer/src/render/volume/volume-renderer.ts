@@ -9,7 +9,6 @@
 import type { Disposable } from "@zarr-viewer/core";
 import { Mat4, asColor3, type Color3, type Color3Like, type Color4Like } from "@zarr-viewer/math";
 import type { GpuContext } from "../device/context.js";
-import { ManagedBuffer } from "../resources/buffer.js";
 import { ManagedTexture } from "../resources/texture.js";
 import { toGpuColor } from "../color.js";
 import { TransferFunction } from "./transfer-function.js";
@@ -35,6 +34,8 @@ import {
 } from "./volume-uniforms.js";
 import { VolumePipeline, VOLUME_DEPTH_FORMAT } from "./volume-pipeline.js";
 import { VolumeBindings } from "./volume-bindings.js";
+import { buildGaussianPreintegrationTable, defaultSigmaBuckets } from "./preintegration-2d.js";
+import { floatToHalf } from "./volume-texture.js";
 
 export type { VolumeBlendMode, VolumeViewMode } from "./volume-uniforms.js";
 export { VOLUME_DEPTH_FORMAT } from "./volume-pipeline.js";
@@ -127,9 +128,10 @@ export class VolumeRenderer implements Disposable {
   // Occupancy grid, tile compactor, visibility feedback, opacity shadow map, and the multi-light
   // storage buffer, plus their rebuild bookkeeping — see render/accel/volume-acceleration.ts.
   private readonly acceleration: VolumeAcceleration;
-  // Milestone 3.1 pre-integration: cumulative-extinction LUT (rebuilt with the TF); dummy when unused.
-  private tPreintBuffer: ManagedBuffer | undefined;
-  private dummyPreint: ManagedBuffer;
+  // Milestone 3.1/3.2 pre-integration: cumulative-extinction LUT texture (rebuilt with the TF);
+  // dummy when unused. `r32float`, width = LUT size, height = sigma-bucket count (1 for now).
+  private tPreintTex: ManagedTexture | undefined;
+  private readonly dummyPreint: ManagedTexture;
   // Far-plane distance used to normalize the depth-centroid output (Milestone 5.1 TAAU reprojection).
   private reprojectFar = 1;
 
@@ -206,11 +208,12 @@ export class VolumeRenderer implements Disposable {
     this.masterAmbient = this.ambient;
     this.acceleration = new VolumeAcceleration(ctx.device);
     if (options.liquidShading) this.setLiquidShading(options.liquidShading);
-    this.dummyPreint = new ManagedBuffer(
-      ctx.device,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      8,
-    );
+    this.dummyPreint = new ManagedTexture(ctx.device, {
+      size: [1, 1, 1],
+      format: "r16float",
+      dimension: "2d",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
   }
 
   public setVolume(texture: ManagedTexture): void {
@@ -279,20 +282,39 @@ export class VolumeRenderer implements Disposable {
     this.tfHash = hashTransferFunction(lut);
     this.acceleration.markOccupancyTfDirty();
     this.acceleration.markShadowDirty();
-    // Milestone 3.1: cumulative extinction LUT T(d) = ∫₀^d α(x) dx (trapezoidal), kept f32 for the
-    // cancellation-prone ratio form. Rebuilt with the TF; consumed by the quality shader's pre-integration.
-    const tCurve = new Float32Array(lutSize);
-    const dd = 1 / Math.max(1, lutSize - 1);
-    let acc = 0;
-    let prevA = (lut[3] ?? 0) / 255;
-    for (let i = 1; i < lutSize; i++) {
-      const a = (lut[i * 4 + 3] ?? 0) / 255;
-      acc += 0.5 * (prevA + a) * dd;
-      tCurve[i] = acc;
-      prevA = a;
+    // Milestone 3.1/3.2: cumulative extinction LUT T(d, sigma) = the TF alpha curve blurred by `sigma`
+    // then integrated 0..d (Gaussian-extended pre-integration). `r16float` is plenty of precision for
+    // this monotonic [0,1]-ish curve (unlike the density-pyramid mean/meanSq moments, this isn't a
+    // near-equal-value subtraction) and is filterable in core WebGPU, letting the shader use hardware
+    // bilinear sampling on both axes instead of a manual lerp. Rebuilt with the TF; `sigma` (the row
+    // axis) is a fixed, uniformly-spaced set of buckets — `preintAvgAlpha` in the shader picks the
+    // per-sample row from the density pyramid's local variance at the current LOD.
+    const alphaCurve = new Float32Array(lutSize);
+    for (let i = 0; i < lutSize; i++) alphaCurve[i] = (lut[i * 4 + 3] ?? 0) / 255;
+    const sigmaBuckets = defaultSigmaBuckets();
+    const tTable = buildGaussianPreintegrationTable(alphaCurve, sigmaBuckets);
+    this.tPreintTex?.dispose();
+    this.tPreintTex = new ManagedTexture(this.ctx.device, {
+      size: [lutSize, sigmaBuckets.length, 1],
+      format: "r16float",
+      dimension: "2d",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    const preintBytesPerRow = Math.max(256, Math.ceil((lutSize * 2) / 256) * 256);
+    const preintPadded = new Uint8Array(preintBytesPerRow * sigmaBuckets.length);
+    const preintView = new DataView(preintPadded.buffer);
+    for (let row = 0; row < sigmaBuckets.length; row++) {
+      const rowOffset = row * preintBytesPerRow;
+      for (let i = 0; i < lutSize; i++) {
+        preintView.setUint16(rowOffset + i * 2, floatToHalf(tTable[row * lutSize + i] ?? 0), true);
+      }
     }
-    this.tPreintBuffer?.dispose();
-    this.tPreintBuffer = ManagedBuffer.fromData(this.ctx.device, GPUBufferUsage.STORAGE, tCurve);
+    this.ctx.device.queue.writeTexture(
+      { texture: this.tPreintTex.gpu },
+      preintPadded,
+      { bytesPerRow: preintBytesPerRow, rowsPerImage: sigmaBuckets.length },
+      { width: lutSize, height: sigmaBuckets.length, depthOrArrayLayers: 1 },
+    );
     this.bindings.invalidate();
   }
 
@@ -655,7 +677,7 @@ export class VolumeRenderer implements Disposable {
       tfTex,
       tfSampler: this.pipelineMgr.tfSamplerHandle,
       brickTex: this.brickTex,
-      preintBuffer: this.tPreintBuffer ?? this.dummyPreint,
+      preintTex: this.tPreintTex ?? this.dummyPreint,
       spec,
       acceleration: this.acceleration,
     });
@@ -752,7 +774,7 @@ export class VolumeRenderer implements Disposable {
     this.pipelineMgr.dispose();
     this.tfTex?.dispose();
     this.acceleration.dispose();
-    this.tPreintBuffer?.dispose();
+    this.tPreintTex?.dispose();
     this.dummyPreint.dispose();
     this.tfTex = undefined;
     this.volumeTex = undefined;

@@ -12,13 +12,14 @@
 import type { Disposable } from "@zarr-viewer/core";
 import type { Mat4 } from "@zarr-viewer/math";
 import { ManagedBuffer } from "../resources/buffer.js";
-import type { ManagedTexture } from "../resources/texture.js";
+import { ManagedTexture } from "../resources/texture.js";
 import { LightingEnvironment, type GpuLight } from "../lighting/index.js";
 import type { ShaderSpecialization } from "./shader-config.js";
 import { VisibilityFeedback, VIS_GRID_DEFAULT } from "./visibility.js";
 import { OccupancyGrid } from "./occupancy.js";
 import { TileCompactor, TILE_SIZE } from "./tiles.js";
 import { ShadowMap } from "./shadow-map.js";
+import { DensityPyramid } from "./density-pyramid.js";
 import { aabbScreenBbox } from "../volume/volume-math.js";
 
 /** Per-frame inputs {@link VolumeAcceleration.runPrePasses} needs but doesn't own. */
@@ -56,11 +57,14 @@ export class VolumeAcceleration implements Disposable {
   private readonly dummyTiles: ManagedBuffer;
   private readonly shadowMap: ShadowMap;
   private readonly lightEnv: LightingEnvironment;
+  private densityPyramid: DensityPyramid | undefined;
+  private readonly dummyDensityPyramid: ManagedTexture;
   private disposed = false;
 
   private dirtyOccMinMax = true;
   private dirtyOccTf = true;
   private dirtyShadow = true;
+  private dirtyDensityPyramid = true;
   private shadowMapEnabled = false;
   private shadowMapBuilt = false;
   private shadowLightDir: [number, number, number] = [0.45, 0.85, 0.35];
@@ -80,6 +84,12 @@ export class VolumeAcceleration implements Disposable {
     this.dummyPrefix = OccupancyGrid.dummyPrefix(device);
     this.dummyTiles = TileCompactor.dummyTiles(device);
     this.shadowMap = new ShadowMap(device);
+    this.dummyDensityPyramid = new ManagedTexture(device, {
+      size: [1, 1, 1],
+      format: "rg32float",
+      dimension: "3d",
+      usage: GPUTextureUsage.TEXTURE_BINDING,
+    });
   }
 
   /** The visibility-feedback bin accumulator (public: the viewer reads back `lastWeights`). */
@@ -137,6 +147,11 @@ export class VolumeAcceleration implements Disposable {
     return this.shadowMap.texture;
   }
 
+  /** The density mip pyramid's `(mean, meanSq)` texture, or a 1x1x1 dummy before the first volume load. */
+  public get densityPyramidTexture(): ManagedTexture {
+    return this.densityPyramid?.texture ?? this.dummyDensityPyramid;
+  }
+
   /**
    * Enable/point the opacity shadow map (Milestone 7.1). A meaningful change of direction (or the
    * enable) marks the map dirty so it rebuilds on the next pre-pass; unchanged inputs cost nothing.
@@ -175,9 +190,19 @@ export class VolumeAcceleration implements Disposable {
       this.occupancy?.dispose();
       this.occupancy = new OccupancyGrid(this.device, size);
     }
+    const pyramidSame =
+      this.densityPyramid &&
+      this.densityPyramid.baseDims[0] === size[0] &&
+      this.densityPyramid.baseDims[1] === size[1] &&
+      this.densityPyramid.baseDims[2] === size[2];
+    if (!pyramidSame) {
+      this.densityPyramid?.dispose();
+      this.densityPyramid = new DensityPyramid(this.device, size);
+    }
     this.dirtyOccMinMax = true;
     this.dirtyOccTf = true;
     this.dirtyShadow = true;
+    this.dirtyDensityPyramid = true;
   }
 
   /** Resolve the bind-group buffers for the active shader spec (dummy fallback when a feature is off). */
@@ -202,6 +227,14 @@ export class VolumeAcceleration implements Disposable {
   public runPrePasses(encoder: GPUCommandEncoder, ctx: VolumeAccelerationFrameCtx): boolean {
     let bindGroupDirty = false;
     const { spec } = ctx;
+    // Milestone 3.2: the density mip pyramid feeds the Gaussian-extended pre-integration table's
+    // sigma lookup, so it's only needed for shader configs that compile PRE_INTEGRATE in — rebuilt
+    // once per volume load, not per frame (`dirtyDensityPyramid` only flips true from
+    // `notifyVolumeChanged`). Not yet consumed by the raymarch bind group (wired in a later step).
+    if (spec.preIntegrate && this.densityPyramid && this.dirtyDensityPyramid && ctx.volumeTex) {
+      this.densityPyramid.rebuildFromVolume(encoder, ctx.volumeTex);
+      this.dirtyDensityPyramid = false;
+    }
     if (spec.occupancy && this.occupancy && ctx.volumeTex) {
       if (this.dirtyOccMinMax) {
         this.occupancy.rebuildMinMax(encoder, ctx.volumeTex);
@@ -275,6 +308,9 @@ export class VolumeAcceleration implements Disposable {
     this.dummyPrefix.dispose();
     this.dummyTiles.dispose();
     this.shadowMap.dispose();
+    this.densityPyramid?.dispose();
+    this.dummyDensityPyramid.dispose();
     this.occupancy = undefined;
+    this.densityPyramid = undefined;
   }
 }

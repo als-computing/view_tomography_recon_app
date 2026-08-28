@@ -103,8 +103,9 @@ export class VolumePipeline implements Disposable {
           { binding: 8, visibility: visVert | visFrag, buffer: { type: "read-only-storage" } },
           { binding: 9, visibility: visFrag, buffer: { type: "read-only-storage" } },
           { binding: 10, visibility: visVert | visFrag, buffer: { type: "read-only-storage" } },
-          { binding: 11, visibility: visFrag, buffer: { type: "read-only-storage" } },
+          { binding: 11, visibility: visFrag, texture: { sampleType: "float", viewDimension: "2d" } },
           { binding: 12, visibility: visFrag, texture: { sampleType: "float", viewDimension: "3d" } },
+          { binding: 13, visibility: visFrag, texture: { sampleType: "unfilterable-float", viewDimension: "3d" } },
         ],
       });
       this.pipelineLayout = this.ctx.device.createPipelineLayout({

@@ -21,6 +21,7 @@ export interface VolumeAccelerationBindingsLike {
   readonly lightBuffer: GPUBuffer;
   readonly visWriteBuffer: GPUBuffer;
   readonly shadowMapTexture: ManagedTexture;
+  readonly densityPyramidTexture: ManagedTexture;
 }
 
 /** Per-frame resources the volume bind group reads. */
@@ -32,7 +33,7 @@ export interface VolumeBindingsParams {
   tfTex: ManagedTexture;
   tfSampler: GPUSampler;
   brickTex: ManagedTexture | undefined;
-  preintBuffer: ManagedBuffer;
+  preintTex: ManagedTexture;
   spec: ShaderSpecialization;
   acceleration: VolumeAccelerationBindingsLike;
 }
@@ -70,10 +71,14 @@ export class VolumeBindings {
         { binding: 8, resource: { buffer: occBuf } },
         { binding: 9, resource: { buffer: prefixBuf } },
         { binding: 10, resource: { buffer: tileBuf } },
-        { binding: 11, resource: { buffer: params.preintBuffer.gpu } },
+        { binding: 11, resource: params.preintTex.createView({ dimension: "2d" }) },
         {
           binding: 12,
           resource: params.acceleration.shadowMapTexture.createView({ dimension: "3d" }),
+        },
+        {
+          binding: 13,
+          resource: params.acceleration.densityPyramidTexture.createView({ dimension: "3d" }),
         },
       ],
     });

@@ -33,6 +33,7 @@ export function computeProvenance(
     shadowMode: shadowEnabled ? "light-axis-sweep" : "none",
     transferFunction: tfHash,
     renderScale,
+    extendedPreIntegration: spec.preIntegrate,
     ...extras,
   };
 }

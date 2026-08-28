@@ -26,6 +26,12 @@ describe("computeProvenance", () => {
     const p = computeProvenance("baseline", "tf-hash", 1, 0, false, { renderScale: 0.75 });
     expect(p.renderScale).toBe(0.75);
   });
+
+  it("reports extendedPreIntegration only for the quality config (Milestone 3.2)", () => {
+    expect(computeProvenance("baseline", "tf-hash", 1, 0, false).extendedPreIntegration).toBe(false);
+    expect(computeProvenance("fast", "tf-hash", 1, 0, false).extendedPreIntegration).toBe(false);
+    expect(computeProvenance("quality", "tf-hash", 1, 0, false).extendedPreIntegration).toBe(true);
+  });
 });
 
 describe("approximateShadingBanner", () => {

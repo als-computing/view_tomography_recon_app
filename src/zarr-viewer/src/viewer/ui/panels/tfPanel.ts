@@ -16,7 +16,7 @@ export function tfPanelBody(rendering: WebGpuRenderingState): string {
   return [
     `<label class="whud__row" style="font-size:11px">Colormap <select id="cmap" class="whud__select">${maps}</select></label>`,
     slider("opacityScale", "Opacity ×", rendering.opacityScale, 0.05, 2, 0.01),
-    `<div class="whud__hint">Opacity curve (drag · dbl-click add) · volume histogram behind</div>`,
+    `<div class="whud__hint">Opacity curve (drag · dbl-click add/remove) · volume histogram behind</div>`,
     `<canvas id="opacity-curve" style="width:100%;height:84px;display:block;touch-action:none;cursor:crosshair"></canvas>`,
     // Dual-thumb color-range slider under the graph — both heads set [colorLo, colorHi] together.
     rangeSlider("color", "Color range", rendering.colorLo, rendering.colorHi, 0.005),

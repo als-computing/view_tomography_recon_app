@@ -8,6 +8,7 @@
  */
 
 import { LIGHT_STRUCT_WGSL } from "./lights.js";
+import { PREINTEGRATION_SIGMA_MAX } from "../volume/preintegration-2d.js";
 
 /** Byte size of the volume frame uniform block (mat4 + 21 × vec4 + shadow mat4 + shadowCtl + camRight/camUp). */
 export const VOLUME_FRAME_UNIFORM_SIZE = 512;
@@ -44,6 +45,10 @@ const TILE_INSTANCED: u32 = ${TILE}u;
 const MS_OCTAVES: u32 = ${MS_OCTAVES}u;
 const BENT_NORMAL_AMBIENT: u32 = ${BENT}u;
 const PRE_INTEGRATE: u32 = ${PREINT}u;
+// Milestone 3.2: must match preintegration-2d.ts's PREINTEGRATION_SIGMA_MAX exactly - this is the
+// sigma value the pre-integration table's top row represents, so v = sigma / SIGMA_MAX picks the
+// right row via hardware bilinear sampling.
+const SIGMA_MAX: f32 = ${PREINTEGRATION_SIGMA_MAX};
 const VIS_SCALE: f32 = 128.0;
 const SHADE_ALPHA_EPS: f32 = 1e-4;
 const TARGET_SEGMENT_OPACITY: f32 = 0.25;
@@ -95,12 +100,16 @@ ${LIGHT_STRUCT_WGSL}
 @group(0) @binding(8) var<storage, read> occCells: array<OccCell>;
 @group(0) @binding(9) var<storage, read> tfPrefix: array<u32>;
 @group(0) @binding(10) var<storage, read> tileInsts: array<TileInst>;
-// Cumulative extinction LUT for pre-integration (Milestone 3.1): tPreint[i] = ∫₀^{d_i} α(x) dx over the
-// transfer function alpha (density units). Kept f32 (the ratio form is cancellation-prone). One entry
-// per TF LUT bin; a 2-entry dummy is bound when PRE_INTEGRATE is off.
-@group(0) @binding(11) var<storage, read> tPreint: array<f32>;
+// Cumulative extinction LUT for pre-integration (Milestone 3.1/3.2): tPreint(d, sigma) = the TF alpha
+// curve blurred by sigma then integrated 0..d. x = density, y = sigma bucket (both bilinearly filtered
+// by hardware) - sigma comes from the density pyramid's local variance at the ray's LOD (see
+// sampleVariance/sigmaLod below). A 1x1 dummy is bound when PRE_INTEGRATE is off.
+@group(0) @binding(11) var tPreint: texture_2d<f32>;
 // Light-space opacity shadow map (Milestone 7.1): .r = optical depth τ from the light to each point.
 @group(0) @binding(12) var shadowTex: texture_3d<f32>;
+// Density mip pyramid (Milestone 3.2): rg = (mean, meanSq) per mip level, sampled via textureLoad at
+// an explicit level (nearest, no interpolation between levels) chosen from the ray's step footprint.
+@group(0) @binding(13) var densityPyramid: texture_3d<f32>;
 
 struct VSOut {
   @builtin(position) clip: vec4<f32>,
@@ -175,28 +184,39 @@ fn sampleTf(density: f32) -> vec4<f32> {
   return textureSampleLevel(tfTex, tfSampler, vec2<f32>(density, 0.5), 0.0);
 }
 
-// Linearly-interpolated cumulative extinction T(density) from the pre-integration LUT.
-fn preintT(d: f32) -> f32 {
-  let n = arrayLength(&tPreint);
-  if (n < 2u) { return 0.0; }
-  let x = clamp(d, 0.0, 1.0) * f32(n - 1u);
-  let i0 = u32(floor(x));
-  let i1 = min(i0 + 1u, n - 1u);
-  return mix(tPreint[i0], tPreint[i1], x - floor(x));
+// Milestone 3.2: local density variance from the mip pyramid's (mean, meanSq) moments at an explicit
+// LOD, clamped >=0 to guard the mean^2~meanSq cancellation case. "level" is a nearest-level pick, not
+// trilinear-blended between levels - the pyramid's own downsample step already box-filters each level.
+fn sampleVariance(uvw: vec3<f32>, lod: f32) -> f32 {
+  let maxLevel = i32(textureNumLevels(densityPyramid)) - 1;
+  let level = clamp(i32(round(lod)), 0, max(maxLevel, 0));
+  let levelU = u32(level);
+  let dims = max(vec3<i32>(textureDimensions(densityPyramid, levelU)), vec3<i32>(1));
+  let coord = clamp(vec3<i32>(uvw * vec3<f32>(dims)), vec3<i32>(0), dims - vec3<i32>(1));
+  let s = textureLoad(densityPyramid, coord, levelU);
+  return max(0.0, s.g - s.r * s.r);
 }
 
-// Milestone 3.1: segment-average TF alpha over the density interval [sf, sb] (front→back samples),
+// Bilinearly-interpolated cumulative extinction T(density, sigma) from the Gaussian-extended
+// pre-integration LUT (Milestone 3.2 extends Milestone 3.1's 1D table to a 2nd axis blurred by the
+// local density-variance-derived sigma from the mip pyramid).
+fn preintT(d: f32, sigma: f32) -> f32 {
+  let v = clamp(sigma / SIGMA_MAX, 0.0, 1.0);
+  return textureSampleLevel(tPreint, tfSampler, vec2<f32>(clamp(d, 0.0, 1.0), v), 0.0).r;
+}
+
+// Milestone 3.1/3.2: segment-average TF alpha over the density interval [sf, sb] (front→back samples),
 // assuming density varies linearly across the step. The ratio form is the exact average extinction;
 // near-equal endpoints (|sb-sf| < eps) fall back to the midpoint value (2nd-order, no discontinuity at
 // the boundary). This replaces the point-sampled endpoint alpha in the composite, so long majorant
 // steps integrate the transfer function instead of skipping over thin spikes between samples.
-fn preintAvgAlpha(sf: f32, sb: f32) -> f32 {
-  let n = arrayLength(&tPreint);
+fn preintAvgAlpha(sf: f32, sb: f32, sigma: f32) -> f32 {
+  let n = textureDimensions(tPreint).x;
   let eps = 3.0 / f32(max(n, 2u));
   if (abs(sb - sf) < eps) {
     return sampleTf((sf + sb) * 0.5).a; // limit form (midpoint)
   }
-  return (preintT(sb) - preintT(sf)) / (sb - sf); // ratio form (exact average)
+  return (preintT(sb, sigma) - preintT(sf, sigma)) / (sb - sf); // ratio form (exact average)
 }
 
 fn occIndex(c: vec3<i32>) -> u32 {
@@ -634,6 +654,18 @@ fn marchColor(in: VSOut, depthOut: ptr<function, f32>) -> vec4<f32> {
   var t = max(hit.x, 0.0) + jitter * stepSize;
   let tEnd = hit.y;
   let rdUvw = rd / (2.0 * halfExt);
+  // Milestone 3.2: pick the density-pyramid mip level whose texel footprint best matches this ray's
+  // step size in volume-texel units (classic LOD = log2(sample footprint in texels)). The composite
+  // path's step is always the uniform baseline stepSize (occupancy/crop-skip branches continue
+  // before reaching it - see below), so this is constant per-ray, not recomputed per-sample.
+  let volDims = vec3<f32>(textureDimensions(volumeTex));
+  let voxelUvw = 1.0 / max(min(min(volDims.x, volDims.y), volDims.z), 1.0);
+  let stepUvwLen = length(stepSize * rdUvw);
+  let sigmaLod = clamp(
+    log2(max(stepUvwLen / voxelUvw, 1.0)),
+    0.0,
+    f32(max(i32(textureNumLevels(densityPyramid)) - 1, 0)),
+  );
 
   var color = vec4<f32>(0.0);
   var mipVal = 0.0;
@@ -769,7 +801,12 @@ fn marchColor(in: VSOut, depthOut: ptr<function, f32>) -> vec4<f32> {
         // Milestone 3.1: integrate the TF over the segment [prevDensity, density] instead of point-
         // sampling the endpoint alpha, so a long majorant step can't skip a thin TF spike between
         // samples. Modulated by the same gradient-opacity factor as the point path.
-        effAlpha = max(preintAvgAlpha(prevDensity, density) * gFactor, 0.0);
+        // Milestone 3.2: blur the integration by the local density-variance-derived sigma (from the
+        // mip pyramid at this ray's LOD), so a spike that aliases at a coarse sample spacing smears
+        // across neighboring samples instead of flickering in/out as the camera zooms.
+        let blurVariance = sampleVariance(uvw, sigmaLod);
+        let blurSigma = sqrt(blurVariance);
+        effAlpha = max(preintAvgAlpha(prevDensity, density, blurSigma) * gFactor, 0.0);
       }
       let sigma = effAlpha * densityScale * sigmaMul;
       var alpha = 1.0 - exp(-sigma * stepNow);

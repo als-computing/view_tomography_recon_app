@@ -25,6 +25,13 @@ export interface RenderProvenance {
   transferFunction: string;
   /** Internal render resolution as a fraction of the swapchain (1 = full). */
   renderScale: number;
+  /**
+   * Whether the Gaussian-extended pre-integration table (Milestone 3.2) was active — i.e. the
+   * per-sample opacity integral was blurred by a mip-pyramid-derived local density variance instead
+   * of using the exact (unblurred) transfer-function curve. An artistic approximation in the same
+   * sense as multi-scatter/bent-normal ambient, so it's provenance-stamped like them.
+   */
+  extendedPreIntegration: boolean;
 }
 
 const PNG_SIG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);

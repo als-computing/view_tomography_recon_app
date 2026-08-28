@@ -287,7 +287,7 @@ const i32Scratch = new Int32Array(f32Scratch.buffer);
  * Our inputs are clamped to [0,1] so only the normal/subnormal-to-zero paths are exercised, but the
  * full range is handled for safety.
  */
-function floatToHalf(value: number): number {
+export function floatToHalf(value: number): number {
   f32Scratch[0] = value;
   const x = i32Scratch[0]!;
   const sign = (x >> 16) & 0x8000;

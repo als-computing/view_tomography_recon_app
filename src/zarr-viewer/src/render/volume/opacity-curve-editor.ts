@@ -17,7 +17,8 @@ export interface OpacityCurveEditorOptions {
 
 /**
  * Interactive opacity-curve editor drawn into a canvas.
- * Drag points vertically (opacity) / horizontally (intensity); double-click to add.
+ * Drag points vertically (opacity) / horizontally (intensity); double-click empty space to add a
+ * point, double-click an existing point to remove it (at least 2 points are always kept).
  */
 export class OpacityCurveEditor {
   public points: OpacityPoint[];
@@ -167,7 +168,10 @@ export class OpacityCurveEditor {
   }
 
   private bind(): void {
-    const toLocal = (e: PointerEvent): { t: number; a: number } => {
+    // `PointerEvent.detail` isn't populated with click-count semantics in most engines (it's a
+    // `MouseEvent`/`click` concept), so double-click add/remove uses the browser's native `dblclick`
+    // event instead — `pointerdown`/`move`/`up` below handle only single-click drag.
+    const toLocal = (e: MouseEvent): { t: number; a: number } => {
       const rect = this.canvas.getBoundingClientRect();
       const t = Math.min(1, Math.max(0, (e.clientX - rect.left) / Math.max(1, rect.width)));
       const a = Math.min(1, Math.max(0, 1 - (e.clientY - rect.top) / Math.max(1, rect.height)));
@@ -194,12 +198,6 @@ export class OpacityCurveEditor {
     const onDown = (e: PointerEvent): void => {
       const { t, a } = toLocal(e);
       this.dragIndex = hit(t, a);
-      if (this.dragIndex < 0 && e.detail >= 2) {
-        const added: OpacityPoint = [t, a];
-        this.points = [...this.points, added].sort((x, y) => x[0] - y[0]);
-        this.dragIndex = this.points.indexOf(added);
-        this.emit();
-      }
       this.canvas.setPointerCapture(e.pointerId);
       e.preventDefault();
     };
@@ -219,15 +217,36 @@ export class OpacityCurveEditor {
       this.dragIndex = -1;
     };
 
+    const onDblClick = (e: MouseEvent): void => {
+      const { t, a } = toLocal(e);
+      const hitIndex = hit(t, a);
+      if (hitIndex >= 0) {
+        // Remove, but always keep at least a start and end point.
+        if (this.points.length > 2) {
+          this.points = this.points.filter((_, i) => i !== hitIndex);
+          this.dragIndex = -1;
+          this.emit();
+        }
+      } else {
+        const added: OpacityPoint = [t, a];
+        this.points = [...this.points, added].sort((x, y) => x[0] - y[0]);
+        this.dragIndex = -1;
+        this.emit();
+      }
+      e.preventDefault();
+    };
+
     this.canvas.addEventListener("pointerdown", onDown);
     this.canvas.addEventListener("pointermove", onMove);
     this.canvas.addEventListener("pointerup", onUp);
     this.canvas.addEventListener("pointercancel", onUp);
+    this.canvas.addEventListener("dblclick", onDblClick);
     this.cleanups.push(() => {
       this.canvas.removeEventListener("pointerdown", onDown);
       this.canvas.removeEventListener("pointermove", onMove);
       this.canvas.removeEventListener("pointerup", onUp);
       this.canvas.removeEventListener("pointercancel", onUp);
+      this.canvas.removeEventListener("dblclick", onDblClick);
     });
   }
 
