@@ -1,6 +1,6 @@
 /**
  * Unified lighting library: GPU light list + shared WGSL + {@link LightingEnvironment}. Copied from
- * prism's `@prism/render` lighting submodule; the scene-extraction path is omitted (this viewer
+ * prism's `@zarr-viewer/render` lighting submodule; the scene-extraction path is omitted (this viewer
  * builds its light set procedurally from the camera).
  *
  * @packageDocumentation

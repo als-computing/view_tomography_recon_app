@@ -4,7 +4,7 @@
  * no GPU). The GPU fragment passes themselves are validated in the browser playground.
  */
 import { describe, it, expect } from "vitest";
-import { RenderGraph, type ResourceHandle } from "@prism/render";
+import { RenderGraph, type ResourceHandle } from "@zarr-viewer/render";
 import {
   PostStack,
   tonemap,
@@ -18,7 +18,7 @@ import {
   linearToSrgb,
   srgbToLinear,
   type Effect,
-} from "@prism/fx";
+} from "@zarr-viewer/fx";
 
 const nullDevice = null as unknown as GPUDevice;
 const RT_TB = 0x10 | 0x04;

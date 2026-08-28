@@ -1,5 +1,5 @@
 {
-  "name": "@prism/fx",
+  "name": "@zarr-viewer/fx",
   "version": "0.0.0",
   "type": "module",
   "description": "Prism post-processing effects: bloom, tonemap, TAA, SSAO, DoF, and more.",
@@ -11,8 +11,8 @@
   },
   "sideEffects": false,
   "dependencies": {
-    "@prism/core": "*",
-    "@prism/math": "*",
-    "@prism/render": "*"
+    "@zarr-viewer/core": "*",
+    "@zarr-viewer/math": "*",
+    "@zarr-viewer/render": "*"
   }
 }

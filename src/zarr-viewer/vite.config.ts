@@ -15,10 +15,7 @@ export default defineConfig({
       "@zarr-viewer/controls": resolve(src, "controls/index.ts"),
       "@zarr-viewer/io": resolve(src, "io/index.ts"),
       "@zarr-viewer/render": resolve(src, "render/index.ts"),
-      "@prism/core": resolve(src, "core/index.ts"),
-      "@prism/math": resolve(src, "math/index.ts"),
-      "@prism/render": resolve(src, "render/index.ts"),
-      "@prism/fx": resolve(src, "fx/src/index.ts"),
+      "@zarr-viewer/fx": resolve(src, "fx/src/index.ts"),
     },
   },
   server: {

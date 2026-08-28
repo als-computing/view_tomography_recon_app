@@ -1,9 +1,9 @@
 /**
- * Standalone OME-Zarr viewer entry — boots Demo 26 on `#canvas`.
+ * Standalone OME-Zarr viewer entry — boots the WebGPU volume viewer on `#canvas`.
  */
 
 import { run } from "./ome-zarr-viewer.js";
-import { resetDemoStage } from "./demo-session.js";
+import { resetViewerStage } from "./viewer-session.js";
 
 const stageEl = document.querySelector("#stage");
 if (!(stageEl instanceof HTMLElement)) {
@@ -15,7 +15,7 @@ let dispose: (() => void) | undefined;
 
 async function boot(): Promise<void> {
   dispose?.();
-  const canvas = resetDemoStage(stage);
+  const canvas = resetViewerStage(stage);
   const handle = await run(canvas);
   dispose = () => handle.dispose();
 }

@@ -5,7 +5,7 @@
  * @packageDocumentation
  */
 
-import type { ToneMapOperator } from "@prism/fx";
+import type { ToneMapOperator } from "@zarr-viewer/fx";
 import type { WebGpuRenderingState } from "../../RenderingState.js";
 import { slider } from "../html.js";
 

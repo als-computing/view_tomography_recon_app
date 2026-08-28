@@ -7,7 +7,7 @@
  * @packageDocumentation
  */
 
-import type { RenderGraph, ResourceHandle } from "@prism/render";
+import type { RenderGraph, ResourceHandle } from "@zarr-viewer/render";
 
 /** A single post-processing effect. */
 export interface Effect {

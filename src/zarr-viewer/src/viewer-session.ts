@@ -1,14 +1,14 @@
 /**
- * Shared playground demo session: RAF + window listeners + HUD cleanup.
- * The shell ({@link resetDemoStage}) restores a fresh `#canvas` between demos.
+ * Shared viewer session: RAF + window listeners + HUD cleanup.
+ * The shell ({@link resetViewerStage}) restores a fresh `#canvas` on load.
  */
 
-export interface DemoHandle {
+export interface ViewerHandle {
   dispose(): void;
 }
 
-/** Create a disposable session bound to the current demo canvas. */
-export function createDemoSession(canvas: HTMLCanvasElement): {
+/** Create a disposable session bound to the current viewer canvas. */
+export function createViewerSession(canvas: HTMLCanvasElement): {
   canvas: HTMLCanvasElement;
   stage: HTMLElement;
   /** Start a self-cancelling animation loop. */
@@ -19,8 +19,8 @@ export function createDemoSession(canvas: HTMLCanvasElement): {
   mountHud: (el: HTMLElement) => void;
   /** Extra cleanup (controls.dispose, UI detach, etc.). */
   onDispose: (fn: () => void) => void;
-  /** Return the handle the playground shell should retain. */
-  handle: () => DemoHandle;
+  /** Return the handle the viewer shell should retain. */
+  handle: () => ViewerHandle;
 } {
   const stage = (canvas.parentElement ?? document.body) as HTMLElement;
   const cleanups: Array<() => void> = [];
@@ -74,7 +74,7 @@ export function createDemoSession(canvas: HTMLCanvasElement): {
 }
 
 /** Wipe the stage and install a fresh WebGPU/2D-capable canvas. */
-export function resetDemoStage(stage: HTMLElement): HTMLCanvasElement {
+export function resetViewerStage(stage: HTMLElement): HTMLCanvasElement {
   stage.replaceChildren();
   const canvas = document.createElement("canvas");
   canvas.id = "canvas";
@@ -82,8 +82,8 @@ export function resetDemoStage(stage: HTMLElement): HTMLCanvasElement {
   return canvas;
 }
 
-/** Shared absolute HUD chrome used by several demos. */
-export function createDemoHud(options?: {
+/** Shared absolute HUD chrome used by the viewer. */
+export function createViewerHud(options?: {
   position?: "top-left" | "bottom-left";
   pointerEvents?: boolean;
 }): HTMLDivElement {
@@ -107,7 +107,7 @@ export function createDemoHud(options?: {
 }
 
 /** Resize a canvas backing store to its CSS box, capped by `maxDpr` (default 2). */
-export function resizeDemoCanvas(canvas: HTMLCanvasElement, maxDpr = 2): void {
+export function resizeViewerCanvas(canvas: HTMLCanvasElement, maxDpr = 2): void {
   const dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
   const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
   const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));

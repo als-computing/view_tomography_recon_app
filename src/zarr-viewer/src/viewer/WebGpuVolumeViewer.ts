@@ -1,5 +1,5 @@
 /**
- * Demo 26 — OME-Zarr volume viewer (Cosmovis / itk-vtk-viewer style).
+ * OME-Zarr volume viewer (Cosmovis / itk-vtk-viewer style).
  *
  * Panels: Data · TF · Render · Slices · Crop · Measure (click-to-pick feature).
  * Pan: Space+drag, Shift/Alt+left, middle, right, or trackpad sideways. Zoom toward cursor.
@@ -31,13 +31,13 @@ import {
 import { Scene, Node } from "@zarr-viewer/scene";
 import { OrbitControls } from "@zarr-viewer/controls";
 import { Mat4, Vec3 } from "@zarr-viewer/math";
-import { bloom, tonemap, fxaa, sharpen, vignette, type ToneMapOperator, type Effect } from "@prism/fx";
+import { bloom, tonemap, fxaa, sharpen, vignette, type ToneMapOperator, type Effect } from "@zarr-viewer/fx";
 import {
-  createDemoSession,
-  createDemoHud,
-  type DemoHandle,
-  resizeDemoCanvas,
-} from "../demo-session.js";
+  createViewerSession,
+  createViewerHud,
+  type ViewerHandle,
+  resizeViewerCanvas,
+} from "../viewer-session.js";
 import { ensureHudStyles } from "../hud-theme.js";
 import { ViewportOverlay } from "../render/overlay/viewport-overlay.js";
 import { FxPipeline } from "../render/post/fx-pipeline.js";
@@ -127,8 +127,8 @@ export async function run(
   canvas: HTMLCanvasElement,
   options?: { zarrUrl?: string; hudMount?: HTMLElement },
 ): Promise<WebGpuViewerInstance> {
-  const session = createDemoSession(canvas);
-  resizeDemoCanvas(canvas);
+  const session = createViewerSession(canvas);
+  resizeViewerCanvas(canvas);
 
   const ctx = await createContext(canvas, { powerPreference: "high-performance" });
   const maxTex = ctx.device.limits.maxTextureDimension3D;
@@ -188,7 +188,7 @@ export async function run(
 
   // Minimal instance for the failure paths (bad store / no uploadable LOD) — real get/set exist only
   // once the volume + controls are live. Keeps the return type uniform so callers always get a handle.
-  const errorInstance = (handle: DemoHandle): WebGpuViewerInstance => ({
+  const errorInstance = (handle: ViewerHandle): WebGpuViewerInstance => ({
     getCamera: () => ({ target: [0, 0, 0], offset: [0, 0, 5], gazeUp: [0, 1, 0], distance: 5 }),
     setCamera: () => {},
     getRendering: readRendering,
@@ -209,7 +209,7 @@ export async function run(
   try {
     source = await openOmeZarr(store, { skipRangeEstimate: true, valueRange });
   } catch (err) {
-    const hud = createDemoHud({ position: "bottom-left", pointerEvents: true });
+    const hud = createViewerHud({ position: "bottom-left", pointerEvents: true });
     session.mountHud(hud);
     hud.innerHTML = `<strong>26 · OME-Zarr</strong><div style="margin-top:8px">${
       err instanceof Error ? err.message : String(err)
@@ -232,7 +232,7 @@ export async function run(
     levels.find((lv) => lv >= MIN_DISPLAY_LEVEL) ?? levels[levels.length - 1]!;
 
   if (levels.length === 0) {
-    const hud = createDemoHud({ position: "bottom-left" });
+    const hud = createViewerHud({ position: "bottom-left" });
     session.mountHud(hud);
     hud.textContent = `No uploadable LOD (GPU max 3D texture ${maxTex}).`;
     return errorInstance(session.handle());
@@ -477,7 +477,7 @@ export async function run(
   // --- Whole-panel collapse ----------------------------------------------------------------------
   // Collapses the entire docked sidebar to a thin strip (or the floating panel to just its header),
   // leaving a chevron to re-expand. The canvas backing store re-fits to its widened CSS box on the
-  // next render-loop frame (resizeDemoCanvas runs every frame); we also nudge it immediately.
+  // next render-loop frame (resizeViewerCanvas runs every frame); we also nudge it immediately.
   let collapsed = false;
   const expandedWidth = docked ? options!.hudMount!.style.width || "320px" : "";
   const applyCollapsed = (): void => {
@@ -488,7 +488,7 @@ export async function run(
       host.style.overflow = collapsed ? "hidden" : "auto";
     }
     // Reading clientWidth below forces a synchronous reflow, so the canvas picks up its new box now.
-    resizeDemoCanvas(canvas);
+    resizeViewerCanvas(canvas);
   };
 
   const lengthUnit = (): units.Unit =>
@@ -939,7 +939,7 @@ export async function run(
   const view = new Mat4();
   const viewProj = new Mat4();
   console.info(
-    "[prism] demo 26 — levels",
+    "[zarr-viewer] levels",
     levels,
     "maxTex",
     maxTex,
@@ -948,7 +948,7 @@ export async function run(
   );
 
   session.loop((dt) => {
-    resizeDemoCanvas(canvas);
+    resizeViewerCanvas(canvas);
     controls.update(dt); // the orbit pivot is clamped to the volume bounds inside update() via targetBounds
     // Render on demand: the volume ray-march is expensive, so re-render only while something is actually
     // changing — otherwise a continuous 60 fps march saturates the GPU and janks the whole browser

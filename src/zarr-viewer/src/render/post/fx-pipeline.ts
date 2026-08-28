@@ -13,7 +13,7 @@
 
 import type { GpuContext } from "../device/context.js";
 import { RenderGraph } from "../graph/render-graph.js";
-import { PostStack, type Effect } from "@prism/fx";
+import { PostStack, type Effect } from "@zarr-viewer/fx";
 import { GpuTimer } from "../accel/gpu-timer.js";
 import type { TemporalAccumulator } from "../accel/taau.js";
 import { VOLUME_DEPTH_FORMAT } from "../volume/volume-renderer.js";

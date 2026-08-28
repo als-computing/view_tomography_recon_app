@@ -9,8 +9,8 @@
  * @packageDocumentation
  */
 
-import { NotImplementedError } from "@prism/core";
-import type { RenderGraph, ResourceHandle } from "@prism/render";
+import { NotImplementedError } from "@zarr-viewer/core";
+import type { RenderGraph, ResourceHandle } from "@zarr-viewer/render";
 import type { Effect, PostStackTarget } from "./stack.js";
 import { FullscreenPass } from "./fullscreen.js";
 import { TONEMAP_WGSL, type ToneMapOperator } from "./tonemap-ops.js";

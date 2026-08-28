@@ -17,7 +17,7 @@ import {
   type OpacityCurveEditor,
   type VolumeRenderer,
 } from "@zarr-viewer/render";
-import type { ToneMapOperator } from "@prism/fx";
+import type { ToneMapOperator } from "@zarr-viewer/fx";
 import type { FxPipeline } from "../../render/post/fx-pipeline.js";
 import type { TemporalAccumulator } from "../../render/accel/taau.js";
 import { getPreset, savePreset, deletePreset } from "../../rendering-presets.js";

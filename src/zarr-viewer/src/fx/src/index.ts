@@ -1,5 +1,5 @@
 /**
- * `@prism/fx` — post-processing effects and the stack that composes them into the render graph.
+ * `@zarr-viewer/fx` — post-processing effects and the stack that composes them into the render graph.
  *
  * @packageDocumentation
  */

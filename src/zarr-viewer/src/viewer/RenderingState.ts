@@ -16,7 +16,7 @@ import {
   type VolumeViewMode,
   type ShaderConfigName,
 } from "@zarr-viewer/render";
-import type { ToneMapOperator } from "@prism/fx";
+import type { ToneMapOperator } from "@zarr-viewer/fx";
 
 /** Everything that shapes the volume's appearance (transfer function + render params + view mode). */
 export interface WebGpuRenderingState {
