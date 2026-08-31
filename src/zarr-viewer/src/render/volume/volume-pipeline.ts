@@ -25,6 +25,23 @@ import { type ShaderConfigName, specializationFor } from "../accel/shader-config
  */
 export const VOLUME_DEPTH_FORMAT: GPUTextureFormat = "r16float";
 
+/**
+ * Format of the 4 Milestone 6 (B3) G-buffer targets (colorUnlit / surfacePos / surfaceNormal /
+ * surfaceAlbedo), see `volume-raymarch.ts`'s `FragOut`. `rgba16float` matches `FxPipeline`'s
+ * `HDR_FORMAT`, so these compose into the same render-graph texture pool without a format mismatch.
+ */
+const GBUFFER_FORMAT: GPUTextureFormat = "rgba16float";
+
+/** The 4 fixed-format G-buffer target entries, appended after color+depth in both pipelines. */
+function gbufferTargets(): GPUColorTargetState[] {
+  return [
+    { format: GBUFFER_FORMAT },
+    { format: GBUFFER_FORMAT },
+    { format: GBUFFER_FORMAT },
+    { format: GBUFFER_FORMAT },
+  ];
+}
+
 /** The background pipeline + its bind group, once both exist (bound together, always paired). */
 export interface VolumeBackgroundPipeline {
   pipeline: GPURenderPipeline;
@@ -151,7 +168,7 @@ export class VolumePipeline implements Disposable {
         fragment: {
           module: bgMod,
           entryPoint: "fs_main",
-          targets: [{ format: colorFormat }, { format: VOLUME_DEPTH_FORMAT }],
+          targets: [{ format: colorFormat }, { format: VOLUME_DEPTH_FORMAT }, ...gbufferTargets()],
         },
         primitive: { topology: "triangle-list" },
       });
@@ -184,7 +201,7 @@ export class VolumePipeline implements Disposable {
       fragment: {
         module,
         entryPoint: "fs_main",
-        targets: [{ format: colorFormat, blend }, { format: VOLUME_DEPTH_FORMAT }],
+        targets: [{ format: colorFormat, blend }, { format: VOLUME_DEPTH_FORMAT }, ...gbufferTargets()],
       },
       primitive: { topology: "triangle-list" },
     });
@@ -202,7 +219,7 @@ export class VolumePipeline implements Disposable {
         fragment: {
           module: nMod,
           entryPoint: "fs_main",
-          targets: [{ format: colorFormat, blend }, { format: VOLUME_DEPTH_FORMAT }],
+          targets: [{ format: colorFormat, blend }, { format: VOLUME_DEPTH_FORMAT }, ...gbufferTargets()],
         },
         primitive: { topology: "triangle-list" },
       }).catch(() => {

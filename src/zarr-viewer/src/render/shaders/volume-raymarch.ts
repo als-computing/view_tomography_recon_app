@@ -9,6 +9,7 @@
 
 import { LIGHT_STRUCT_WGSL } from "./lights.js";
 import { PREINTEGRATION_SIGMA_MAX } from "../volume/preintegration-2d.js";
+import { VOLUME_LIGHTING_SHARED_WGSL } from "./volume-lighting-shared.js";
 
 /** Byte size of the volume frame uniform block (mat4 + 21 × vec4 + shadow mat4 + shadowCtl + camRight/camUp). */
 export const VOLUME_FRAME_UNIFORM_SIZE = 512;
@@ -286,100 +287,16 @@ fn envRadiance(dir: vec3<f32>) -> vec3<f32> {
   return mix(ground, sky, hemi) * max(frame.liquid.z, 0.2);
 }
 
-// Gentle smooth-cutoff attenuation (no harsh 1/r²) so stage/flashlight coverage stays even.
-fn volAttenuation(dist: f32, range: f32) -> f32 {
-  if (range <= 0.0) { return 1.0; } // directional: no distance falloff
-  let x = clamp(1.0 - (dist / max(range, 1e-3)) * (dist / max(range, 1e-3)), 0.0, 1.0);
-  return x * x;
+${VOLUME_LIGHTING_SHARED_WGSL}
+
+// Milestone 6 (B3): unlit is the same shading minus the shadow/AO/multi-scatter diffuseSpec term -
+// feeds the colorUnlit G-buffer target. lit is byte-identical to what shadeSample returned before
+// this struct existed.
+struct ShadeResult {
+  lit: vec3<f32>,
+  unlit: vec3<f32>,
 }
 
-// Secondary shadow ray: march from the sample toward the light through the volume, accumulating
-// optical depth, and return transmittance T = exp(-tau). ldir points toward the light (world);
-// maxDist is the distance to the (positional) light, or huge for directional. seed is a per-sample
-// hash in [0,1) used to jitter the start (anti-banding) and dither a soft penumbra.
-//
-// The step is tied to the PRIMARY ray step (frame.params.x), not the box size, so the shadow's
-// optical depth uses the same sampling rate as the composite (same sigma = a*densityScale*12) --
-// keeping shadow darkness consistent instead of resolution-dependent. shadowSteps (lightCtl1.y) is a
-// cap on how far we march.
-fn shadowTransmittance(
-  pWorld: vec3<f32>, ldir: vec3<f32>, densityScale: f32, maxDist: f32, seed: f32,
-) -> f32 {
-  let stepsCap = i32(frame.lightCtl1.y);
-  if (stepsCap <= 0) { return 1.0; }
-  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
-  let ext2 = 2.0 * max(halfExt.x, max(halfExt.y, halfExt.z));
-  let softness = clamp(frame.lightCtl1.w, 0.0, 1.0);
-  let sStep = max(frame.params.x, 5e-4) * 1.6;
-  // March at most: to the light, across the box, and within the step budget.
-  let marchLen = min(min(ext2, maxDist), f32(stepsCap) * sStep);
-  // Soft shadows: laterally offset the whole ray by up to (softness) steps -- a dithered penumbra that
-  // averages out under FXAA / temporal jitter. Build a basis perpendicular to the light direction.
-  var origin = pWorld;
-  if (softness > 0.0) {
-    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(ldir.y) > 0.9);
-    let tang = normalize(cross(ldir, up));
-    let bitan = cross(ldir, tang);
-    let j1 = fract(seed * 17.13) - 0.5;
-    let j2 = fract(seed * 41.71 + 0.37) - 0.5;
-    origin += (tang * j1 + bitan * j2) * softness * sStep * 2.0;
-  }
-  // Jittered start bias (>= half a step) avoids self-shadow acne and banding.
-  let bias = (0.5 + seed) * sStep;
-  var traveled = bias;
-  var wp = origin + ldir * bias;
-  var tau = 0.0;
-  loop {
-    if (traveled >= marchLen) { break; }
-    let uvw = (wp + halfExt) / (2.0 * halfExt);
-    if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) { break; }
-    if (inCrop(uvw)) {
-      let a = sampleTf(sampleDensity(uvw)).a;
-      tau += a * densityScale * 12.0 * sStep;
-      if (tau > 8.0) { break; }
-    }
-    wp += ldir * sStep;
-    traveled += sStep;
-  }
-  let T = exp(-tau);
-  return mix(1.0, T, clamp(frame.lightCtl1.z, 0.0, 1.0));
-}
-
-// Volumetric ambient occlusion: sample density outward along the surface normal; more material
-// above a sample = more occluded (darker ambient).
-fn ambientOcclusion(pWorld: vec3<f32>, n: vec3<f32>, seed: f32) -> f32 {
-  let samples = i32(frame.lightCtl2.w);
-  if (samples <= 0) { return 0.0; }
-  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
-  let ext = max(halfExt.x, max(halfExt.y, halfExt.z));
-  let radius = max(frame.lightCtl2.y, 1e-3) * ext;
-  let stepW = radius / f32(samples);
-  var occ = 0.0;
-  for (var s = 1; s <= samples; s++) {
-    // Jitter each tap by (seed) within its step so the AO probe doesn't band on flat features.
-    let wp = pWorld + n * stepW * (f32(s) - 0.5 + seed);
-    let uvw = (wp + halfExt) / (2.0 * halfExt);
-    if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) { break; }
-    if (inCrop(uvw)) {
-      occ += sampleTf(sampleDensity(uvw)).a / f32(samples);
-    }
-  }
-  return clamp(occ, 0.0, 1.0);
-}
-
-// Milestone 7.1: sample the precomputed light-space opacity map (optical depth τ from the light) with a
-// single trilinear fetch, instead of marching a secondary shadow ray. Points outside the map are unlit-
-// shadowed (T = 1). Applies the same shadowStrength (lightCtl1.z) as the brute-march path.
-fn shadowMapT(worldP: vec3<f32>) -> f32 {
-  let lc = (frame.worldToLight * vec4<f32>(worldP, 1.0)).xyz;
-  if (any(lc < vec3<f32>(0.0)) || any(lc > vec3<f32>(1.0))) { return 1.0; }
-  let tau = textureSampleLevel(shadowTex, volumeSampler, lc, 0.0).r;
-  return mix(1.0, exp(-tau), clamp(frame.lightCtl1.z, 0.0, 1.0));
-}
-
-// seed is a per-sample hash for shadow/AO jitter. heavy gates the expensive secondary rays
-// (shadow + AO) to samples that actually contribute to the image (front-of-volume, not yet opaque);
-// low-contribution samples still get cheap diffuse/spec so the look is unchanged.
 fn shadeSample(
   base: vec3<f32>,
   grad: vec3<f32>,
@@ -390,7 +307,7 @@ fn shadeSample(
   densityScale: f32,
   seed: f32,
   heavy: bool,
-) -> vec3<f32> {
+) -> ShadeResult {
   let gLen = length(grad);
   var n = vec3<f32>(0.0, 1.0, 0.0);
   if (gLen > 1e-5) {
@@ -406,74 +323,35 @@ fn shadeSample(
   let shadowOn = frame.lightCtl1.x > 0.5;
   let aoOn = frame.lightCtl2.x > 0.5;
 
-  var ao = 0.0;
-  if (aoOn && heavy) { ao = ambientOcclusion(pWorld, n, seed) * clamp(frame.lightCtl2.z, 0.0, 1.0); }
-  var ambientTerm = base * masterAmbient * (1.0 - ao);
+  let lightRes = evaluateLighting(
+    base, n, viewDir, pWorld, density, densityScale, seed, heavy,
+    numLights, specStrength, shininess, aoOn, shadowOn,
+  );
+  var ambientTerm = base * masterAmbient * (1.0 - lightRes.ao);
   if (BENT_NORMAL_AMBIENT != 0u) {
     // Milestone 7.2: directional (bent-normal) ambient. Instead of a flat grey ambient, sample the
     // studio environment along the surface normal (the unoccluded-direction proxy) with (1-ao) as the
     // cone aperture. Blended near unity so it re-tints/varies ambient without changing overall exposure.
     let irr = envRadiance(n);
-    ambientTerm = base * masterAmbient * (1.0 - ao) * mix(vec3<f32>(1.0), irr, 0.85);
+    ambientTerm = base * masterAmbient * (1.0 - lightRes.ao) * mix(vec3<f32>(1.0), irr, 0.85);
   }
-
-  var diffuseSpec = vec3<f32>(0.0);
-  for (var i = 0; i < numLights; i++) {
-    let Lgt = lights[i];
-    let kind = i32(Lgt.positionKind.w + 0.5);
-    var ldir: vec3<f32>;
-    var att = 1.0;
-    var maxDist = 1e30;
-    if (kind == 0) {
-      ldir = normalize(Lgt.directionRange.xyz);
-    } else {
-      let toL = Lgt.positionKind.xyz - pWorld;
-      let dist = length(toL);
-      maxDist = dist;
-      ldir = toL / max(dist, 1e-4);
-      att = volAttenuation(dist, Lgt.directionRange.w);
-      if (kind == 2) {
-        let cosT = dot(-ldir, normalize(Lgt.directionRange.xyz));
-        att *= smoothstep(Lgt.spotRect.y, Lgt.spotRect.x, cosT);
-      }
-    }
-    if (att <= 0.0) { continue; }
-    let radiance = Lgt.colorIntensity.xyz * Lgt.colorIntensity.w * att;
-    var shadow = 1.0;
-    // Only shadow-casting lights (spotRect.z flag, set per light on the CPU) cast, and only for
-    // contributing samples (heavy) -- clamps the biggest cost while matching the visible result.
-    if (shadowOn && heavy && Lgt.spotRect.z > 0.5) {
-      if (frame.shadowCtl.x > 0.5) {
-        shadow = shadowMapT(pWorld); // precomputed light-space opacity map (Milestone 7.1)
-      } else {
-        shadow = shadowTransmittance(pWorld, ldir, densityScale, maxDist, seed);
-      }
-    }
-    let ndotl = max(dot(n, ldir), 0.0);
-    let H = normalize(ldir + viewDir);
-    let ndoth = max(dot(n, H), 0.0);
-    let spec = pow(ndoth, shininess) * specStrength * smoothstep(0.05, 0.25, density);
-    diffuseSpec += (base * ndotl + spec) * radiance * shadow;
-    if (MS_OCTAVES > 0u && heavy) {
-      // Milestone 7.3: cheap multi-scatter octaves (Wrenninge). Each octave lets light penetrate deeper
-      // via T^c (c < 1) with no extra shadow marching; weighting by (Tj - shadow) adds a soft glow that
-      // fills hard shadows without brightening already-lit samples (Tj == shadow ⇒ zero contribution).
-      var atten = 1.0;
-      var w = 1.0;
-      for (var o = 0u; o < MS_OCTAVES; o++) {
-        atten *= 0.5;
-        w *= 0.6;
-        let Tj = pow(shadow, atten);
-        diffuseSpec += base * ndotl * radiance * max(Tj - shadow, 0.0) * w;
-      }
-    }
-  }
+  let diffuseSpec = lightRes.diffuseSpec;
 
   let rim = base * pow(1.0 - max(dot(n, viewDir), 0.0), 3.0) * 0.25;
-  let lit = ambientTerm + diffuseSpec + rim;
+  let litFull = ambientTerm + diffuseSpec + rim;
+  // Milestone 6 (B3): the "unlit" G-buffer channel is the same blend but WITHOUT the shadow/AO/
+  // multi-scatter-weighted diffuseSpec term - i.e. what shadeSample would return if evaluateLighting
+  // contributed nothing. Same edge/lighting-strength blend so the two stay visually comparable.
+  let litUnlitOnly = ambientTerm + rim;
   let edge = smoothstep(0.02, 0.35, gLen);
-  let shaded = mix(base * masterAmbient, lit, clamp(0.35 + edge * 0.65, 0.0, 1.0));
-  return mix(base, shaded, clamp(lighting, 0.0, 1.0));
+  let blendFactor = clamp(0.35 + edge * 0.65, 0.0, 1.0);
+  let shadedFull = mix(base * masterAmbient, litFull, blendFactor);
+  let shadedUnlitOnly = mix(base * masterAmbient, litUnlitOnly, blendFactor);
+  let lightingFactor = clamp(lighting, 0.0, 1.0);
+  return ShadeResult(
+    mix(base, shadedFull, lightingFactor),
+    mix(base, shadedUnlitOnly, lightingFactor),
+  );
 }
 
 /** Dielectric liquid: TF RGB = absorption tint; gradient drives free-surface Fresnel. */
@@ -586,7 +464,14 @@ fn passesViewMode(uvw: vec3<f32>, viewMode: u32, thickness: f32) -> bool {
 // Composites the volume into a colour and, via depthOut, the transmittance-weighted depth centroid
 // (Milestone 5.1) normalized by the far plane — for TAAU reprojection. All early exits leave depthOut at
 // the caller's default (1.0 = far); only the composited path writes a real centroid.
-fn marchColor(in: VSOut, depthOut: ptr<function, f32>) -> vec4<f32> {
+fn marchColor(
+  in: VSOut,
+  depthOut: ptr<function, f32>,
+  colorUnlitOut: ptr<function, vec4<f32>>,
+  surfacePosOut: ptr<function, vec4<f32>>,
+  surfaceNormalOut: ptr<function, vec4<f32>>,
+  surfaceAlbedoOut: ptr<function, vec4<f32>>,
+) -> vec4<f32> {
   let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, (1.0 - in.uv.y) * 2.0 - 1.0);
 
   let ro = frame.eye.xyz;
@@ -680,6 +565,15 @@ fn marchColor(in: VSOut, depthOut: ptr<function, f32>) -> vec4<f32> {
   var prevDensity = 0.0; // previous sample's density, for the pre-integration segment (Milestone 3.1)
   var centroidNum = 0.0;    // Σ t·Δα  — transmittance-weighted depth centroid (Milestone 5.1)
   var centroidWeight = 0.0; // Σ Δα
+  // Milestone 6 (B3) G-buffer accumulators: same Δα weighting as the depth centroid above, extended
+  // to world position / normal / density. colorUnlit mirrors color's own alpha-under compositing.
+  var colorUnlit = vec4<f32>(0.0);
+  var surfacePosNum = vec3<f32>(0.0);    // Σ p·Δα
+  var surfaceNormalNum = vec3<f32>(0.0); // Σ n·Δα
+  var densityCentroidNum = 0.0;          // Σ density·Δα
+  // TF-sampled albedo centroid - a half-res lighting pass needs the material color evaluateLighting
+  // modulates by (diffuseSpec = base*ndotl + spec), which none of the other G-buffer channels carry.
+  var surfaceAlbedoNum = vec3<f32>(0.0); // Σ base·Δα
   var i = 0;
   loop {
     if (i >= maxSteps || t > tEnd) { break; }
@@ -817,18 +711,37 @@ fn marchColor(in: VSOut, depthOut: ptr<function, f32>) -> vec4<f32> {
         let heavy = (1.0 - color.a) > 0.03 && alpha > 0.03;
         let sseed = fract(jitter + f32(i) * 0.61803399);
         var lit: vec3<f32>;
+        var unlit: vec3<f32>;
         if (dielectric) {
+          // Dielectric shading has no shadow/AO/multi-scatter gate at all (its own separate Fresnel/
+          // env model) - there's nothing to strip out, so "unlit" is just the same result.
           lit = shadeDielectric(src.rgb, src.a, grad, viewDir, rd, density);
+          unlit = lit;
         } else {
-          lit = shadeSample(src.rgb, grad, viewDir, p, density, lighting, densityScale, sseed, heavy);
+          let shadeRes = shadeSample(src.rgb, grad, viewDir, p, density, lighting, densityScale, sseed, heavy);
+          lit = shadeRes.lit;
+          unlit = shadeRes.unlit;
         }
         lit = mix(lit, vec3<f32>(0.95, 0.85, 0.35), planeH * 0.65);
+        unlit = mix(unlit, vec3<f32>(0.95, 0.85, 0.35), planeH * 0.65);
         let a = clamp(alpha, 0.0, 1.0);
         let oneMinus = 1.0 - color.a;
         color = vec4<f32>(color.rgb + oneMinus * lit * a, color.a + oneMinus * a);
+        colorUnlit = vec4<f32>(colorUnlit.rgb + oneMinus * unlit * a, colorUnlit.a + oneMinus * a);
         let dContrib = oneMinus * a; // this sample's opacity contribution
         centroidNum += t * dContrib;
         centroidWeight += dContrib;
+        // Milestone 6 (B3): world-position / normal / density centroids, same Δα weighting as above.
+        var n = vec3<f32>(0.0, 1.0, 0.0);
+        let gLenN = length(grad);
+        if (gLenN > 1e-5) {
+          n = normalize(grad);
+          if (dot(n, viewDir) < 0.0) { n = -n; }
+        }
+        surfacePosNum += p * dContrib;
+        surfaceNormalNum += n * dContrib;
+        densityCentroidNum += density * dContrib;
+        surfaceAlbedoNum += src.rgb * dContrib;
       }
     }
 
@@ -880,11 +793,41 @@ fn marchColor(in: VSOut, depthOut: ptr<function, f32>) -> vec4<f32> {
     }
   }
 
+  // Milestone 6 (B3) colorUnlit output, computed the same way as outRgb/outA above but from
+  // colorUnlit instead of color. MIP/MinIP/average never call shadeSample/evaluateLighting at
+  // all (no heavy-lighting term to strip), so "unlit" is just the same result as outRgb there.
+  var outRgbUnlit = outRgb;
+  var outAUnlit = outA;
+  if (blendMode == 0) {
+    outRgbUnlit = colorUnlit.rgb * exposure;
+    if (alphaComposite) {
+      outAUnlit = colorUnlit.a;
+    } else {
+      outRgbUnlit = outRgbUnlit + (1.0 - colorUnlit.a) * bg;
+      outAUnlit = 1.0;
+    }
+  }
+
   // composite.y >= 0.5 → emit linear HDR (a post stack tonemaps); else tonemap in-shader.
   if (frame.composite.y < 0.5) {
     outRgb = tonemapACES(outRgb);
     outRgb = pow(outRgb, vec3<f32>(0.95));
+    outRgbUnlit = tonemapACES(outRgbUnlit);
+    outRgbUnlit = pow(outRgbUnlit, vec3<f32>(0.95));
   }
+  *colorUnlitOut = vec4<f32>(outRgbUnlit, outAUnlit);
+
+  // Milestone 6 (B3) world-position / normal / density centroids - same Δα-weighted average as the
+  // depth centroid below. Left at the caller's defaults when no sample contributed (weight ~0).
+  if (centroidWeight > 1e-5) {
+    let posWeight = max(centroidWeight, 1e-6);
+    *surfacePosOut = vec4<f32>(surfacePosNum / posWeight, centroidWeight);
+    let nLen = length(surfaceNormalNum);
+    let nAvg = select(vec3<f32>(0.0, 1.0, 0.0), normalize(surfaceNormalNum), nLen > 1e-6);
+    *surfaceNormalOut = vec4<f32>(nAvg, densityCentroidNum / posWeight);
+    *surfaceAlbedoOut = vec4<f32>(surfaceAlbedoNum / posWeight, 0.0);
+  }
+
   // Depth centroid (world distance along the ray) normalized by the far plane, for TAAU reprojection.
   let far = max(frame.shadowCtl.y, 1e-6);
   let centroidT = select(hit.x, centroidNum / max(centroidWeight, 1e-6), centroidWeight > 1e-5);
@@ -894,16 +837,26 @@ fn marchColor(in: VSOut, depthOut: ptr<function, f32>) -> vec4<f32> {
 
 // MRT entry point: colour to location 0, depth centroid (.r) to location 1. Splitting marchColor out
 // keeps its many early returns untouched; the depth defaults to 1.0 (far) for every early exit.
+// Locations 2-4 (Milestone 6 / B3): colorUnlit / surfacePos / surfaceNormal G-buffer targets for a
+// future half-res lighting pass - real accumulation, not yet consumed by anything downstream.
 struct FragOut {
   @location(0) color: vec4<f32>,
   @location(1) depth: vec4<f32>,
+  @location(2) colorUnlit: vec4<f32>,
+  @location(3) surfacePos: vec4<f32>,
+  @location(4) surfaceNormal: vec4<f32>,
+  @location(5) surfaceAlbedo: vec4<f32>,
 };
 
 @fragment
 fn fs_main(in: VSOut) -> FragOut {
   var depth = 1.0;
-  let color = marchColor(in, &depth);
-  return FragOut(color, vec4<f32>(depth, 0.0, 0.0, 0.0));
+  var colorUnlit = vec4<f32>(0.0);
+  var surfacePos = vec4<f32>(0.0);
+  var surfaceNormal = vec4<f32>(0.0, 1.0, 0.0, 0.0);
+  var surfaceAlbedo = vec4<f32>(0.0);
+  let color = marchColor(in, &depth, &colorUnlit, &surfacePos, &surfaceNormal, &surfaceAlbedo);
+  return FragOut(color, vec4<f32>(depth, 0.0, 0.0, 0.0), colorUnlit, surfacePos, surfaceNormal, surfaceAlbedo);
 }
 `;
 }
@@ -987,10 +940,15 @@ fn tonemapACES(x: vec3<f32>) -> vec3<f32> {
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-// Two render targets to match the volume pipeline (colour + depth); background depth = 1.0 (far).
+// Render targets must match the volume pipeline exactly (colour + depth + the Milestone 6 / B3
+// G-buffer placeholders below); background depth = 1.0 (far).
 struct FragOut {
   @location(0) color: vec4<f32>,
   @location(1) depth: vec4<f32>,
+  @location(2) colorUnlit: vec4<f32>,
+  @location(3) surfacePos: vec4<f32>,
+  @location(4) surfaceNormal: vec4<f32>,
+  @location(5) surfaceAlbedo: vec4<f32>,
 };
 
 @fragment
@@ -1007,6 +965,7 @@ fn fs_main(in: VSOut) -> FragOut {
   if (frame.composite.y < 0.5) {
     bg = pow(tonemapACES(bg), vec3<f32>(0.95));
   }
-  return FragOut(vec4<f32>(bg, 1.0), vec4<f32>(1.0, 0.0, 0.0, 0.0));
+  let color = vec4<f32>(bg, 1.0);
+  return FragOut(color, vec4<f32>(1.0, 0.0, 0.0, 0.0), color, vec4<f32>(0.0), vec4<f32>(0.0, 1.0, 0.0, 0.0), vec4<f32>(0.0));
 }
 `;

@@ -296,6 +296,9 @@ export async function run(
       aoIntensity: rendering.aoIntensity,
       aoSamples: rendering.aoSamples,
     });
+    // Milestone 6 (B3): actual render-scale selection is adaptive (moving vs. settled) and happens every
+    // frame in the render loop below, not here — this one-time call just avoids a stale full-res scale
+    // for the very first frame before the loop has run.
     fxPipeline.setRenderScale(rendering.halfRes ? 0.5 : 1);
   };
 
@@ -370,6 +373,9 @@ export async function run(
   const NAV_SETTLE = 0.15; // seconds of camera stillness before refining back to the configured value
   let navSampleDist = 1;
   let taauPrevSettled = false; // tracks the moving↔settled edge so TAAU reseeds fine detail on settle
+  // Milestone 6 (B3) Step 5, debug-only: KeyL shows the half-res lightAdd buffer instead of the real
+  // image, for a visual sanity check of the new G-buffer lighting pass. Removed once B3 ships for real.
+  let debugLightAdd = false;
 
   // High-res ROI brick: stream + composite a fine sub-volume over the coarse base when zoomed in (or a
   // crop ROI is set), and fade it out / discard on zoom-out. ROI stream progress is patched directly
@@ -931,6 +937,9 @@ export async function run(
       } else if (e.code === "KeyE") {
         picking.clear();
         resetCrop();
+      } else if (e.code === "KeyL") {
+        debugLightAdd = !debugLightAdd;
+        requestRender();
       }
     })();
   });
@@ -1050,23 +1059,27 @@ export async function run(
       alpha: rendering.measurePlaneAlpha,
       forward: basis.forward,
     });
+    // "Settled" = camera stopped AND the adaptive step has finished refining (else we'd blend coarse-
+    // in-motion frames with the sharp ones, or drop back to full quality mid-motion and jank). Drives
+    // TAAU accumulation, and (Milestone 6/B3) the two half-res levers below: half-res render scale and
+    // half-res G-buffer lighting both apply only while navigating, reverting to full quality once still —
+    // so the toggles buy interaction-time smoothness without permanently baking their approximations
+    // into the settled image people actually look at / screenshot.
+    const settled = residency.idle >= NAV_SETTLE && Math.abs(navSampleDist - rendering.sampleDist) < 0.02;
+    fxPipeline.setRenderScale(rendering.halfRes && !settled ? 0.5 : 1);
     // Volume → linear HDR, then the post stack to the swapchain (one encoder / one submit). The DOM
     // overlay (gizmo + scale bar) draws to a separate canvas and is unaffected.
     const rw = Math.max(1, Math.round(canvas.width * fxPipeline.renderScale));
     const rh = Math.max(1, Math.round(canvas.height * fxPipeline.renderScale));
     volumeRenderer.setInternalSize(rw, rh);
     volumeRenderer.setReprojectFar(far); // normalize the depth-centroid output for TAAU reprojection
-    // Milestone 5: accumulate only once fully settled — the camera stopped AND the adaptive step has
-    // finished refining (else we'd blend coarse-in-motion frames with the sharp ones). Anything else
-    // resets the history so a moving view shows the live frame with no ghosting. When accumulating, jitter
-    // the projection sub-pixel so successive converged frames supersample; the un-jittered viewProj still
-    // drives ROI/overlay.
+    // Milestone 5: accumulate only once fully settled. Anything else resets the history so a moving view
+    // shows the live frame with no ghosting. When accumulating, jitter the projection sub-pixel so
+    // successive converged frames supersample; the un-jittered viewProj still drives ROI/overlay.
     let renderViewProj = viewProj;
     if (rendering.temporalAA) {
-      // "Settled" = camera stopped AND the adaptive step has finished refining. On the moving→settled
-      // edge, reseed accumulation so the sharp frames replace the coarse in-motion history; a moving view
-      // keeps converging via reprojection rather than resetting.
-      const settled = residency.idle >= NAV_SETTLE && Math.abs(navSampleDist - rendering.sampleDist) < 0.02;
+      // On the moving→settled edge, reseed accumulation so the sharp frames replace the coarse in-motion
+      // history; a moving view keeps converging via reprojection rather than resetting.
       if (settled && !taauPrevSettled) taau.reset();
       taauPrevSettled = settled;
       // Reprojection inputs use the UN-jittered matrices (jitter is only for the render's sub-pixel
@@ -1095,8 +1108,19 @@ export async function run(
         volumeRenderer.recordPrePasses(encoder, renderViewProj, camera.position);
       },
       taau,
+      debugLightAdd || (rendering.gbufferLighting && !settled)
+        ? {
+            recordLighting: (graph, gbuffer, lw, lh) =>
+              volumeRenderer.recordLightingDebug(graph, gbuffer, lw, lh),
+            mode: debugLightAdd ? "debug" : "composite",
+          }
+        : undefined,
     );
+    if (debugLightAdd) requestRender(); // keep redrawing while the debug view is on (no idle path yet)
     volumeRenderer.afterSubmit();
+    // Half-res render scale / lighting only apply while navigating (see `settled` above) — the settle
+    // edge must trigger one more frame so the final full-quality image actually gets drawn and stays.
+    if (!settled) requestRender();
 
     // Bottom-left overlay: axis gizmo (camera world basis) + physical scale bar.
     // Edge rulers: world (sim µm) per CSS pixel at the calibration depth. Perspective ⇒ exact only on
@@ -1120,6 +1144,14 @@ export async function run(
       ruler,
       banner: volumeRenderer.approximateShadingBanner(),
     });
+
+    // Milestone 6 (B3) Step 7: live GPU-ms readout in the Lighting panel for A/B-comparing the
+    // half-res lighting toggle's perf impact, without a full renderUi() rebuild every frame.
+    const gpuMsLabel = ui.querySelector<HTMLElement>("#gpuMsLabel");
+    if (gpuMsLabel) {
+      const ms = fxPipeline.lastGpuMs;
+      gpuMsLabel.textContent = ms === undefined ? "–" : ms.toFixed(2);
+    }
 
     // Record what we just rendered, and keep the budget alive while anything is still converging so the
     // image finishes refining after the camera stops (adaptive step easing, TAAU accumulating, ROI brick

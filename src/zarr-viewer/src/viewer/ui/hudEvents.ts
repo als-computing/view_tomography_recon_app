@@ -293,6 +293,7 @@ export function bindHudInput(ctx: HudEventContext): void {
         t.dataset.chk === "aoOn" ||
         t.dataset.chk === "halfRes" ||
         t.dataset.chk === "temporalAA" ||
+        t.dataset.chk === "gbufferLighting" ||
         t.dataset.chk === "shadowCastGlobal" ||
         t.dataset.chk === "shadowCastFlash" ||
         t.dataset.chk === "shadowCastStage"
@@ -304,6 +305,7 @@ export function bindHudInput(ctx: HudEventContext): void {
         else if (t.dataset.chk === "aoOn") ctx.rendering.aoOn = on;
         else if (t.dataset.chk === "halfRes") ctx.rendering.halfRes = on;
         else if (t.dataset.chk === "temporalAA") { ctx.rendering.temporalAA = on; ctx.taau.setEnabled(on); }
+        else if (t.dataset.chk === "gbufferLighting") ctx.rendering.gbufferLighting = on;
         else if (t.dataset.chk === "shadowCastGlobal") ctx.rendering.shadowCastGlobal = on;
         else if (t.dataset.chk === "shadowCastFlash") ctx.rendering.shadowCastFlash = on;
         else if (t.dataset.chk === "shadowCastStage") ctx.rendering.shadowCastStage = on;

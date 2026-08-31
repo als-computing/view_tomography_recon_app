@@ -47,8 +47,10 @@ export function lightingPanelBody(params: {
     slider("aoRadius", "AO radius", r.aoRadius, 0.01, 0.3, 0.01),
     slider("aoIntensity", "AO intensity", r.aoIntensity, 0, 1, 0.02),
     slider("aoSamples", "AO samples", r.aoSamples, 1, 16, 1),
-    `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${r.halfRes ? "checked" : ""}/> Half resolution</label>`,
+    `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${r.halfRes ? "checked" : ""}/> Half resolution while navigating</label>`,
     `<label class="whud__check"><input type="checkbox" data-chk="temporalAA" ${r.temporalAA ? "checked" : ""}/> Temporal AA (accumulate when still)</label>`,
+    `<label class="whud__check"><input type="checkbox" data-chk="gbufferLighting" ${r.gbufferLighting ? "checked" : ""}/> Half-res lighting while navigating (experimental)</label>`,
+    `<div class="whud__hint" style="margin-top:2px">GPU: <span id="gpuMsLabel">–</span> ms (volume pass)</div>`,
     `<label class="whud__check"><input type="checkbox" data-chk="roiEnabled" ${roiEnabled ? "checked" : ""}/> High-res ROI (stream visible detail)</label>`,
     `<div id="roiProgressWrap" style="margin-top:6px;${roiProgress ? "" : "display:none"}">` +
       `<div style="display:flex;justify-content:space-between;font-size:10px;opacity:0.85">` +

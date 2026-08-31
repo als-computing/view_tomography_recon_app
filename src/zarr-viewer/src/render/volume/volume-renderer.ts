@@ -18,6 +18,8 @@ import { type ShaderConfigName, specializationFor } from "../accel/shader-config
 import { hashTransferFunction, type RenderProvenance } from "../accel/provenance.js";
 import type { VisibilityFeedback } from "../accel/visibility.js";
 import { VolumeAcceleration } from "../accel/volume-acceleration.js";
+import { LightingPass, type LightingPassGbuffer } from "../accel/lighting-pass.js";
+import type { RenderGraph, ResourceHandle } from "../graph/render-graph.js";
 import { computeProvenance, approximateShadingBanner } from "./volume-provenance.js";
 import {
   applyLiquidShading,
@@ -174,6 +176,7 @@ export class VolumeRenderer implements Disposable {
 
   private readonly frameData = new Float32Array(VOLUME_FRAME_UNIFORM_SIZE / 4);
   private readonly invViewProj = new Mat4();
+  private readonly lightingPass: LightingPass;
 
   public constructor(
     public readonly ctx: GpuContext,
@@ -207,6 +210,7 @@ export class VolumeRenderer implements Disposable {
     this.lightingStrength = options.lightingStrength ?? 1;
     this.masterAmbient = this.ambient;
     this.acceleration = new VolumeAcceleration(ctx.device);
+    this.lightingPass = new LightingPass(ctx.device);
     if (options.liquidShading) this.setLiquidShading(options.liquidShading);
     this.dummyPreint = new ManagedTexture(ctx.device, {
       size: [1, 1, 1],
@@ -768,12 +772,45 @@ export class VolumeRenderer implements Disposable {
     this.pipelineMgr.uniformBuffer.write(this.frameData);
   }
 
+  /**
+   * Milestone 6 (B3) Step 5, debug-only: add the half-res lighting pass to `graph`, reading `gbuffer`
+   * (the just-recorded volume pass's `surfacePos`/`surfaceNormal`/`surfaceAlbedo` targets), and return
+   * the `lightAdd` handle for {@link "../post/fx-pipeline".FxPipeline.render}'s debug blit. `undefined`
+   * before the volume/TF are loaded.
+   */
+  public recordLightingDebug(
+    graph: RenderGraph,
+    gbuffer: LightingPassGbuffer,
+    width: number,
+    height: number,
+  ): ResourceHandle | undefined {
+    const volumeTex = this.volumeTex;
+    const tfTex = this.tfTex;
+    if (!volumeTex || !tfTex) return undefined;
+    return this.lightingPass.resolve(graph, {
+      frameUniform: this.pipelineMgr.uniformBuffer.gpu,
+      volumeTex: volumeTex.gpu,
+      volumeSampler: this.pipelineMgr.sampler,
+      tfTex: tfTex.gpu,
+      tfSampler: this.pipelineMgr.tfSamplerHandle,
+      lightsBuffer: this.acceleration.lightBuffer,
+      brickTex: (this.brickTex ?? volumeTex).gpu,
+      shadowTex: this.acceleration.shadowMapTexture.gpu,
+      surfacePos: gbuffer.surfacePos,
+      surfaceNormal: gbuffer.surfaceNormal,
+      surfaceAlbedo: gbuffer.surfaceAlbedo,
+      fullWidth: width,
+      fullHeight: height,
+    });
+  }
+
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.pipelineMgr.dispose();
     this.tfTex?.dispose();
     this.acceleration.dispose();
+    this.lightingPass.dispose();
     this.tPreintTex?.dispose();
     this.dummyPreint.dispose();
     this.tfTex = undefined;

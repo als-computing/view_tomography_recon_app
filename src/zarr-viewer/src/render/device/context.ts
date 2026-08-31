@@ -76,9 +76,13 @@ export async function createContext(
   // Volume uploads go through an internal WebGPU staging buffer sized to the whole level, which can be
   // hundreds of MiB — well past the 256 MiB default `maxBufferSize`. Raise the buffer/binding limits to
   // what the adapter actually supports so `writeTexture` for a large level doesn't fail validation.
+  // `maxColorAttachmentBytesPerSample` similarly needs raising past the 32-byte default: the volume
+  // pass's 5 MRT outputs (color + depth-centroid + the Milestone 6 / B3 G-buffer targets) total 34
+  // bytes/sample, and the spec-default limit only guarantees 32.
   const requiredLimits: Record<string, number> = {
     maxBufferSize: adapter.limits.maxBufferSize,
     maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+    maxColorAttachmentBytesPerSample: adapter.limits.maxColorAttachmentBytesPerSample,
   };
 
   const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
