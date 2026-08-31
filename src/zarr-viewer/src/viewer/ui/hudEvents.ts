@@ -16,6 +16,9 @@ import {
   type ShaderConfigName,
   type OpacityCurveEditor,
   type VolumeRenderer,
+  type TfBandConfig,
+  DEFAULT_OPACITY_POINTS,
+  MAX_TF_BANDS,
 } from "@zarr-viewer/render";
 import type { ToneMapOperator } from "@zarr-viewer/fx";
 import type { FxPipeline } from "../../render/post/fx-pipeline.js";
@@ -27,6 +30,7 @@ import type { CropDragController } from "../interaction/CropDragController.js";
 import type { WebGpuRenderingState, WebGpuCroppingState } from "../RenderingState.js";
 import { autoWindow } from "../histogram.js";
 import { fmt, type PanelId, type HudTab } from "./html.js";
+import { hexToRgb } from "./panels/annotationsPanel.js";
 
 export interface HudEventContext {
   ui: HTMLElement;
@@ -47,6 +51,13 @@ export interface HudEventContext {
   getHistogram(): Float32Array | undefined;
   getSelectedPreset(): string;
   setSelectedPreset(v: string): void;
+  getActiveBandIndex(): number;
+  setActiveBandIndex(v: number): void;
+  loadMask(url: string): void;
+  removeMask(): void;
+  setMaskClassColor(id: number, rgb: [number, number, number]): void;
+  setMaskClassOpacity(id: number, opacity: number): void;
+  toggleMaskClassVisible(id: number): void;
   getCollapsed(): boolean;
   setCollapsed(v: boolean): void;
   getActiveTab(): HudTab;
@@ -150,6 +161,87 @@ export function bindHudClick(ctx: HudEventContext): void {
       ctx.emitRendering();
       return;
     }
+    if (btn.dataset.tfmode) {
+      // "bands": seed one band from the current single-TF look (preserves what's on screen) if none
+      // exist yet. "single": bands are discarded (the flat single-TF fields take back over) — cheap
+      // to redefine, so this is an acceptable v1 trade rather than keeping a separate saved copy.
+      if (btn.dataset.tfmode === "bands") {
+        if (!ctx.rendering.tfBands || ctx.rendering.tfBands.length === 0) {
+          const seed: TfBandConfig = {
+            loT: 0,
+            hiT: 1,
+            colorMap: ctx.rendering.colorMap,
+            opacityPoints: ctx.rendering.opacityPoints.map((p) => [p[0], p[1]] as const),
+            opacityScale: ctx.rendering.opacityScale,
+          };
+          ctx.rendering.tfBands = [seed];
+        }
+        ctx.setActiveBandIndex(0);
+      } else {
+        ctx.rendering.tfBands = undefined;
+      }
+      ctx.applyTf();
+      ctx.renderUi();
+      ctx.emitRendering();
+      return;
+    }
+    if (btn.dataset.act === "addTfBand") {
+      const bands = ctx.rendering.tfBands ?? [];
+      if (bands.length >= MAX_TF_BANDS) return;
+      const makeBand = (loT: number, hiT: number): TfBandConfig => ({
+        loT,
+        hiT,
+        colorMap: "viridis",
+        opacityPoints: DEFAULT_OPACITY_POINTS.map((p) => [p[0], p[1]] as const),
+        opacityScale: 1,
+      });
+      let next: TfBandConfig[];
+      if (bands.length === 0) {
+        next = [makeBand(0, 1)];
+      } else {
+        // The domain is fully tiled by the existing bands (each Add so far has always covered up to
+        // 1), so there's no "unclaimed" span to give a new band by default - split the LAST band's
+        // range in half instead and give the new band the top half, keeping full coverage instead of
+        // producing a near-zero-width sliver band at the very end of the domain (the bug this fixes:
+        // a naive "start where the last one ended" default degenerates to [0.99, 1] once the last
+        // band already reaches hiT=1, which barely renders and reads as "doesn't work").
+        const last = bands[bands.length - 1]!;
+        const mid = (last.loT + last.hiT) / 2;
+        next = [...bands.slice(0, -1), { ...last, hiT: mid }, makeBand(mid, last.hiT)];
+      }
+      ctx.rendering.tfBands = next;
+      ctx.setActiveBandIndex(next.length - 1);
+      ctx.applyTf();
+      ctx.renderUi();
+      ctx.emitRendering();
+      return;
+    }
+    if (btn.dataset.act === "removeTfBand" && btn.dataset.idx != null) {
+      const bands = ctx.rendering.tfBands ?? [];
+      const i = Number(btn.dataset.idx);
+      const next = bands.filter((_, bi) => bi !== i);
+      ctx.rendering.tfBands = next;
+      ctx.setActiveBandIndex(Math.max(0, Math.min(ctx.getActiveBandIndex(), next.length - 1)));
+      ctx.applyTf();
+      ctx.renderUi();
+      ctx.emitRendering();
+      return;
+    }
+    if (btn.dataset.act === "selectTfBand" && btn.dataset.idx != null) {
+      ctx.setActiveBandIndex(Number(btn.dataset.idx));
+      ctx.renderUi();
+      return;
+    }
+    if (btn.dataset.act === "toggleTfBand" && btn.dataset.idx != null) {
+      const band = ctx.rendering.tfBands?.[Number(btn.dataset.idx)];
+      if (band) {
+        band.enabled = band.enabled === false ? true : false;
+        ctx.applyTf();
+        ctx.renderUi();
+        ctx.emitRendering();
+      }
+      return;
+    }
     if (btn.dataset.act === "exportPng") {
       void (async () => {
         const blob = await stampCanvasPng(
@@ -227,6 +319,20 @@ export function bindHudClick(ctx: HudEventContext): void {
       ctx.picking.clear();
       ctx.resetCrop();
     }
+    if (btn.dataset.act === "loadMask") {
+      const url = ctx.ui.querySelector<HTMLInputElement>("#maskUrlInput")?.value.trim();
+      if (url) ctx.loadMask(url);
+      return;
+    }
+    if (btn.dataset.act === "removeMask") {
+      ctx.removeMask();
+      return;
+    }
+    if (btn.dataset.act === "toggleMaskClass" && btn.dataset.idx != null) {
+      ctx.toggleMaskClassVisible(Number(btn.dataset.idx));
+      ctx.renderUi(); // discrete click, not a drag - a full rebuild here is cheap and simplest
+      return;
+    }
   });
 }
 
@@ -244,6 +350,15 @@ export function bindHudChange(ctx: HudEventContext): void {
       ctx.emitRendering();
     } else if (t.id === "presetSelect") {
       ctx.setSelectedPreset(t.value);
+    } else if (t.dataset.bandCmap != null) {
+      const i = Number(t.dataset.bandCmap);
+      const band = ctx.rendering.tfBands?.[i];
+      if (band) {
+        band.colorMap = t.value as ColorMapName;
+        ctx.applyTf();
+        if (i === ctx.getActiveBandIndex()) ctx.getCurveEditor()?.setColorMap(band.colorMap);
+        ctx.emitRendering();
+      }
     }
   });
 }
@@ -345,6 +460,20 @@ export function bindHudInput(ctx: HudEventContext): void {
       ctx.emitRendering();
       return;
     }
+    if (t.dataset.maskColor != null) {
+      ctx.setMaskClassColor(Number(t.dataset.maskColor), hexToRgb(t.value));
+      return;
+    }
+    if (t.dataset.maskOpacity != null) {
+      const id = Number(t.dataset.maskOpacity);
+      const v = Number(t.value);
+      ctx.setMaskClassOpacity(id, v);
+      // Patch the label directly (no renderUi()) - same reasoning as the tfBandRange slider: a full
+      // rebuild on every drag tick would be needlessly slow and isn't needed just to show a number.
+      const label = ctx.ui.querySelector(`[data-mask-opacity-val="${id}"]`);
+      if (label) label.textContent = fmt(v);
+      return;
+    }
     if (t.dataset.range) {
       // Dual-thumb range (color low/high, or per-axis crop min/max). Everything is scoped to this
       // group's `.whud__range` wrapper so multiple ranges coexist. Keep lo <= hi (a thumb dragged past
@@ -376,6 +505,20 @@ export function bindHudInput(ctx: HudEventContext): void {
         ctx.applyTf();
         ctx.getCurveEditor()?.setColorRange([ctx.rendering.colorLo, ctx.rendering.colorHi]);
         ctx.emitRendering();
+      } else if (group === "tfBandRange") {
+        const i = ctx.getActiveBandIndex();
+        const band = ctx.rendering.tfBands?.[i];
+        if (band) {
+          band.loT = lo;
+          band.hiT = hi;
+          ctx.applyTf();
+          // Patch the row's "lo – hi" readout directly (no full renderUi()) - a full rebuild would tear
+          // down and recreate the OpacityCurveEditor on every drag tick, causing exactly the jank/flicker
+          // the interaction-perf fix above was just added to avoid.
+          const label = ctx.ui.querySelector(`[data-band-range-label="${i}"]`);
+          if (label) label.textContent = `${fmt(lo)} – ${fmt(hi)}`;
+          ctx.emitRendering();
+        }
       } else if (group === "cropX" || group === "cropY" || group === "cropZ") {
         const axis = group === "cropX" ? 0 : group === "cropY" ? 1 : 2;
         ctx.cropping.cropMin[axis] = lo;
@@ -390,6 +533,15 @@ export function bindHudInput(ctx: HudEventContext): void {
     const v = Number(t.value);
     const lab = ctx.ui.querySelector(`[data-val="${id}"]`);
     if (lab) lab.textContent = fmt(v);
+    if (id.startsWith("tfBandScale")) {
+      const band = ctx.rendering.tfBands?.[Number(id.slice("tfBandScale".length))];
+      if (band) {
+        band.opacityScale = v;
+        ctx.applyTf();
+        ctx.emitRendering(); // outside RENDERING_SLIDERS (a static id set - this id is per-band/dynamic)
+      }
+      return;
+    }
     switch (id) {
       case "opacityScale":
         ctx.rendering.opacityScale = v;

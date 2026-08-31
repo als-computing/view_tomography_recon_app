@@ -22,11 +22,14 @@ import {
   type VolumeLevelResult,
   VolumeRenderer,
   composeTransferFunction,
+  composeMultiBandTransferFunction,
   OpacityCurveEditor,
   type ColorMapName,
   type VolumeBlendMode,
   type VolumeViewMode,
   type ShaderConfigName,
+  uploadMaskPalette,
+  type ManagedTexture,
 } from "@zarr-viewer/render";
 import { Scene, Node } from "@zarr-viewer/scene";
 import { OrbitControls } from "@zarr-viewer/controls";
@@ -92,6 +95,9 @@ import { measurePanelBody } from "./ui/panels/measurePanel.js";
 import { postfxPanelBody } from "./ui/panels/postfxPanel.js";
 import { lightingPanelBody } from "./ui/panels/lightingPanel.js";
 import { presetsPanelBody, sanitizeSelectedPreset } from "./ui/panels/presetsPanel.js";
+import { annotationsPanelBody } from "./ui/panels/annotationsPanel.js";
+import { loadMaskVolume } from "./volume/load-mask.js";
+import { discoverMaskClasses, buildMaskPalette, type MaskClassState } from "./state/mask-classes.js";
 
 export type { WebGpuRenderingState, WebGpuCroppingState } from "./RenderingState.js";
 
@@ -180,13 +186,27 @@ export async function run(
   const requestRender = (): void => {
     renderFrames = Math.max(renderFrames, 3);
   };
+  // Seconds since the last HUD-driven rendering change (TF curve drag, any render/lighting slider) -
+  // the render loop's "settled" gate (half-res render scale + half-res lighting while moving) was
+  // camera-only, so dragging a TF curve or slider kept re-running the full-cost per-sample
+  // shadow/AO/multi-light path on every input tick, which is what made editing feel slow. Folded into
+  // `settled` in the render loop below so an active HUD drag gets the same interaction-time cheap path
+  // as camera motion, then refines back to full quality NAV_SETTLE seconds after the drag stops.
+  let interactionIdle = Number.POSITIVE_INFINITY;
+  const markInteracting = (): void => {
+    interactionIdle = 0;
+  };
 
   // Snapshot the rendering / cropping groups from the live closure state. Defined up here so the
-  // early error-path instances (below) can expose them too. opacityPoints/cropMin/cropMax are
+  // early error-path instances (below) can expose them too. opacityPoints/cropMin/cropMax/tfBands are
   // defensively copied so a caller mutating the returned object can't corrupt internal state.
   const readRendering = (): WebGpuRenderingState => ({
     ...rendering,
     opacityPoints: rendering.opacityPoints.map((p) => [p[0], p[1]] as const),
+    tfBands: rendering.tfBands?.map((band) => ({
+      ...band,
+      opacityPoints: band.opacityPoints.map((p) => [p[0], p[1]] as const),
+    })),
   });
   const readCropping = (): WebGpuCroppingState => ({
     ...cropping,
@@ -290,6 +310,7 @@ export async function run(
   // Lighting-panel change; the light *positions* themselves are rebuilt per frame (below).
   const applyLighting = (): void => {
     requestRender();
+    markInteracting();
     taau.reset(); // lighting changed → restart temporal accumulation
     volumeRenderer.setLightingParams({
       masterAmbient: rendering.lightAmbient,
@@ -373,6 +394,19 @@ export async function run(
   let histogram: Float32Array | undefined; // the DISPLAYED histogram (equalized when equalizeOn)
   let rawHistogram: Float32Array | undefined; // the true distribution (percentiles + toggling equalize)
   let curveEditor: OpacityCurveEditor | undefined;
+  // Which TF band the shared opacity-curve editor is currently showing (item 7 Phase A) - UI-only,
+  // not part of the serializable WebGpuRenderingState (mirrors selectedPreset's pattern).
+  let activeBandIndex = 0;
+
+  // Mask/annotation layer (item 7 Phase B) - viewer-local state, not part of WebGpuRenderingState
+  // (mirrors how the primary dataset's own URL/source isn't part of it either).
+  let maskUrl = "";
+  let maskLoading = false;
+  let maskError: string | undefined;
+  // undefined = nothing loaded; an array (possibly empty, if the mask is all-background) once loaded.
+  let maskClasses: MaskClassState[] | undefined;
+  let maskGpuTex: ManagedTexture | undefined;
+  let maskPaletteGpuTex: ManagedTexture | undefined;
 
   // Progressive coarse→fine loader: owns the per-level GPU textures and streams finer levels toward
   // `targetLevel`, never downgrading what's displayed. `level` tracks the level currently on screen.
@@ -521,21 +555,90 @@ export async function run(
     lengthUnit().pow(3).labeled(`${lengthUnit().symbol}³`, `cubic ${lengthUnit().name}`);
 
   const applyTf = (): void => {
-    const tf = composeTransferFunction({
-      opacity: rendering.opacityPoints,
-      colorMap: rendering.colorMap,
-      colorRange: [rendering.colorLo, rendering.colorHi],
-      opacityScale: rendering.opacityScale,
-      samples: 48,
-      intensityRemap: rendering.equalizeOn ? equalizeRemap : undefined,
-    });
+    // Bands mode (item 7 Phase A) recolors intensity sub-ranges of this same volume independently;
+    // the single-TF fields below drive rendering unchanged whenever tfBands is unset/empty.
+    const tf =
+      rendering.tfBands && rendering.tfBands.length > 0
+        ? composeMultiBandTransferFunction(rendering.tfBands)
+        : composeTransferFunction({
+            opacity: rendering.opacityPoints,
+            colorMap: rendering.colorMap,
+            colorRange: [rendering.colorLo, rendering.colorHi],
+            opacityScale: rendering.opacityScale,
+            samples: 48,
+            intensityRemap: rendering.equalizeOn ? equalizeRemap : undefined,
+          });
     volumeRenderer.setTransferFunction(tf, 512);
     requestRender();
+    markInteracting();
     taau.reset(); // transfer function / colormap changed → restart temporal accumulation
-    curveEditor?.setColorMap(rendering.colorMap);
-    curveEditor?.setPoints(rendering.opacityPoints);
-    curveEditor?.setColorRange([rendering.colorLo, rendering.colorHi]);
+    // Keep the shared curve editor showing whatever it should for the current mode: the active band
+    // in Bands mode, the flat fields otherwise (bands use a fixed [0,1] local range - each band IS
+    // already its own sub-domain, so there's nothing to additionally squeeze).
+    const bands = rendering.tfBands;
+    const activeBand = bands && bands.length > 0 ? bands[Math.min(activeBandIndex, bands.length - 1)] : undefined;
+    if (activeBand) {
+      curveEditor?.setColorMap(activeBand.colorMap);
+      curveEditor?.setPoints(activeBand.opacityPoints);
+      curveEditor?.setColorRange([0, 1]);
+    } else {
+      curveEditor?.setColorMap(rendering.colorMap);
+      curveEditor?.setPoints(rendering.opacityPoints);
+      curveEditor?.setColorRange([rendering.colorLo, rendering.colorHi]);
+    }
   };
+
+  // Rebuild + push the mask palette texture from the current maskClasses state (item 7 Phase B). A
+  // no-op until a mask is loaded. Always allocates a new texture (mirrors setTransferFunction's own
+  // LUT-rebuild-on-every-change pattern) and disposes the previous one — otherwise every color/opacity/
+  // visibility edit would leak a 1KB texture.
+  const applyMaskPalette = (): void => {
+    if (!maskClasses) return;
+    const bytes = buildMaskPalette(maskClasses);
+    const next = uploadMaskPalette(ctx.device, bytes);
+    maskPaletteGpuTex?.dispose();
+    maskPaletteGpuTex = next;
+    volumeRenderer.setMaskPalette(next);
+    requestRender();
+    markInteracting();
+  };
+
+  const loadMask = async (url: string): Promise<void> => {
+    maskLoading = true;
+    maskError = undefined;
+    maskUrl = url;
+    renderUi();
+    try {
+      const { texture, classCounts } = await loadMaskVolume(ctx, url);
+      maskGpuTex?.dispose();
+      maskGpuTex = texture;
+      volumeRenderer.setMask(texture);
+      maskClasses = discoverMaskClasses(classCounts);
+      applyMaskPalette();
+    } catch (err) {
+      maskError = err instanceof Error ? err.message : String(err);
+    } finally {
+      maskLoading = false;
+      requestRender();
+      renderUi();
+    }
+  };
+
+  const removeMask = (): void => {
+    volumeRenderer.setMask(null);
+    maskGpuTex?.dispose();
+    maskGpuTex = undefined;
+    maskPaletteGpuTex?.dispose();
+    maskPaletteGpuTex = undefined;
+    maskClasses = undefined;
+    maskError = undefined;
+    requestRender();
+    renderUi();
+  };
+  session.onDispose(() => {
+    maskGpuTex?.dispose();
+    maskPaletteGpuTex?.dispose();
+  });
 
   // Recompute the equalize remap + displayed histogram from the raw distribution and current toggle.
   const recomputeEqualize = (): void => {
@@ -550,6 +653,7 @@ export async function run(
 
   const applyRender = (): void => {
     requestRender();
+    markInteracting();
     taau.reset(); // any render-setting change → restart temporal accumulation
     volumeRenderer.setParams({
       densityScale: rendering.densityScale,
@@ -657,7 +761,12 @@ export async function run(
     requestRender();
     // shaderConfig gets its own runtime validation (state may come from untyped localStorage/preset
     // JSON) — strip it from the generic merge unless it's one of the three known-valid names.
-    const { shaderConfig: rawShaderConfig, opacityPoints: rawOpacityPoints, ...rest } = state;
+    const {
+      shaderConfig: rawShaderConfig,
+      opacityPoints: rawOpacityPoints,
+      tfBands: rawTfBands,
+      ...rest
+    } = state;
     mergeDefined(rendering, rest);
     if (rawShaderConfig === "baseline" || rawShaderConfig === "fast" || rawShaderConfig === "quality") {
       rendering.shaderConfig = rawShaderConfig;
@@ -665,6 +774,20 @@ export async function run(
     if (Array.isArray(rawOpacityPoints)) {
       rendering.opacityPoints = rawOpacityPoints.map((p) => [p[0], p[1]] as const);
     }
+    // Unlike mergeDefined's usual "absent key = leave untouched" rule, tfBands must be set explicitly
+    // either way: `state` came from a saved snapshot (localStorage last-used, a preset, a share-link)
+    // that may predate this field, or was captured while in Single mode (no bands) — in both cases the
+    // absence means "no bands," not "keep whatever's currently active." Leaving that ambiguous would
+    // strand stale bands active after switching to an old/single-mode preset while every other TF field
+    // updates, which is a confusing mixed state, not a real "cache."
+    rendering.tfBands =
+      Array.isArray(rawTfBands) && rawTfBands.length > 0
+        ? rawTfBands.map((band) => ({
+            ...band,
+            opacityPoints: band.opacityPoints.map((p) => [p[0], p[1]] as const),
+          }))
+        : undefined;
+    activeBandIndex = 0; // the restored band list (if any) may be a different length/order
     taau.setEnabled(rendering.temporalAA);
     recomputeEqualize(); // rebuild the remap + displayed histogram from this viewer's own data
     applyTf();
@@ -814,7 +937,7 @@ export async function run(
       roiEnabled: residency.isEnabled,
       roiProgress: residency.progress,
     });
-    const tfBody = tfPanelBody(rendering);
+    const tfBody = tfPanelBody(rendering, activeBandIndex);
     const renderBody = renderPanelBody(rendering);
 
     const active = activeSlice();
@@ -851,12 +974,20 @@ export async function run(
     // interaction silently snapped the sidebar back to the top. <details> open/close state already
     // survives via `openSections`; scroll position needs the same explicit save/restore.
     const controlsBody = controlsPanelBody(rendering);
+    const annotationsBody = annotationsPanelBody({
+      maskUrl,
+      maskLoading,
+      maskError,
+      maskLoaded: maskClasses !== undefined,
+      classes: maskClasses ?? [],
+    });
     const allPanels: { id: PanelId; title: string; body: string }[] = [
       { id: "data", title: "Data", body: dataBody },
       { id: "tf", title: "Transfer Function", body: tfBody },
       { id: "slices", title: "Slices", body: slicesBody },
       { id: "crop", title: "Crop", body: cropBody },
       { id: "measure", title: "Measure", body: measureBody },
+      { id: "annotations", title: "Annotations", body: annotationsBody },
       { id: "presets", title: "Presets", body: presetsBody },
       { id: "render", title: "Render", body: renderBody },
       { id: "lighting", title: "Lighting", body: lightingBody },
@@ -912,11 +1043,20 @@ export async function run(
     if (!collapsed && openSections.has("tf")) {
       const c = ui.querySelector<HTMLCanvasElement>("#opacity-curve");
       if (c) {
-        curveEditor = new OpacityCurveEditor(c, rendering.opacityPoints, {
-          colorMap: rendering.colorMap,
-          colorRange: [rendering.colorLo, rendering.colorHi],
+        // Bands mode: the shared editor edits whichever band is selected, in that band's own local
+        // [0,1] range (each band is already its own sub-domain — no separate color-range squeeze).
+        const bands = rendering.tfBands;
+        const activeBand =
+          bands && bands.length > 0 ? bands[Math.min(activeBandIndex, bands.length - 1)] : undefined;
+        curveEditor = new OpacityCurveEditor(c, activeBand ? activeBand.opacityPoints : rendering.opacityPoints, {
+          colorMap: activeBand ? activeBand.colorMap : rendering.colorMap,
+          colorRange: activeBand ? [0, 1] : [rendering.colorLo, rendering.colorHi],
           onChange: (pts) => {
-            rendering.opacityPoints = pts.map((p) => [p[0], p[1]] as const);
+            if (activeBand) {
+              activeBand.opacityPoints = pts.map((p) => [p[0], p[1]] as const);
+            } else {
+              rendering.opacityPoints = pts.map((p) => [p[0], p[1]] as const);
+            }
             applyTf();
             emitRendering();
           },
@@ -949,6 +1089,35 @@ export async function run(
     getSelectedPreset: () => selectedPreset,
     setSelectedPreset: (v) => {
       selectedPreset = v;
+    },
+    getActiveBandIndex: () => activeBandIndex,
+    setActiveBandIndex: (v) => {
+      activeBandIndex = v;
+    },
+    loadMask: (url) => {
+      void loadMask(url);
+    },
+    removeMask: () => removeMask(),
+    setMaskClassColor: (id, rgb) => {
+      const cls = maskClasses?.find((c) => c.id === id);
+      if (cls) {
+        cls.color = rgb;
+        applyMaskPalette();
+      }
+    },
+    setMaskClassOpacity: (id, opacity) => {
+      const cls = maskClasses?.find((c) => c.id === id);
+      if (cls) {
+        cls.opacity = opacity;
+        applyMaskPalette();
+      }
+    },
+    toggleMaskClassVisible: (id) => {
+      const cls = maskClasses?.find((c) => c.id === id);
+      if (cls) {
+        cls.visible = !cls.visible;
+        applyMaskPalette();
+      }
     },
     getCollapsed: () => collapsed,
     setCollapsed: (v) => {
@@ -1191,13 +1360,18 @@ export async function run(
       alpha: rendering.measurePlaneAlpha,
       forward: basis.forward,
     });
-    // "Settled" = camera stopped AND the adaptive step has finished refining (else we'd blend coarse-
-    // in-motion frames with the sharp ones, or drop back to full quality mid-motion and jank). Drives
-    // TAAU accumulation, and (Milestone 6/B3) the two half-res levers below: half-res render scale and
-    // half-res G-buffer lighting both apply only while navigating, reverting to full quality once still —
-    // so the toggles buy interaction-time smoothness without permanently baking their approximations
-    // into the settled image people actually look at / screenshot.
-    const settled = residency.idle >= NAV_SETTLE && Math.abs(navSampleDist - rendering.sampleDist) < 0.02;
+    interactionIdle += dt; // seconds since the last TF-curve/slider drag (see markInteracting())
+    // "Settled" = camera stopped AND the adaptive step has finished refining AND no HUD drag (TF curve,
+    // any render/lighting slider) is actively in progress (else we'd blend coarse-in-motion frames with
+    // the sharp ones, or drop back to full quality mid-drag and jank the editing itself). Drives TAAU
+    // accumulation, and (Milestone 6/B3) the two half-res levers below: half-res render scale and
+    // half-res G-buffer lighting both apply only while navigating/interacting, reverting to full quality
+    // once still — so the toggles buy interaction-time smoothness without permanently baking their
+    // approximations into the settled image people actually look at / screenshot.
+    const settled =
+      residency.idle >= NAV_SETTLE &&
+      interactionIdle >= NAV_SETTLE &&
+      Math.abs(navSampleDist - rendering.sampleDist) < 0.02;
     fxPipeline.setRenderScale(rendering.halfRes && !settled ? 0.5 : 1);
     controls.invertX = rendering.invertOrbitX;
     controls.invertY = rendering.invertOrbitY;

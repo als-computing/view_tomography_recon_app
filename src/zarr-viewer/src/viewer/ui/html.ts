@@ -16,13 +16,22 @@ export type PanelId =
   | "postfx"
   | "lighting"
   | "presets"
-  | "controls";
+  | "controls"
+  | "annotations";
 
 /** Which top-level HUD tab a panel lives under. */
 export type HudTab = "volume" | "render";
 
 /** `PanelId`s shown under the "Volume settings" tab. */
-export const VOLUME_TAB_PANELS: readonly PanelId[] = ["data", "tf", "slices", "crop", "measure", "presets"];
+export const VOLUME_TAB_PANELS: readonly PanelId[] = [
+  "data",
+  "tf",
+  "slices",
+  "crop",
+  "measure",
+  "annotations",
+  "presets",
+];
 /** `PanelId`s shown under the "Render settings" tab. */
 export const RENDER_TAB_PANELS: readonly PanelId[] = ["render", "lighting", "postfx", "controls"];
 

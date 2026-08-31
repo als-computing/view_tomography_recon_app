@@ -101,7 +101,17 @@ export function normalizeWindowLevel(
 export class TransferFunction {
   private readonly sorted: TransferStop[];
 
-  public constructor(public readonly stops: readonly TransferStop[]) {
+  /**
+   * `rawLut`, when supplied, bakes the LUT directly instead of interpolating `stops` — used by
+   * multi-band composition ({@link "./tf-bands.js".composeMultiBandTransferFunction}), where each
+   * output sample must look up its owning band independently rather than linearly interpolate across
+   * a single global stop list (which would bleed color/opacity across band boundaries). `stops` stays
+   * empty (harmless — unused) for a raw-LUT instance.
+   */
+  public constructor(
+    public readonly stops: readonly TransferStop[],
+    private readonly rawLut?: (size: number) => Uint8Array,
+  ) {
     if (stops.length === 0) {
       this.sorted = [{ position: 0, color: [0, 0, 0, 0] }];
     } else {
@@ -111,9 +121,11 @@ export class TransferFunction {
 
   /**
    * Bake to an RGBA8 lookup table of `size` entries (length `size * 4`). Values outside the first/
-   * last stop clamp; between stops colors are linearly interpolated.
+   * last stop clamp; between stops colors are linearly interpolated. Delegates to `rawLut` instead,
+   * when this instance was built with one.
    */
   public toLut(size: number): Uint8Array {
+    if (this.rawLut) return this.rawLut(size);
     const n = Math.max(2, Math.floor(size));
     const out = new Uint8Array(n * 4);
     const stops = this.sorted;

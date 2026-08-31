@@ -18,6 +18,7 @@ import {
   volumeRaymarchWgsl,
 } from "../shaders/volume-raymarch.js";
 import { type ShaderConfigName, specializationFor } from "../accel/shader-config.js";
+import { MAX_LAYERS, MASK_BINDING_BASE } from "./volume-bindings.js";
 
 /**
  * Second render target of the volume pass (Milestone 5.1): the transmittance-weighted depth centroid,
@@ -123,6 +124,28 @@ export class VolumePipeline implements Disposable {
           { binding: 11, visibility: visFrag, texture: { sampleType: "float", viewDimension: "2d" } },
           { binding: 12, visibility: visFrag, texture: { sampleType: "float", viewDimension: "3d" } },
           { binding: 13, visibility: visFrag, texture: { sampleType: "unfilterable-float", viewDimension: "3d" } },
+          // Composited volume "layers" (item 7): MAX_LAYERS fixed density-texture slots (14..14+MAX_LAYERS-1,
+          // reusing volumeSampler/binding 2) plus one shared TF atlas (binding 14+MAX_LAYERS, reusing
+          // tfSampler/binding 4) — see volume-bindings.ts's MAX_LAYERS doc for why the count is fixed.
+          ...Array.from({ length: MAX_LAYERS }, (_, i) => ({
+            binding: 14 + i,
+            visibility: visFrag,
+            texture: { sampleType: "float" as const, viewDimension: "3d" as const },
+          })),
+          {
+            binding: 14 + MAX_LAYERS,
+            visibility: visFrag,
+            texture: { sampleType: "float", viewDimension: "2d" },
+          },
+          // Mask/annotation layer (item 7 Phase B): both read via textureLoad (no sampler) since class
+          // IDs must never be interpolated. r8uint's sample type is "uint"; the palette is declared
+          // "unfilterable-float" (same as binding 13's density pyramid) since nothing samples it either.
+          { binding: MASK_BINDING_BASE, visibility: visFrag, texture: { sampleType: "uint", viewDimension: "3d" } },
+          {
+            binding: MASK_BINDING_BASE + 1,
+            visibility: visFrag,
+            texture: { sampleType: "unfilterable-float", viewDimension: "2d" },
+          },
         ],
       });
       this.pipelineLayout = this.ctx.device.createPipelineLayout({

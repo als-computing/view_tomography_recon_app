@@ -15,6 +15,7 @@ import {
   type VolumeBlendMode,
   type VolumeViewMode,
   type ShaderConfigName,
+  type TfBandConfig,
 } from "@zarr-viewer/render";
 import type { ToneMapOperator } from "@zarr-viewer/fx";
 
@@ -27,6 +28,11 @@ export interface WebGpuRenderingState {
   equalizeClip: number;
   opacityScale: number;
   opacityPoints: OpacityPoint[];
+  /** Up to `MAX_TF_BANDS` intensity-range TF bands (item 7 Phase A). `undefined`/empty means "off" —
+   * the single-TF fields above (`colorMap`/`colorLo`/`colorHi`/`opacityScale`/`opacityPoints`) drive
+   * rendering as before, unchanged. Additive/optional so existing serialized configs, presets, and
+   * share-links (which predate this field) keep working with no migration. */
+  tfBands?: TfBandConfig[];
   densityScale: number;
   exposure: number;
   sampleDist: number;

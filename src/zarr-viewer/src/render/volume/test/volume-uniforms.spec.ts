@@ -75,10 +75,12 @@ const BASE_PARAMS: VolumeFrameParams = {
   camUp: [0, 1, 0],
   camAspect: 800 / 600,
   tanHalfFovY: Math.tan((42 * Math.PI) / 180 / 2),
+  maskEnabled: false,
+  maskDims: [1, 1, 1],
 };
 
 function pack(overrides: Partial<VolumeFrameParams> = {}): Float32Array {
-  const d = new Float32Array(128);
+  const d = new Float32Array(132);
   writeVolumeFrameUniform(d, new Mat4(), FAKE_ACCEL, { ...BASE_PARAMS, ...overrides });
   return d;
 }
@@ -154,5 +156,13 @@ describe("writeVolumeFrameUniform", () => {
     const d = pack({ camAspect: 2, tanHalfFovY: 0.5 });
     expect(d[123]).toBeCloseTo(1); // tanHalfFovY * aspect
     expect(d[127]).toBeCloseTo(0.5);
+  });
+
+  it("packs maskCtl (enable + mask voxel dims)", () => {
+    const off = pack();
+    expect(off[128]).toBe(0);
+    const on = pack({ maskEnabled: true, maskDims: [64, 32, 16] });
+    expect(on[128]).toBe(1);
+    expect([on[129], on[130], on[131]]).toEqual([64, 32, 16]);
   });
 });

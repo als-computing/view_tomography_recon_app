@@ -174,6 +174,15 @@ export class VolumeRenderer implements Disposable {
   private brickMin: [number, number, number] = [0, 0, 0];
   private brickMax: [number, number, number] = [0, 0, 0];
 
+  // Mask/annotation layer (item 7 Phase B): a same-grid r8uint class-id volume + its rgba8unorm
+  // palette (class id → color+opacity). Dummies are genuinely valid r8uint/rgba8unorm textures (unlike
+  // brickTex, nothing else bound has a compatible format to reuse as a fallback — see volume-bindings.ts).
+  private maskTex: ManagedTexture | undefined;
+  private maskPaletteTex: ManagedTexture | undefined;
+  private maskEnabled = false;
+  private readonly dummyMaskTex: ManagedTexture;
+  private readonly dummyMaskPalette: ManagedTexture;
+
   private readonly frameData = new Float32Array(VOLUME_FRAME_UNIFORM_SIZE / 4);
   private readonly invViewProj = new Mat4();
   private readonly lightingPass: LightingPass;
@@ -218,6 +227,18 @@ export class VolumeRenderer implements Disposable {
       dimension: "2d",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
+    this.dummyMaskTex = new ManagedTexture(ctx.device, {
+      size: [1, 1, 1],
+      format: "r8uint",
+      dimension: "3d",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.dummyMaskPalette = new ManagedTexture(ctx.device, {
+      size: [1, 1, 1],
+      format: "rgba8unorm",
+      dimension: "2d",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
   }
 
   public setVolume(texture: ManagedTexture): void {
@@ -257,6 +278,23 @@ export class VolumeRenderer implements Disposable {
   /** Fade weight [0,1] for the brick (drives smooth zoom-out); no bind-group rebuild. */
   public setBrickBlend(weight: number): void {
     this.brickBlend = Math.min(1, Math.max(0, weight));
+  }
+
+  /**
+   * Set (or clear with `null`) the mask/annotation density texture (`r8uint`, item 7 Phase B). Assumed
+   * to share the primary volume's own world box (no separate world-AABB/translation handling) — see
+   * the plan's Phase B design note for why that's a safe assumption for an annotation of this scan.
+   */
+  public setMask(texture: ManagedTexture | null): void {
+    this.maskTex = texture ?? undefined;
+    this.maskEnabled = texture !== null;
+    this.bindings.invalidate();
+  }
+
+  /** Replace the mask's palette (class id → color+opacity, `rgba8unorm`, one row). */
+  public setMaskPalette(paletteTexture: ManagedTexture): void {
+    this.maskPaletteTex = paletteTexture;
+    this.bindings.invalidate();
   }
 
   public setBoxHalfSize(x: number, y: number, z: number): void {
@@ -679,6 +717,8 @@ export class VolumeRenderer implements Disposable {
       preintTex: this.tPreintTex ?? this.dummyPreint,
       spec,
       acceleration: this.acceleration,
+      maskTex: this.maskTex ?? this.dummyMaskTex,
+      maskPaletteTex: this.maskPaletteTex ?? this.dummyMaskPalette,
     });
 
     const background = this.pipelineMgr.background;
@@ -763,6 +803,8 @@ export class VolumeRenderer implements Disposable {
       camUp: this.camUp,
       camAspect: this.camAspect,
       tanHalfFovY: this.tanHalfFovY,
+      maskEnabled: this.maskEnabled,
+      maskDims: this.maskTex?.desc.size ?? [1, 1, 1],
     });
     this.pipelineMgr.uniformBuffer.write(this.frameData);
   }
@@ -808,6 +850,8 @@ export class VolumeRenderer implements Disposable {
     this.lightingPass.dispose();
     this.tPreintTex?.dispose();
     this.dummyPreint.dispose();
+    this.dummyMaskTex.dispose();
+    this.dummyMaskPalette.dispose();
     this.tfTex = undefined;
     this.volumeTex = undefined;
     this.bindings.invalidate();

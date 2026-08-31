@@ -11,8 +11,8 @@ import { LIGHT_STRUCT_WGSL } from "./lights.js";
 import { PREINTEGRATION_SIGMA_MAX } from "../volume/preintegration-2d.js";
 import { VOLUME_LIGHTING_SHARED_WGSL } from "./volume-lighting-shared.js";
 
-/** Byte size of the volume frame uniform block (mat4 + 21 × vec4 + shadow mat4 + shadowCtl + camRight/camUp). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 512;
+/** Byte size of the volume frame uniform block (mat4 + 22 × vec4 + shadow mat4 + shadowCtl + camRight/camUp). */
+export const VOLUME_FRAME_UNIFORM_SIZE = 528;
 
 /** Compile-time specialization for {@link volumeRaymarchWgsl}. */
 export interface VolumeRaymarchSpec {
@@ -81,6 +81,7 @@ struct Frame {
   shadowCtl: vec4<f32>,      // x = shadowMapEnable (1 = sample the map instead of marching a shadow ray)
   camRight: vec4<f32>,       // xyz = camera right axis (world, unit), w = tan(halfFovY) * aspect
   camUp: vec4<f32>,          // xyz = camera up axis (world, unit),    w = tan(halfFovY)
+  maskCtl: vec4<f32>,        // x = maskEnable, yzw = mask voxel dims (item 7 Phase B)
 };
 
 struct OccCell { dmin: f32, dmax: f32, dist: f32, occupied: f32 }
@@ -111,6 +112,12 @@ ${LIGHT_STRUCT_WGSL}
 // Density mip pyramid (Milestone 3.2): rg = (mean, meanSq) per mip level, sampled via textureLoad at
 // an explicit level (nearest, no interpolation between levels) chosen from the ray's step footprint.
 @group(0) @binding(13) var densityPyramid: texture_3d<f32>;
+// Mask/annotation layer (item 7 Phase B): assumed same-grid as the primary (uvw needs no remapping).
+// Both read via textureLoad only - class ids must never be interpolated, so neither uses a sampler.
+// Bindings 14..20 (the shelved multi-volume-layer slots + TF atlas) are declared nowhere in this
+// shader; WebGPU doesn't require every bind-group-layout entry to be referenced.
+@group(0) @binding(21) var maskTex: texture_3d<u32>;
+@group(0) @binding(22) var maskPaletteTex: texture_2d<f32>;
 
 struct VSOut {
   @builtin(position) clip: vec4<f32>,
@@ -183,6 +190,17 @@ fn sampleDensity(uvw: vec3<f32>) -> f32 {
 
 fn sampleTf(density: f32) -> vec4<f32> {
   return textureSampleLevel(tfTex, tfSampler, vec2<f32>(density, 0.5), 0.0);
+}
+
+// Mask/annotation layer (item 7 Phase B): uvw is over the primary's own box (same grid, no separate
+// remapping - see the Frame.maskCtl doc comment). Nearest-voxel lookup via textureLoad (never
+// interpolated - a blended class id would be meaningless), then a palette lookup by class id (also
+// textureLoad, so the palette is never filtered either). Returns straight (non-premultiplied) RGBA.
+fn sampleMask(uvw: vec3<f32>) -> vec4<f32> {
+  let dims = max(frame.maskCtl.yzw, vec3<f32>(1.0));
+  let voxel = clamp(vec3<i32>(uvw * dims), vec3<i32>(0), vec3<i32>(dims) - vec3<i32>(1));
+  let classId = i32(textureLoad(maskTex, voxel, 0).r);
+  return textureLoad(maskPaletteTex, vec2<i32>(classId, 0), 0);
 }
 
 // Milestone 3.2: local density variance from the mip pyramid's (mean, meanSq) moments at an explicit
@@ -623,7 +641,13 @@ fn marchColor(
       // skip still fast-forwards through the empty voxels inside the margin — only the *deep* air is
       // leaped. The leap box of radius (dist - OCC_LEAP_MIN) stays in the provably-empty interior.
       let OCC_LEAP_MIN = 5.0;
-      if (rec.dist >= OCC_LEAP_MIN) {
+      // item 7 Phase B: the occupancy grid is built from the PRIMARY's density only, so a leap has no
+      // way to know whether the mask has content in the region it's about to jump over - an annotation
+      // sitting in primary-empty space (the exact scenario a mask commonly targets) could be skipped
+      // entirely. Building a real mask-aware occupancy structure is future work; for now, correctness
+      // wins over the leap's speedup whenever a mask is active - baseline per-step marching (the branch
+      // below) always visits every uvw, so sampleMask() above never gets skipped.
+      if (rec.dist >= OCC_LEAP_MIN && frame.maskCtl.x < 0.5) {
         let g = max(frame.accelOcc.xyz, vec3<f32>(1.0));
         let cs = 1.0 / g;
         let r = max(0.0, floor(rec.dist) - OCC_LEAP_MIN);
@@ -659,6 +683,26 @@ fn marchColor(
       t += stepNow;
       i += 1;
       continue;
+    }
+
+    // Mask/annotation layer (item 7 Phase B): composited independently of the primary's own density -
+    // an annotation must stay visible even where the primary is empty, which is exactly why this runs
+    // here rather than after (or gated behind) the primary's density<0.01 skip-ahead below. Flat/unlit
+    // only (no shadow/AO/extinction physics) in v1, using the palette's own alpha directly as each
+    // step's blend weight - the same Δα-weighted "over" accumulation the primary uses, just without
+    // converting a density into an extinction coefficient first (a mask has no density, only a label).
+    // Composite-mode only: MIP/MinIP/average don't have a front-to-back accumulator to add this into.
+    // NOTE: the empty-space occupancy leap above (when OCCUPANCY is compiled in) is built from the
+    // PRIMARY's density only and can jump straight past this point without ever revisiting it - a mask
+    // sitting in primary-empty space can be skipped entirely. That's a known, separately-tracked
+    // correctness gap (item 7 Phase B step 4), not something this step already accounts for.
+    if (blendMode == 0 && frame.maskCtl.x > 0.5) {
+      let mask = sampleMask(uvw);
+      if (mask.a > SHADE_ALPHA_EPS) {
+        let om = 1.0 - color.a;
+        color = vec4<f32>(color.rgb + om * mask.rgb * mask.a, color.a + om * mask.a);
+        colorUnlit = vec4<f32>(colorUnlit.rgb + om * mask.rgb * mask.a, colorUnlit.a + om * mask.a);
+      }
     }
 
     let density = sampleDensity(uvw);
