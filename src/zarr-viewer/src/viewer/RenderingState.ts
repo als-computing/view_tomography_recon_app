@@ -163,9 +163,9 @@ export function defaultRenderingState(): WebGpuRenderingState {
     flashRange: 6,
     stageConeDeg: 86,
     stageRange: 8,
-    halfRes: false,
-    temporalAA: false, // Milestone 5: accumulate a clean supersampled image while the camera is still
-    gbufferLighting: false, // Milestone 6 (B3), opt-in
+    halfRes: true, // adaptive: only applies while navigating (see WebGpuVolumeViewer.ts's `settled`)
+    temporalAA: true, // Milestone 5: accumulate a clean supersampled image while the camera is still
+    gbufferLighting: true, // Milestone 6 (B3), adaptive: only applies while navigating
     shaderConfig: "baseline",
     measurePlaneOn: false,
     measureDepth: 0.5, // 0..1 fraction across the volume's depth footprint (0 = front face, 1 = back)

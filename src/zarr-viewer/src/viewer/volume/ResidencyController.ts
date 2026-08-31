@@ -25,6 +25,18 @@ const ROI_SETTLE = 0.2;
  * thrash.
  */
 const ROI_HINT_SETTLE = 0.45;
+/**
+ * Minimum seconds a region is served before a *different* one is allowed to take over. Bin-level
+ * hysteresis (see `visHintBin`) alone doesn't stop ping-ponging between two-or-more genuinely
+ * important, comparably-visible regions when zoomed out over a wide view: once a brick loads for
+ * region A, `residentLevelOf` reports it as covered, so A's own priority correctly drops toward 0 -
+ * but that just hands the "most under-served" crown to region B. Once B's brick replaces A's (only one
+ * brick is resident at a time), A's bins revert to reporting the coarse level again and A's priority
+ * comes back - so without a cooldown the two regions volley forever, never letting either be looked at.
+ * This grace period breaks that: once a region starts loading, nothing else can preempt it for a while,
+ * even if a different bin would otherwise "win" on priority.
+ */
+const MIN_REGION_SERVE = 3;
 
 export interface ResidencyDeps {
   device: GPUDevice;
@@ -70,10 +82,23 @@ export class ResidencyController {
     | { level: number; voxelMin: [number, number, number]; voxelMax: [number, number, number] }
     | null = null;
   private roiIdle = 0;
+  /** Seconds since the current region (`lastRoiKey`) started being requested/served. See MIN_REGION_SERVE. */
+  private regionServedFor = 0;
   private roiRequestInFlight = false; // a brick request is streaming (drives the reset guard + progress bar)
   private roiReqSeq = 0; // monotonic id so a superseded request's finally() can't clobber a newer one
   private prevRoiCam: CameraPoseLike;
   private progressValue: { loaded: number; total: number } | null = null;
+  /**
+   * Sticky visibility-hint bin (Milestone 1), + the priority it had when picked. The vis-bin readback
+   * is a periodically-cleared rolling window (see `VisibilityFeedback.recordCopy`'s readback cadence),
+   * and each window's rays are sub-pixel jittered by TAAU — for a genuinely still camera this still
+   * shifts bin weights slightly window to window, which (especially zoomed out, where many bins have
+   * similar modest weight) can flip which bin ranks #1. Without stickiness that flip evicts the just-
+   * loaded brick and starts fetching the new "top" bin's region instead — repeating forever, never
+   * covering the whole zoomed-out view. Only switch when a new bin's priority clearly beats the current
+   * one, not merely edges it out.
+   */
+  private visHintBin: { x: number; y: number; z: number; priority: number } | undefined;
 
   public constructor(deps: ResidencyDeps) {
     this.deps = deps;
@@ -159,6 +184,8 @@ export class ResidencyController {
   public resetRequestTracking(): void {
     this.lastRoiKey = "";
     this.lastRegion = null;
+    this.visHintBin = undefined;
+    this.regionServedFor = 0;
   }
 
   /**
@@ -183,6 +210,7 @@ export class ResidencyController {
     } else {
       this.roiIdle += dt;
     }
+    this.regionServedFor += dt;
 
     let want = 0; // brick blend target this frame (a loaded brick is on screen)
     let desired = false; // we intend to keep a high-res brick this frame (a finer region applies)
@@ -229,7 +257,16 @@ export class ResidencyController {
               return level;
             },
           });
-          const top = ranked[0];
+          // Sticky pick: keep the currently-hinted bin unless a new one clearly beats it (>1.5x its
+          // priority) or it's no longer a real candidate at all (fell out of the ranked list / priority
+          // dropped to 0, e.g. the resident brick now actually covers it). See visHintBin's doc comment.
+          const sticky = this.visHintBin
+            ? ranked.find((b) => b.x === this.visHintBin!.x && b.y === this.visHintBin!.y && b.z === this.visHintBin!.z)
+            : undefined;
+          const challenger = ranked[0];
+          const top =
+            sticky && (!challenger || challenger.priority <= sticky.priority * 1.5) ? sticky : challenger;
+          this.visHintBin = top ? { x: top.x, y: top.y, z: top.z, priority: top.priority } : undefined;
           if (top && top.priority > 0) {
             const box = visBinUvwBox(top.x, top.y, top.z, vis.grid);
             const pad = 0.05;
@@ -313,8 +350,12 @@ export class ResidencyController {
           // made the high-res ROI briefly drop to coarse / go blank when moving mid-load. Same-key
           // requests are still blocked (key === lastRoiKey) and ROI_SETTLE debounces motion, so this
           // can't flood.
-          if (!covered && key !== this.lastRoiKey && this.roiIdle >= ROI_SETTLE) {
+          // MIN_REGION_SERVE only gates a SWITCH away from an already-resident region (lastRoiKey !==
+          // "") - the very first region for a fresh zoom-in must not wait out the cooldown.
+          const cooledDown = this.lastRoiKey === "" || this.regionServedFor >= MIN_REGION_SERVE;
+          if (!covered && key !== this.lastRoiKey && this.roiIdle >= ROI_SETTLE && cooledDown) {
             this.lastRoiKey = key;
+            this.regionServedFor = 0;
             this.lastRegion = { level: region.level, voxelMin, voxelMax };
             const half = [sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5];
             const full = [sizeSim.x, sizeSim.y, sizeSim.z];
@@ -346,6 +387,7 @@ export class ResidencyController {
     if (!desired && !this.roiRequestInFlight) {
       this.lastRoiKey = "";
       this.lastRegion = null;
+      this.visHintBin = undefined; // don't let a stale hint bias where the next zoom-in starts
     }
     this.brickBlendTarget = want;
 

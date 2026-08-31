@@ -296,6 +296,11 @@ export async function run(
       aoIntensity: rendering.aoIntensity,
       aoSamples: rendering.aoSamples,
     });
+    // Keeps the actual TemporalAccumulator in sync with rendering.temporalAA - needed here (not just
+    // the checkbox's own change handler) so the default state (and any restored preset/session) takes
+    // effect on first load, since TemporalAccumulator itself defaults disabled regardless of what
+    // rendering.temporalAA says.
+    taau.setEnabled(rendering.temporalAA);
     // Milestone 6 (B3): actual render-scale selection is adaptive (moving vs. settled) and happens every
     // frame in the render loop below, not here — this one-time call just avoids a stale full-res scale
     // for the very first frame before the loop has run.

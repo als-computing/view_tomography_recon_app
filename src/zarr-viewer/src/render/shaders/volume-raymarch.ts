@@ -506,19 +506,40 @@ fn marchColor(
   let hit = intersectAabb(ro, rd, boxMin, boxMax);
   if (hit.x > hit.y || hit.y < 0.0) {
     // No volume along this ray — still paint the measure plane where it sits in front of the camera.
+    // Milestone 6 (B3): colorUnlitOut must mirror every value returned here (not just the "real hit"
+    // path below), or the half-res lighting composite (which reads colorUnlit as its base) sees pure
+    // transparent black wherever a ray misses the volume - the "black box around the volume" bug.
     if (planeT > 0.0) {
-      if (alphaComposite) { return vec4<f32>(vec3<f32>(planeGray) * planeAlpha, planeAlpha); }
+      if (alphaComposite) {
+        let v = vec4<f32>(vec3<f32>(planeGray) * planeAlpha, planeAlpha);
+        *colorUnlitOut = v;
+        return v;
+      }
       let comp = mix(bg, vec3<f32>(planeGray), planeAlpha);
-      if (frame.composite.y >= 0.5) { return vec4<f32>(comp, 1.0); }
+      if (frame.composite.y >= 0.5) {
+        let v = vec4<f32>(comp, 1.0);
+        *colorUnlitOut = v;
+        return v;
+      }
       let outC = tonemapACES(comp);
-      return vec4<f32>(pow(outC, vec3<f32>(0.95)), 1.0);
+      let v = vec4<f32>(pow(outC, vec3<f32>(0.95)), 1.0);
+      *colorUnlitOut = v;
+      return v;
     }
     if (alphaComposite) {
-      return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      let v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      *colorUnlitOut = v;
+      return v;
     }
-    if (frame.composite.y >= 0.5) { return vec4<f32>(bg, 1.0); } // linear HDR for post stack
+    if (frame.composite.y >= 0.5) { // linear HDR for post stack
+      let v = vec4<f32>(bg, 1.0);
+      *colorUnlitOut = v;
+      return v;
+    }
     let outBg = tonemapACES(bg);
-    return vec4<f32>(pow(outBg, vec3<f32>(0.95)), 1.0);
+    let v = vec4<f32>(pow(outBg, vec3<f32>(0.95)), 1.0);
+    *colorUnlitOut = v;
+    return v;
   }
 
   let stepSize = max(frame.params.x, 5e-4);
@@ -776,6 +797,9 @@ fn marchColor(
       outRgb = (avgRgb / avgW) * exposure;
       outA = select(1.0, clamp(avgW * 0.1, 0.0, 1.0), alphaComposite);
     } else if (alphaComposite) {
+      // Milestone 6 (B3): mirror to colorUnlitOut - same reasoning as the "ray misses box" early
+      // returns above, this early return would otherwise leave colorUnlitOut at its black default.
+      *colorUnlitOut = vec4<f32>(0.0, 0.0, 0.0, 0.0);
       return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     } else {
       outRgb = bg;
@@ -785,6 +809,8 @@ fn marchColor(
     if (alphaComposite) {
       outA = color.a;
       if (outA < 1e-4) {
+        // Milestone 6 (B3): mirror to colorUnlitOut - see the other alphaComposite early returns above.
+        *colorUnlitOut = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
       }
     } else {
