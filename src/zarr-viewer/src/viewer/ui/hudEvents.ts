@@ -23,9 +23,10 @@ import type { TemporalAccumulator } from "../../render/accel/taau.js";
 import { getPreset, savePreset, deletePreset } from "../../rendering-presets.js";
 import type { ResidencyController } from "../volume/ResidencyController.js";
 import type { PickingController } from "../interaction/PickingController.js";
+import type { CropDragController } from "../interaction/CropDragController.js";
 import type { WebGpuRenderingState, WebGpuCroppingState } from "../RenderingState.js";
 import { autoWindow } from "../histogram.js";
-import { fmt, type PanelId } from "./html.js";
+import { fmt, type PanelId, type HudTab } from "./html.js";
 
 export interface HudEventContext {
   ui: HTMLElement;
@@ -37,6 +38,7 @@ export interface HudEventContext {
   taau: TemporalAccumulator;
   residency: ResidencyController;
   picking: PickingController;
+  cropDrag: CropDragController;
   openSections: Set<PanelId>;
   getSource(): VolumeSource;
   getLevel(): number;
@@ -47,6 +49,8 @@ export interface HudEventContext {
   setSelectedPreset(v: string): void;
   getCollapsed(): boolean;
   setCollapsed(v: boolean): void;
+  getActiveTab(): HudTab;
+  setActiveTab(v: HudTab): void;
   applyLevel(next: number): void;
   applyRender(): void;
   applyTf(): void;
@@ -120,6 +124,11 @@ export function bindHudClick(ctx: HudEventContext): void {
     if (!btn) return;
     if (btn.dataset.act === "toggleCollapse") {
       ctx.setCollapsed(!ctx.getCollapsed());
+      ctx.renderUi();
+      return;
+    }
+    if (btn.dataset.act === "setTab" && btn.dataset.tab) {
+      ctx.setActiveTab(btn.dataset.tab as HudTab);
       ctx.renderUi();
       return;
     }
@@ -253,6 +262,11 @@ export function bindHudInput(ctx: HudEventContext): void {
         ctx.renderUi();
         return;
       }
+      if (t.dataset.chk === "cropDragMode") {
+        ctx.cropDrag.setCropMode(on);
+        ctx.renderUi();
+        return;
+      }
       if (
         t.dataset.chk === "fxBloom" ||
         t.dataset.chk === "fxFxaa" ||
@@ -277,6 +291,12 @@ export function bindHudInput(ctx: HudEventContext): void {
       }
       if (t.dataset.chk === "measurePlaneOn") {
         ctx.rendering.measurePlaneOn = on; // the render loop reads this live; just emit for links/share
+        ctx.emitRendering();
+        return;
+      }
+      if (t.dataset.chk === "invertOrbitX" || t.dataset.chk === "invertOrbitY") {
+        if (t.dataset.chk === "invertOrbitX") ctx.rendering.invertOrbitX = on;
+        else ctx.rendering.invertOrbitY = on; // the render loop reads these live, no other side effect
         ctx.emitRendering();
         return;
       }

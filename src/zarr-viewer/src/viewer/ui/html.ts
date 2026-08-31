@@ -15,7 +15,16 @@ export type PanelId =
   | "measure"
   | "postfx"
   | "lighting"
-  | "presets";
+  | "presets"
+  | "controls";
+
+/** Which top-level HUD tab a panel lives under. */
+export type HudTab = "volume" | "render";
+
+/** `PanelId`s shown under the "Volume settings" tab. */
+export const VOLUME_TAB_PANELS: readonly PanelId[] = ["data", "tf", "slices", "crop", "measure", "presets"];
+/** `PanelId`s shown under the "Render settings" tab. */
+export const RENDER_TAB_PANELS: readonly PanelId[] = ["render", "lighting", "postfx", "controls"];
 
 /** A collapsible `<details>` panel; open/closed state comes from the caller's `openSections` set. */
 export function section(

@@ -35,6 +35,51 @@ export function computeCameraBasis(wm: ArrayLike<number>): CameraBasis {
   };
 }
 
+/**
+ * A "de-rolled" right/up basis for `forward`: as if the camera had zero roll relative to `worldUp`,
+ * regardless of the camera's *actual* (possibly rolled) right/up — e.g. from free "trackball" orbiting,
+ * which lets roll accumulate with no fixed up axis. Used by the orientation gizmo so it reflects the
+ * volume's fixed world orientation the way a viewer expects (up axis reads as "up" on screen) without
+ * spinning/tilting purely from incidental camera roll; the actual camera navigation is untouched — this
+ * only affects what's drawn in the gizmo overlay.
+ *
+ * `right = normalize(forward × worldUp)` (world-level horizontal), sign-matched against `actualRight`
+ * so this works regardless of which absolute cross-product handedness convention the rest of the
+ * codebase's basis vectors use (self-calibrating, not hardcoded). `up = right × forward`, completing a
+ * basis with the same handedness as `computeCameraBasis`'s (verified: for a zero-roll camera, this
+ * reduces to `right ≈ actualRight`, `up ≈ actualUp`).
+ *
+ * Degenerate when `forward` is parallel to `worldUp` (looking straight up/down world-up, e.g. a
+ * bird's-eye view) — de-rolling is meaningless there (any right/up choice is equally "rolled"), so
+ * this falls back to the camera's own actual `right`/`up` rather than producing a zero-length result.
+ */
+export function derollCameraBasis(
+  forward: readonly [number, number, number],
+  actualRight: readonly [number, number, number],
+  actualUp: readonly [number, number, number],
+  worldUp: readonly [number, number, number] = [0, 1, 0],
+): CameraBasis {
+  const rx0 = forward[1] * worldUp[2] - forward[2] * worldUp[1];
+  const ry0 = forward[2] * worldUp[0] - forward[0] * worldUp[2];
+  const rz0 = forward[0] * worldUp[1] - forward[1] * worldUp[0];
+  const rLen = Math.hypot(rx0, ry0, rz0);
+  if (rLen < 1e-6) {
+    return { right: [...actualRight], up: [...actualUp], forward: [...forward] };
+  }
+  const sign = rx0 * actualRight[0] + ry0 * actualRight[1] + rz0 * actualRight[2] < 0 ? -1 : 1;
+  const right: [number, number, number] = [
+    (rx0 / rLen) * sign,
+    (ry0 / rLen) * sign,
+    (rz0 / rLen) * sign,
+  ];
+  const ux = right[1] * forward[2] - right[2] * forward[1];
+  const uy = right[2] * forward[0] - right[0] * forward[2];
+  const uz = right[0] * forward[1] - right[1] * forward[0];
+  const uLen = Math.hypot(ux, uy, uz) || 1;
+  const up: [number, number, number] = [ux / uLen, uy / uLen, uz / uLen];
+  return { right, up, forward: [...forward] };
+}
+
 export interface NearFar {
   readonly near: number;
   readonly far: number;

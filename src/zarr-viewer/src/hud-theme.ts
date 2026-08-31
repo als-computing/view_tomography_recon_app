@@ -87,6 +87,37 @@ const HUD_CSS = `
   color: var(--whud-text);
 }
 
+/* Volume-settings / Render-settings tab switcher in the header. */
+.whud__tab-btn {
+  flex-shrink: 0;
+  cursor: pointer;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--whud-muted);
+  background: var(--whud-surface);
+  border: 1px solid var(--whud-border);
+  border-radius: var(--radius);
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.whud__tab-btn:hover {
+  background: var(--whud-hover-bg);
+  border-color: var(--whud-hover-border);
+  color: var(--whud-text);
+}
+.whud__tab-btn--active,
+.whud__tab-btn--active:hover {
+  background: var(--whud-active);
+  border-color: var(--whud-active-border);
+  color: #ffffff;
+}
+
 /* Collapsed: hide everything but the expand chevron. Docked panels are narrowed to a thin strip by
    the viewer (sidebar width); floating panels shrink to just their header. */
 .whud--collapsed { overflow: hidden; }

@@ -87,6 +87,10 @@ export interface WebGpuRenderingState {
   measureDepth: number;
   measurePlaneGray: number;
   measurePlaneAlpha: number;
+  /** Invert horizontal/vertical orbit drag direction. Both default off (unchanged behavior) — an
+   * opt-in fix for users who find the default direction backwards. */
+  invertOrbitX: boolean;
+  invertOrbitY: boolean;
 }
 
 /** The ROI crop box plus the slice planes (positions, per-axis enables, overlay visibility). */
@@ -171,6 +175,8 @@ export function defaultRenderingState(): WebGpuRenderingState {
     measureDepth: 0.5, // 0..1 fraction across the volume's depth footprint (0 = front face, 1 = back)
     measurePlaneGray: 0.6, // plane greyscale value [0,1]
     measurePlaneAlpha: 0.35, // plane opacity [0,1]
+    invertOrbitX: false,
+    invertOrbitY: false,
   };
 }
 

@@ -6,6 +6,7 @@ import { describe, it, expect } from "vitest";
 import { Mat4 } from "@zarr-viewer/math";
 import {
   computeCameraBasis,
+  derollCameraBasis,
   computeNearFar,
   computeMeasurePlaneDepth,
   computeRuler,
@@ -33,6 +34,62 @@ describe("computeCameraBasis", () => {
     expect(basis.right).toEqual([1, 0, 0]);
     expect(basis.up).toEqual([0, 1, 0]);
     expect(basis.forward.map((v) => v + 0)).toEqual([0, 0, -1]); // normalize -0 to 0 for comparison
+  });
+});
+
+describe("derollCameraBasis", () => {
+  it("matches the actual basis when there is no roll", () => {
+    const forward: [number, number, number] = [0, 0, -1];
+    const { right, up } = derollCameraBasis(forward, [1, 0, 0], [0, 1, 0]);
+    expect(right[0]).toBeCloseTo(1);
+    expect(right[1]).toBeCloseTo(0);
+    expect(right[2]).toBeCloseTo(0);
+    expect(up[0]).toBeCloseTo(0);
+    expect(up[1]).toBeCloseTo(1);
+    expect(up[2]).toBeCloseTo(0);
+  });
+
+  it("produces the same right/up regardless of the camera's actual roll, for the same forward", () => {
+    const forward: [number, number, number] = [0, 0, -1];
+    const a = derollCameraBasis(forward, [1, 0, 0], [0, 1, 0]);
+    const cos30 = Math.cos(Math.PI / 6);
+    const sin30 = Math.sin(Math.PI / 6);
+    // A different "actual" (rolled) basis for the identical forward direction - a real trackball
+    // camera could report either, depending purely on the drag path taken to get there.
+    const rolledRight: [number, number, number] = [cos30, sin30, 0];
+    const rolledUp: [number, number, number] = [-sin30, cos30, 0];
+    const b = derollCameraBasis(forward, rolledRight, rolledUp);
+    expect(b.right[0]).toBeCloseTo(a.right[0]);
+    expect(b.right[1]).toBeCloseTo(a.right[1]);
+    expect(b.right[2]).toBeCloseTo(a.right[2]);
+    expect(b.up[0]).toBeCloseTo(a.up[0]);
+    expect(b.up[1]).toBeCloseTo(a.up[1]);
+    expect(b.up[2]).toBeCloseTo(a.up[2]);
+  });
+
+  it("falls back to the actual basis when looking straight along world-up (degenerate)", () => {
+    const forward: [number, number, number] = [0, 1, 0]; // parallel to the default worldUp
+    const actualRight: [number, number, number] = [1, 0, 0];
+    const actualUp: [number, number, number] = [0, 0, -1];
+    const { right, up } = derollCameraBasis(forward, actualRight, actualUp);
+    expect(right).toEqual(actualRight);
+    expect(up).toEqual(actualUp);
+  });
+
+  it("returns an orthonormal basis matching computeCameraBasis's handedness for a tilted view", () => {
+    // A camera looking down and to the side, with an already-zero-roll actual basis (hand-derived from
+    // computeCameraBasis's own convention) - deroll should reproduce it closely and stay orthonormal.
+    const forward: [number, number, number] = [-0.632455532, -0.4472135955, -0.632455532];
+    const actualRight: [number, number, number] = [0.7071067812, 0, -0.7071067812];
+    const actualUp: [number, number, number] = [-0.316227766, 0.894427191, -0.316227766];
+    const { right, up } = derollCameraBasis(forward, actualRight, actualUp);
+    expect(Math.hypot(right[0], right[1], right[2])).toBeCloseTo(1);
+    expect(Math.hypot(up[0], up[1], up[2])).toBeCloseTo(1);
+    expect(right[0] * up[0] + right[1] * up[1] + right[2] * up[2]).toBeCloseTo(0); // right ⊥ up
+    expect(right[0] * forward[0] + right[1] * forward[1] + right[2] * forward[2]).toBeCloseTo(0);
+    expect(up[0] * forward[0] + up[1] * forward[1] + up[2] * forward[2]).toBeCloseTo(0);
+    expect(right[0]).toBeCloseTo(actualRight[0], 3);
+    expect(up[1]).toBeCloseTo(actualUp[1], 3);
   });
 });
 

@@ -59,13 +59,17 @@ import {
 } from "./RenderingState.js";
 import { zarrUrlFromQuery, pickZarrStore } from "./util.js";
 import { autoWindow, buildEqualizeRemap, rebinThroughRemap } from "./histogram.js";
-import { type PanelId, section, fmt } from "./ui/html.js";
+import { type PanelId, type HudTab, VOLUME_TAB_PANELS, RENDER_TAB_PANELS, section, fmt } from "./ui/html.js";
+import { controlsPanelBody } from "./ui/panels/controlsPanel.js";
 import { ResidencyController } from "./volume/ResidencyController.js";
 import { PickingController } from "./interaction/PickingController.js";
+import { CropDragController } from "./interaction/CropDragController.js";
+import { cropWorldBox, boxCorners, worldToScreen } from "./volume/crop-drag-geometry.js";
 import { bindHudEvents, type HudEventContext } from "./ui/hudEvents.js";
 import { buildFrameLights } from "./rendering/lighting.js";
 import {
   computeCameraBasis,
+  derollCameraBasis,
   computeNearFar,
   computeMeasurePlaneDepth,
   computeRuler,
@@ -144,7 +148,11 @@ export async function run(
   const rendering: WebGpuRenderingState = defaultRenderingState();
   let equalizeRemap: Float32Array | undefined; // CDF remap LUT while equalizeOn
   const cropping: WebGpuCroppingState = defaultCroppingState();
-  const openSections = new Set<PanelId>(["tf", "render"]);
+  const openSections = new Set<PanelId>(["tf"]);
+  // Which top-level HUD tab is showing - "volume" (data/TF/slices/crop/measure/presets) or "render"
+  // (render/lighting/postfx/controls). Only one panel within the active tab is open at a time (see
+  // renderUi()'s <details> toggle listener) so the sidebar never needs scrolling to find a section.
+  let activeTab: HudTab = "volume";
   let loading = false;
   // One-shot guard: apply the last-used rendering snapshot once, after this viewer's first level (and
   // thus its histogram) is ready. A ?share= link applied later by the app still wins.
@@ -343,6 +351,11 @@ export async function run(
       e.button === 0 &&
       (picking.pickMode || e.ctrlKey || e.metaKey)
     ) {
+      return false;
+    }
+    // Crop mode: only veto orbit when the pointerdown actually hits a crop-box face - crop mode stays
+    // on while the user rotates the view to see other sides of the box before dragging a face.
+    if (e instanceof PointerEvent && e.type === "pointerdown" && e.button === 0 && cropDrag.wouldHit(e)) {
       return false;
     }
     return true;
@@ -614,7 +627,10 @@ export async function run(
     opts?: { openSlices?: boolean; skipRenderUi?: boolean },
   ): void => {
     enterViewMode(mode, true);
-    if (opts?.openSlices) openSections.add("slices");
+    if (opts?.openSlices) {
+      openSections.add("slices");
+      activeTab = "volume";
+    }
     if (!opts?.skipRenderUi) renderUi();
     emitRendering();
     emitCropping();
@@ -757,9 +773,28 @@ export async function run(
     getVolumeUnit3: () => um3(),
     applyRender: () => applyRender(),
     renderUi: () => renderUi(),
-    onPicked: () => openSections.add("measure"),
+    onPicked: () => {
+      openSections.add("measure");
+      activeTab = "volume";
+    },
   });
   session.onDispose(() => picking.dispose());
+
+  const cropDrag = new CropDragController({
+    canvas,
+    camera,
+    invViewProj,
+    lastViewProj,
+    sizeSim,
+    cropping,
+    isVolumeView: () => rendering.viewMode === "volume",
+    applyRender: () => applyRender(),
+    onDragEnd: () => {
+      renderUi();
+      emitCropping();
+    },
+  });
+  session.onDispose(() => cropDrag.dispose());
 
   const renderUi = (): void => {
     requestRender(); // catch-all: any HUD interaction that rebuilds the panel also repaints the canvas
@@ -793,7 +828,7 @@ export async function run(
       axisVoxelCount,
     });
 
-    const cropBody = cropPanelBody(cropping);
+    const cropBody = cropPanelBody(cropping, cropDrag.cropMode);
     const measureBody = measurePanelBody({
       rendering,
       pickMode: picking.pickMode,
@@ -815,34 +850,62 @@ export async function run(
     // reset was the actual cause of the HUD "feeling slow to scroll/interact with": every such
     // interaction silently snapped the sidebar back to the top. <details> open/close state already
     // survives via `openSections`; scroll position needs the same explicit save/restore.
+    const controlsBody = controlsPanelBody(rendering);
+    const allPanels: { id: PanelId; title: string; body: string }[] = [
+      { id: "data", title: "Data", body: dataBody },
+      { id: "tf", title: "Transfer Function", body: tfBody },
+      { id: "slices", title: "Slices", body: slicesBody },
+      { id: "crop", title: "Crop", body: cropBody },
+      { id: "measure", title: "Measure", body: measureBody },
+      { id: "presets", title: "Presets", body: presetsBody },
+      { id: "render", title: "Render", body: renderBody },
+      { id: "lighting", title: "Lighting", body: lightingBody },
+      { id: "postfx", title: "Post FX", body: postfxBody },
+      { id: "controls", title: "Controls", body: controlsBody },
+    ];
+    // Only the active tab's panels render at all - the other tab's <details> don't exist in the DOM,
+    // so there's nothing to scroll past to find a section in the tab you're actually using.
+    const tabPanelIds = activeTab === "volume" ? VOLUME_TAB_PANELS : RENDER_TAB_PANELS;
+    const sectionsHtml = tabPanelIds
+      .map((id) => allPanels.find((p) => p.id === id))
+      .filter((p): p is (typeof allPanels)[number] => p !== undefined)
+      .map((p) => section(openSections, p.id, p.title, p.body))
+      .join("");
+
     const savedScrollTop = ui.scrollTop;
     ui.innerHTML = [
       `<div class="whud__header">` +
         `<span class="whud__title">Tomography Volume Renderer</span>` +
+        `<button type="button" class="whud__tab-btn${activeTab === "volume" ? " whud__tab-btn--active" : ""}" ` +
+        `data-act="setTab" data-tab="volume" title="Volume settings" aria-label="Volume settings">▣</button>` +
+        `<button type="button" class="whud__tab-btn${activeTab === "render" ? " whud__tab-btn--active" : ""}" ` +
+        `data-act="setTab" data-tab="render" title="Render settings" aria-label="Render settings">⚙</button>` +
         `<button type="button" class="whud__collapse-btn" data-act="toggleCollapse" ` +
         `title="${collapsed ? "Expand panel" : "Collapse panel"}" ` +
         `aria-label="${collapsed ? "Expand panel" : "Collapse panel"}">${collapsed ? "\u2039" : "\u203A"}</button>` +
         `</div>`,
       `<div class="whud__status">L${level} · ${dx}×${dy}×${dz}${loading ? " · loading…" : ""}${picking.pickMode ? " · PICK" : ""}${residency.brickLevel !== undefined ? ` · ROI L${residency.brickLevel}` : ""}</div>`,
-      section(openSections, "data", "Data", dataBody),
-      section(openSections, "tf", "Transfer Function", tfBody),
-      section(openSections, "render", "Render", renderBody),
-      section(openSections, "lighting", "Lighting", lightingBody),
-      section(openSections, "slices", "Slices", slicesBody),
-      section(openSections, "crop", "Crop", cropBody),
-      section(openSections, "measure", "Measure", measureBody),
-      section(openSections, "postfx", "Post FX", postfxBody),
-      section(openSections, "presets", "Presets", presetsBody),
+      sectionsHtml,
       `<div class="whud__hint">Pan: Space+drag / Shift / middle / right · wheel zooms to cursor · P / Ctrl+click pick · [ ] LOD · O open</div>`,
     ].join("");
     ui.scrollTop = savedScrollTop;
 
+    // Only one section open at a time, within the active tab - opening one closes the others (both in
+    // openSections and in the live DOM, so the browser's own <details> state agrees immediately without
+    // a full renderUi() rebuild).
     for (const el of ui.querySelectorAll<HTMLDetailsElement>("details.whud__section")) {
       const id = el.dataset.section as PanelId | undefined;
       if (!id) continue;
       el.addEventListener("toggle", () => {
-        if (el.open) openSections.add(id);
-        else openSections.delete(id);
+        if (el.open) {
+          openSections.clear();
+          openSections.add(id);
+          for (const other of ui.querySelectorAll<HTMLDetailsElement>("details.whud__section")) {
+            if (other !== el) other.open = false;
+          }
+        } else {
+          openSections.delete(id);
+        }
       });
     }
 
@@ -876,6 +939,7 @@ export async function run(
     taau,
     residency,
     picking,
+    cropDrag,
     openSections,
     getSource: () => source,
     getLevel: () => level,
@@ -889,6 +953,10 @@ export async function run(
     getCollapsed: () => collapsed,
     setCollapsed: (v) => {
       collapsed = v;
+    },
+    getActiveTab: () => activeTab,
+    setActiveTab: (v) => {
+      activeTab = v;
     },
     applyLevel: (next) => void applyLevel(next),
     applyRender: () => applyRender(),
@@ -963,6 +1031,7 @@ export async function run(
       } else if (e.code === "KeyP") {
         picking.togglePickMode();
         openSections.add("measure");
+        activeTab = "volume";
         renderUi();
       } else if (e.code === "KeyS") {
         cropping.showPlanes = !cropping.showPlanes;
@@ -990,6 +1059,11 @@ export async function run(
       } else if (e.code === "KeyL") {
         debugLightAdd = !debugLightAdd;
         requestRender();
+      } else if (e.code === "KeyC") {
+        cropDrag.toggleCropMode();
+        openSections.add("crop");
+        activeTab = "volume";
+        renderUi();
       }
     })();
   });
@@ -1026,7 +1100,15 @@ export async function run(
     // per frame, so camsEqual falsely reports "unchanged" and the canvas freezes mid-interaction while the
     // UI keeps responding. isAnimating compares normalized directions + relative distance error, so it is
     // scale-independent and stays true throughout any drag / damping catch-up.
-    if (controls.isAnimating || !camsEqual(camNow, lastRenderCam)) requestRender();
+    // isAnimating's damping-convergence thresholds are intentionally tight (see its own doc comment),
+    // so its exponential tail can keep reporting "still animating" for longer than the eye can tell the
+    // difference - if TAAU has already fully converged (settled image, sampleCount at the cap), that
+    // lingering true stops mattering: once the accumulated image is as good as it's going to get, more
+    // frames only cost time (each one re-runs the full per-sample lighting path, since half-res/
+    // half-res-lighting are both off once settled - see `settled` below) without improving anything, so
+    // don't let isAnimating alone keep the loop rendering past that point.
+    const taauFullyConverged = rendering.temporalAA && taau.sampleCount >= taau.maxAccum;
+    if ((controls.isAnimating && !taauFullyConverged) || !camsEqual(camNow, lastRenderCam)) requestRender();
     if (canvas.width !== lastRenderW || canvas.height !== lastRenderH) requestRender();
     if (renderFrames <= 0) return;
     renderFrames -= 1;
@@ -1117,6 +1199,8 @@ export async function run(
     // into the settled image people actually look at / screenshot.
     const settled = residency.idle >= NAV_SETTLE && Math.abs(navSampleDist - rendering.sampleDist) < 0.02;
     fxPipeline.setRenderScale(rendering.halfRes && !settled ? 0.5 : 1);
+    controls.invertX = rendering.invertOrbitX;
+    controls.invertY = rendering.invertOrbitY;
     // Volume → linear HDR, then the post stack to the swapchain (one encoder / one submit). The DOM
     // overlay (gizmo + scale bar) draws to a separate canvas and is unaffected.
     const rw = Math.max(1, Math.round(canvas.width * fxPipeline.renderScale));
@@ -1187,11 +1271,46 @@ export async function run(
       worldPerPxToDisplay: (worldPerPx) => units.fromSim(worldPerPx, units.LENGTH, sim).to(rulerUnit),
       unitSymbol: rulerUnit.symbol,
     });
+    // Crop-box wireframe: only while crop mode is on (see item 6's plan - avoids visual clutter
+    // otherwise). Projects the box's 8 world corners through the current (un-jittered) viewProj.
+    const cropBox = cropDrag.cropMode && rendering.viewMode === "volume"
+      ? (() => {
+          const world = cropWorldBox(cropping.cropMin, cropping.cropMax, sizeSim);
+          // Project in the WebGPU canvas's own backing-store aspect ratio - the same one
+          // proj.perspective() above used (canvas.width / canvas.height) - then scale down to CSS
+          // pixels for the overlay canvas's own (already dpr-transformed) drawing space. Using
+          // canvas.clientWidth/clientHeight directly here would assume that ratio exactly matches
+          // canvas.width/canvas.height's, which independent per-axis Math.floor(css*dpr) rounding
+          // during canvas resize doesn't guarantee - a small mismatch reads as a skewed box.
+          const bw = canvas.width || 1;
+          const bh = canvas.height || 1;
+          const cssPerBackingX = (canvas.clientWidth || 1) / bw;
+          const cssPerBackingY = (canvas.clientHeight || 1) / bh;
+          const corners = boxCorners(world.min, world.max).map(([x, y, z]) => {
+            const p = worldToScreen(lastViewProj, x, y, z, bw, bh);
+            return p ? ([p[0] * cssPerBackingX, p[1] * cssPerBackingY] as [number, number]) : null;
+          });
+          return { corners, highlight: cropDrag.activeFace };
+        })()
+      : undefined;
+    // De-roll the gizmo's basis: "trackball" orbiting (this app's default) has no fixed up axis, so
+    // the camera's *actual* right/up accumulate roll as you free-rotate. Passing the raw camera basis
+    // to the gizmo makes the volume's fixed world axes look like they're spinning/tilting purely from
+    // that incidental roll. derollCameraBasis reconstructs right/up as if roll were always zero
+    // relative to a reference "up" axis, so the gizmo reads as "how is the volume oriented on screen"
+    // rather than "how is the camera currently rolled" — forward is unaffected (roll doesn't change
+    // view direction). The reference is world Z, not Y: this viewer's camera/orbit math is internally
+    // Y-up (an arbitrary render-space choice, unrelated to the data), but for tomography data Z is the
+    // dataset's own stack axis (world Z = dataset Z directly, no separate volume transform in this
+    // app) and reads as "vertical" to the people looking at it - that's the axis the gizmo should hold
+    // steady, independent of which axis OrbitControls happens to use internally for navigation.
+    const gizmoBasis = derollCameraBasis(basis.forward, basis.right, basis.up, [0, 0, 1]);
     overlay.draw({
-      right: basis.right,
-      up: basis.up,
+      right: gizmoBasis.right,
+      up: gizmoBasis.up,
       forward: basis.forward,
       ruler,
+      cropBox,
     });
 
     // Milestone 6 (B3) Step 7: live GPU-ms readout in the Lighting panel for A/B-comparing the

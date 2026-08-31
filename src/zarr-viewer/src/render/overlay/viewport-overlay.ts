@@ -1,16 +1,20 @@
 /**
  * ViewportOverlay — a lightweight full-viewport 2D overlay drawn over the WebGPU render (not the HUD).
  *
- * Two read-only indicators, redrawn every frame:
+ * Read-only indicators, redrawn every frame:
  *   - an **axis gizmo** (bottom-right): color-coded R/G/B lines for world X/Y/Z, oriented by the current
  *     camera basis, so you can always read which way the volume is facing while you orbit;
  *   - **X/Y rulers** along the bottom and left edges: tick marks (major + minor) labelled with physical
- *     distances, usable like a ruler to gauge on-screen size.
+ *     distances, usable like a ruler to gauge on-screen size;
+ *   - a **crop-box wireframe** (only while crop mode is on): the 12 edges of the crop box, with the
+ *     currently hovered/dragged face's 4 edges highlighted.
  *
- * It's a pure 2D-canvas drawer: the viewer supplies the camera basis vectors and a pre-computed ruler
- * descriptor (major spacing in px + physical value per major + unit) — all unit/geometry math stays in
- * the viewer. The canvas is `pointer-events: none` so it never intercepts orbit/pan drags, and it sits
- * over the dark render, so strokes/text are light with a soft dark shadow for legibility.
+ * It's a pure 2D-canvas drawer: the viewer supplies the camera basis vectors, a pre-computed ruler
+ * descriptor (major spacing in px + physical value per major + unit), and already screen-projected crop
+ * box corners — all unit/geometry math stays in the viewer (this module must not import from `viewer/`,
+ * which is a one-way dependency in this codebase). The canvas is `pointer-events: none` so it never
+ * intercepts orbit/pan drags, and it sits over the dark render, so strokes/text are light with a soft
+ * dark shadow for legibility.
  *
  * @packageDocumentation
  */
@@ -27,7 +31,20 @@ export interface OverlayRuler {
   unitLabel: string;
 }
 
-/** Per-frame draw inputs: the camera world basis (unit vectors) + an optional ruler. */
+/**
+ * The crop box's 8 corners, already projected to CSS-pixel screen space by the viewer (see
+ * `viewer/volume/crop-drag-geometry.ts`'s `boxCorners`/`worldToScreen`) — indexed by the same
+ * bit0=x/bit1=y/bit2=z convention `boxCorners()` uses. A `null` entry is a corner behind the camera;
+ * edges touching it are skipped.
+ */
+export interface OverlayCropBox {
+  corners: ([number, number] | null)[];
+  /** The currently hovered/dragged face, highlighted in an accent color, or undefined for none. */
+  highlight?: { axis: 0 | 1 | 2; side: "min" | "max" };
+}
+
+/** Per-frame draw inputs: the camera world basis (unit vectors), an optional ruler, and an optional
+ * crop-box wireframe. */
 export interface OverlayDrawParams {
   /** Camera right axis in world space (world X maps here). */
   right: [number, number, number];
@@ -37,9 +54,36 @@ export interface OverlayDrawParams {
   forward: [number, number, number];
   /** Ruler to draw along the edges, or null when it can't be computed this frame. */
   ruler: OverlayRuler | null;
+  /** Crop box to draw (only while crop mode is on), or undefined/null to draw nothing. */
+  cropBox?: OverlayCropBox | null;
 }
 
 const GIZMO_R = 22;
+
+/** The 12 edges of a box, as pairs of `OverlayCropBox.corners` indices (differ in exactly one bit) —
+ * must match `viewer/volume/crop-drag-geometry.ts`'s `boxCorners()` indexing convention. Duplicated
+ * rather than imported since `render/` doesn't depend on `viewer/` in this codebase; it's a fixed,
+ * 12-entry constant, low risk to keep in sync by hand. */
+const CROP_BOX_EDGES: readonly [number, number][] = [
+  [0, 1], [2, 3], [4, 5], [6, 7],
+  [0, 2], [1, 3], [4, 6], [5, 7],
+  [0, 4], [1, 5], [2, 6], [3, 7],
+];
+
+/** Which axis/side (see `CropFaceAxis`/`"min"|"max"`) each edge belongs to, for highlight matching —
+ * an edge belongs to a face if it lies entirely on that face's plane, i.e. both its corner indices
+ * share the same bit for that axis. */
+function edgeFaces(a: number, b: number): { axis: 0 | 1 | 2; side: "min" | "max" }[] {
+  const faces: { axis: 0 | 1 | 2; side: "min" | "max" }[] = [];
+  const axes: (0 | 1 | 2)[] = [0, 1, 2];
+  for (const axis of axes) {
+    const bit = 1 << axis;
+    if ((a & bit) === (b & bit)) {
+      faces.push({ axis, side: (a & bit) === 0 ? "min" : "max" });
+    }
+  }
+  return faces;
+}
 
 const AXES: { v: readonly [number, number, number]; color: string; label: string }[] = [
   { v: [1, 0, 0], color: "#e5484d", label: "X" },
@@ -86,14 +130,36 @@ export class ViewportOverlay {
     this.canvas.height = Math.round(cssH * dpr);
   }
 
-  /** Redraw the rulers + gizmo for the current camera basis. Call once per frame. */
+  /** Redraw the rulers + gizmo + crop box for the current camera basis. Call once per frame. */
   public draw(params: OverlayDrawParams): void {
     this.syncSize();
     const ctx = this.ctx;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.clearRect(0, 0, this.cssW, this.cssH);
+    if (params.cropBox) this.drawCropBox(params.cropBox);
     if (params.ruler) this.drawRulers(params.ruler);
     this.drawGizmo(params);
+  }
+
+  private drawCropBox(box: OverlayCropBox): void {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.lineWidth = 1.5;
+    for (const [a, b] of CROP_BOX_EDGES) {
+      const pa = box.corners[a];
+      const pb = box.corners[b];
+      if (!pa || !pb) continue;
+      const highlighted =
+        box.highlight !== undefined &&
+        edgeFaces(a, b).some((f) => f.axis === box.highlight!.axis && f.side === box.highlight!.side);
+      ctx.strokeStyle = highlighted ? "#5b9dd9" : "rgba(255,255,255,0.55)";
+      ctx.lineWidth = highlighted ? 2.5 : 1.5;
+      ctx.beginPath();
+      ctx.moveTo(pa[0], pa[1]);
+      ctx.lineTo(pb[0], pb[1]);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   private drawRulers(r: OverlayRuler): void {

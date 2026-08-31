@@ -114,6 +114,10 @@ export class OrbitControls implements Controller {
   public damping = 12;
   /** When false, pointer/wheel input is ignored. */
   public enabled = true;
+  /** Invert horizontal orbit drag direction. Default off (unchanged existing behavior). */
+  public invertX = false;
+  /** Invert vertical orbit drag direction. Default off (unchanged existing behavior). */
+  public invertY = false;
   /**
    * Optional gate for pointerdown/wheel. Return `false` to ignore the event (e.g. when a UI overlay
    * chrome is under the cursor).
@@ -192,8 +196,10 @@ export class OrbitControls implements Controller {
       this.lastX = e.clientX;
       this.lastY = e.clientY;
       if (this.dragging === "orbit") {
-        if (this.mode === "turntable") this.orbitTurntable(dx, dy);
-        else this.orbitTrackball(dx, dy);
+        const idx = this.invertX ? -dx : dx;
+        const idy = this.invertY ? -dy : dy;
+        if (this.mode === "turntable") this.orbitTurntable(idx, idy);
+        else this.orbitTrackball(idx, idy);
       } else {
         this.panBy(dx, dy);
       }
