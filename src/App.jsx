@@ -233,7 +233,7 @@ function App() {
     <div id="app" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
       <Header
         logoUrl="images/als_logo_wheel.png"
-        title="Tomography Visualizer powered by itk-vtk-viewer"
+        title="Tomography Volume Renderer"
         onSelect={openTab}
         onShare={handleShare}
         canShare={!!shareTargetId}

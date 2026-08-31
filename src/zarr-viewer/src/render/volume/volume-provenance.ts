@@ -1,15 +1,10 @@
 /**
- * Pure derivations for the volume renderer's export provenance and on-screen approximate-shading
- * banner. No GPU calls, no class state.
+ * Pure derivations for the volume renderer's export provenance. No GPU calls, no class state.
  *
  * @packageDocumentation
  */
 
-import {
-  specializationFor,
-  approximateShadingLabel,
-  type ShaderConfigName,
-} from "../accel/shader-config.js";
+import { specializationFor, type ShaderConfigName } from "../accel/shader-config.js";
 import type { RenderProvenance } from "../accel/provenance.js";
 
 /**
@@ -36,9 +31,4 @@ export function computeProvenance(
     extendedPreIntegration: spec.preIntegrate,
     ...extras,
   };
-}
-
-/** Visible approximate-shading banner for `shaderConfig`, or `null` when none is active. */
-export function approximateShadingBanner(shaderConfig: ShaderConfigName): string | null {
-  return approximateShadingLabel(specializationFor(shaderConfig));
 }

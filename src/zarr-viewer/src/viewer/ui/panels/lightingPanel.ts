@@ -1,7 +1,7 @@
 /**
  * HUD "Lighting" panel: three light modes (global directional / camera flashlight / 4-corner stage)
  * each with color + intensity, shared shading params, volumetric shadows, ambient occlusion, and the
- * half-res / temporal-AA / high-res-ROI levers. Pure string builder.
+ * half-res / temporal-AA levers. Pure string builder.
  *
  * @packageDocumentation
  */
@@ -9,12 +9,8 @@
 import type { WebGpuRenderingState } from "../../RenderingState.js";
 import { slider, colorRow } from "../html.js";
 
-export function lightingPanelBody(params: {
-  rendering: WebGpuRenderingState;
-  roiEnabled: boolean;
-  roiProgress: { loaded: number; total: number } | null;
-}): string {
-  const { rendering: r, roiEnabled, roiProgress } = params;
+export function lightingPanelBody(params: { rendering: WebGpuRenderingState }): string {
+  const { rendering: r } = params;
   return [
     `<label class="whud__check"><input type="checkbox" data-chk="lightGlobalOn" ${r.lightGlobalOn ? "checked" : ""}/> Global directional</label>`,
     colorRow("lightGlobalColor", "Color", r.lightGlobalColor),
@@ -51,18 +47,6 @@ export function lightingPanelBody(params: {
     `<label class="whud__check"><input type="checkbox" data-chk="temporalAA" ${r.temporalAA ? "checked" : ""}/> Temporal AA (accumulate when still)</label>`,
     `<label class="whud__check"><input type="checkbox" data-chk="gbufferLighting" ${r.gbufferLighting ? "checked" : ""}/> Half-res lighting while navigating (experimental)</label>`,
     `<div class="whud__hint" style="margin-top:2px">GPU: <span id="gpuMsLabel">–</span> ms (volume pass)</div>`,
-    `<label class="whud__check"><input type="checkbox" data-chk="roiEnabled" ${roiEnabled ? "checked" : ""}/> High-res ROI (stream visible detail)</label>`,
-    `<div id="roiProgressWrap" style="margin-top:6px;${roiProgress ? "" : "display:none"}">` +
-      `<div style="display:flex;justify-content:space-between;font-size:10px;opacity:0.85">` +
-      `<span>Streaming ROI…</span>` +
-      `<span id="roiProgressLabel">${roiProgress ? `${roiProgress.loaded}/${roiProgress.total} chunks` : ""}</span>` +
-      `</div>` +
-      `<div style="height:4px;margin-top:2px;background:rgba(255,255,255,0.15);border-radius:2px;overflow:hidden">` +
-      `<div id="roiProgressFill" style="height:100%;background:#5b9dd9;transition:width 0.1s linear;width:${
-        roiProgress && roiProgress.total ? Math.round((roiProgress.loaded / roiProgress.total) * 100) : 0
-      }%"></div>` +
-      `</div>` +
-      `</div>`,
     `<div class="whud__hint">Shadows + AO cast secondary rays per sample. Enable half-res on large volumes to keep it interactive.</div>`,
   ].join("");
 }

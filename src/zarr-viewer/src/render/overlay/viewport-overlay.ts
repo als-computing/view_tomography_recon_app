@@ -37,11 +37,6 @@ export interface OverlayDrawParams {
   forward: [number, number, number];
   /** Ruler to draw along the edges, or null when it can't be computed this frame. */
   ruler: OverlayRuler | null;
-  /**
-   * Visible approximate-shading provenance banner (top of the viewport). Required whenever
-   * multi-scatter octaves or bent-normal ambient are active — not buried in a settings panel.
-   */
-  banner?: string | null;
 }
 
 const GIZMO_R = 22;
@@ -97,26 +92,8 @@ export class ViewportOverlay {
     const ctx = this.ctx;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.clearRect(0, 0, this.cssW, this.cssH);
-    if (params.banner) this.drawBanner(params.banner);
     if (params.ruler) this.drawRulers(params.ruler);
     this.drawGizmo(params);
-  }
-
-  private drawBanner(text: string): void {
-    const ctx = this.ctx;
-    ctx.save();
-    ctx.font = "600 12px system-ui, -apple-system, sans-serif";
-    const padX = 10;
-    const padY = 6;
-    const w = ctx.measureText(text).width + padX * 2;
-    const h = 22;
-    ctx.fillStyle = "rgba(120, 40, 10, 0.82)";
-    ctx.fillRect(8, 8, w, h);
-    ctx.fillStyle = "#ffe7c2";
-    ctx.textAlign = "left";
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, 8 + padX, 8 + h / 2);
-    ctx.restore();
   }
 
   private drawRulers(r: OverlayRuler): void {

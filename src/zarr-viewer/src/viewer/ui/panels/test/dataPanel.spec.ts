@@ -31,6 +31,8 @@ describe("dataPanelBody", () => {
       loading: false,
       maxTex: 2048,
       unit: units.micrometer,
+      roiEnabled: false,
+      roiProgress: null,
     });
     expect(html).toContain('data-level="0"');
     expect(html).toContain('data-level="1"');
@@ -49,6 +51,8 @@ describe("dataPanelBody", () => {
       loading: true,
       maxTex: 2048,
       unit: units.micrometer,
+      roiEnabled: false,
+      roiProgress: null,
     });
     expect(html).toContain("disabled");
   });
@@ -61,6 +65,8 @@ describe("dataPanelBody", () => {
       loading: false,
       maxTex: 256,
       unit: units.micrometer,
+      roiEnabled: false,
+      roiProgress: null,
     });
     expect(html).toContain("L0 needs 512");
     expect(html).toContain("GPU max 256");
@@ -74,7 +80,39 @@ describe("dataPanelBody", () => {
       loading: false,
       maxTex: 4096,
       unit: units.micrometer,
+      roiEnabled: false,
+      roiProgress: null,
     });
     expect(html).not.toContain("needs");
+  });
+
+  it("hides the ROI progress bar when no stream is in flight", () => {
+    const html = dataPanelBody({
+      source: fakeSource(),
+      levels: [0, 1, 2],
+      level: 1,
+      loading: false,
+      maxTex: 2048,
+      unit: units.micrometer,
+      roiEnabled: false,
+      roiProgress: null,
+    });
+    const idx = html.indexOf('id="roiProgressWrap"');
+    expect(html.slice(idx, idx + 60)).toContain("display:none");
+  });
+
+  it("shows the ROI progress bar with loaded/total counts while streaming", () => {
+    const html = dataPanelBody({
+      source: fakeSource(),
+      levels: [0, 1, 2],
+      level: 1,
+      loading: false,
+      maxTex: 2048,
+      unit: units.micrometer,
+      roiEnabled: true,
+      roiProgress: { loaded: 3, total: 10 },
+    });
+    expect(html).toContain("3/10 chunks");
+    expect(html).toContain("width:30%");
   });
 });

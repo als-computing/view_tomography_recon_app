@@ -20,7 +20,7 @@ import type { VisibilityFeedback } from "../accel/visibility.js";
 import { VolumeAcceleration } from "../accel/volume-acceleration.js";
 import { LightingPass, type LightingPassGbuffer } from "../accel/lighting-pass.js";
 import type { RenderGraph, ResourceHandle } from "../graph/render-graph.js";
-import { computeProvenance, approximateShadingBanner } from "./volume-provenance.js";
+import { computeProvenance } from "./volume-provenance.js";
 import {
   applyLiquidShading,
   applyMeasurePlane,
@@ -518,11 +518,6 @@ export class VolumeRenderer implements Disposable {
       this.shadowEnable,
       extras,
     );
-  }
-
-  /** Visible approximate-shading banner, or `null` when none is active. */
-  public approximateShadingBanner(): string | null {
-    return approximateShadingBanner(this.shaderConfig);
   }
 
   public setViewMode(mode: VolumeViewMode): void {

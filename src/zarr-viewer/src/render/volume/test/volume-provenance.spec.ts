@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { approximateShadingBanner, computeProvenance } from "../volume-provenance.js";
+import { computeProvenance } from "../volume-provenance.js";
 
 describe("computeProvenance", () => {
   it("reports the real shadow representation and taau frame count for baseline", () => {
@@ -31,18 +31,5 @@ describe("computeProvenance", () => {
     expect(computeProvenance("baseline", "tf-hash", 1, 0, false).extendedPreIntegration).toBe(false);
     expect(computeProvenance("fast", "tf-hash", 1, 0, false).extendedPreIntegration).toBe(false);
     expect(computeProvenance("quality", "tf-hash", 1, 0, false).extendedPreIntegration).toBe(true);
-  });
-});
-
-describe("approximateShadingBanner", () => {
-  it("is null for baseline and fast", () => {
-    expect(approximateShadingBanner("baseline")).toBeNull();
-    expect(approximateShadingBanner("fast")).toBeNull();
-  });
-
-  it("describes active approximations for quality", () => {
-    expect(approximateShadingBanner("quality")).toBe(
-      "Approximate shading: multi-scatter ×2, bent-normal ambient",
-    );
   });
 });

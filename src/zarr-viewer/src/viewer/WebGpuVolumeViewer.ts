@@ -574,6 +574,39 @@ export async function run(
   const enterViewMode = (mode: VolumeViewMode, reframe = true): void =>
     enterViewModePure(cameraCtx, mode, rendering, cropping, applyRender, reframe);
 
+  /** Recenter the camera on the whole volume, regardless of the current view mode (the "Home" button). */
+  const homeCamera = (): void => {
+    frameSliceCameraPure(cameraCtx, "volume", { x: cropping.sliceX, y: cropping.sliceY, z: cropping.sliceZ });
+    applyRender();
+  };
+
+  // Floating "Home" button, hovering over the top-right of the canvas — reuses the same stage element
+  // ViewportOverlay attaches into (see below), positioned above it (higher z-index) since the overlay
+  // itself is pointer-events:none and would otherwise sit "on top" visually but never intercept clicks.
+  const homeButton = document.createElement("button");
+  homeButton.type = "button";
+  homeButton.className = "whud-home-btn";
+  homeButton.title = "Recenter on the whole volume";
+  homeButton.setAttribute("aria-label", "Recenter on the whole volume");
+  homeButton.textContent = "⌂";
+  Object.assign(homeButton.style, {
+    position: "absolute",
+    top: "12px",
+    right: "12px",
+    zIndex: "3",
+    width: "32px",
+    height: "32px",
+    borderRadius: "6px",
+    border: "1px solid rgba(255,255,255,0.18)",
+    background: "rgba(20,20,26,0.72)",
+    color: "#e8e8ec",
+    font: "16px system-ui, sans-serif",
+    cursor: "pointer",
+  });
+  homeButton.addEventListener("click", () => homeCamera());
+  (canvas.parentElement ?? document.body).appendChild(homeButton);
+  session.onDispose(() => homeButton.remove());
+
   // Switch view mode (and, for the plane modes, the slice it enables) then notify listeners — view
   // mode carries both a render mode and slice enables/overlays, so both change events fire together.
   const setViewModeAndEmit = (
@@ -736,7 +769,16 @@ export async function run(
     const [dx, dy, dz] = source.dimensionsAt(level);
     const unit = lengthUnit();
 
-    const dataBody = dataPanelBody({ source, levels, level, loading, maxTex, unit });
+    const dataBody = dataPanelBody({
+      source,
+      levels,
+      level,
+      loading,
+      maxTex,
+      unit,
+      roiEnabled: residency.isEnabled,
+      roiProgress: residency.progress,
+    });
     const tfBody = tfPanelBody(rendering);
     const renderBody = renderPanelBody(rendering);
 
@@ -760,11 +802,7 @@ export async function run(
       u3: um3(),
     });
     const postfxBody = postfxPanelBody(rendering);
-    const lightingBody = lightingPanelBody({
-      rendering,
-      roiEnabled: residency.isEnabled,
-      roiProgress: residency.progress,
-    });
+    const lightingBody = lightingPanelBody({ rendering });
 
     // Presets section — sanitize the selection against the current preset list before rendering, so
     // it stays valid across preset add/remove and HUD rebuilds.
@@ -772,9 +810,15 @@ export async function run(
     selectedPreset = sanitizeSelectedPreset(selectedPreset, presetNames);
     const presetsBody = presetsPanelBody(presetNames, selectedPreset);
 
+    // Reassigning innerHTML resets the container's native scrollTop to 0 in every browser - since
+    // renderUi() rebuilds the whole sidebar on many routine interactions (not just rare ones), that
+    // reset was the actual cause of the HUD "feeling slow to scroll/interact with": every such
+    // interaction silently snapped the sidebar back to the top. <details> open/close state already
+    // survives via `openSections`; scroll position needs the same explicit save/restore.
+    const savedScrollTop = ui.scrollTop;
     ui.innerHTML = [
       `<div class="whud__header">` +
-        `<span class="whud__title">OME-Zarr viewer</span>` +
+        `<span class="whud__title">Tomography Volume Renderer</span>` +
         `<button type="button" class="whud__collapse-btn" data-act="toggleCollapse" ` +
         `title="${collapsed ? "Expand panel" : "Collapse panel"}" ` +
         `aria-label="${collapsed ? "Expand panel" : "Collapse panel"}">${collapsed ? "\u2039" : "\u203A"}</button>` +
@@ -791,6 +835,7 @@ export async function run(
       section(openSections, "presets", "Presets", presetsBody),
       `<div class="whud__hint">Pan: Space+drag / Shift / middle / right · wheel zooms to cursor · P / Ctrl+click pick · [ ] LOD · O open</div>`,
     ].join("");
+    ui.scrollTop = savedScrollTop;
 
     for (const el of ui.querySelectorAll<HTMLDetailsElement>("details.whud__section")) {
       const id = el.dataset.section as PanelId | undefined;
@@ -1147,7 +1192,6 @@ export async function run(
       up: basis.up,
       forward: basis.forward,
       ruler,
-      banner: volumeRenderer.approximateShadingBanner(),
     });
 
     // Milestone 6 (B3) Step 7: live GPU-ms readout in the Lighting panel for A/B-comparing the
