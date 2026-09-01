@@ -12,8 +12,8 @@ import { PREINTEGRATION_SIGMA_MAX } from "../volume/preintegration-2d.js";
 import { VOLUME_LIGHTING_SHARED_WGSL } from "./volume-lighting-shared.js";
 import { MASK_BINDING_BASE } from "../volume/volume-bindings.js";
 
-/** Byte size of the volume frame uniform block (mat4 + 23 × vec4 + shadow mat4 + shadowCtl + camRight/camUp). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 544;
+/** Byte size of the volume frame uniform block (mat4 + 24 × vec4 + shadow mat4 + shadowCtl + camRight/camUp). */
+export const VOLUME_FRAME_UNIFORM_SIZE = 560;
 
 /** Compile-time specialization for {@link volumeRaymarchWgsl}. */
 export interface VolumeRaymarchSpec {
@@ -67,7 +67,7 @@ struct Frame {
   cropMax: vec4<f32>,        // xyz = crop max in uvw [0,1]
   slices: vec4<f32>,         // xyz = slice positions in uvw [0,1], w = packed flags
   liquid: vec4<f32>,         // x = ior, y = roughness, z = envIntensity, w = absorptionScale
-  composite: vec4<f32>,      // x = alphaComposite, y = linear-HDR, z = ERT threshold, w unused
+  composite: vec4<f32>,      // x = alphaComposite, y = linear-HDR, z = ERT threshold, w = deferLighting
   lightCtl0: vec4<f32>,      // x = numLights, y = masterAmbient, z = specStrength, w = roughness
   lightCtl1: vec4<f32>,      // x = shadowEnable, y = shadowSteps, z = shadowStrength, w = shadowSoftness
   lightCtl2: vec4<f32>,      // x = aoEnable, y = aoRadius (uvw frac), z = aoIntensity, w = aoSamples
@@ -84,6 +84,7 @@ struct Frame {
   camUp: vec4<f32>,          // xyz = camera up axis (world, unit),    w = tan(halfFovY)
   mask0Ctl: vec4<f32>,       // x = mask0Enable, yzw = mask0 voxel dims (item 7 Phase B, slot 0)
   mask1Ctl: vec4<f32>,       // x = mask1Enable, yzw = mask1 voxel dims (item 7 Phase B, slot 1)
+  skipCtl: vec4<f32>,        // x = lowDensitySkipThreshold (Phase 1e hardening), yzw unused
 };
 
 struct OccCell { dmin: f32, dmax: f32, dist: f32, occupied: f32 }
@@ -728,7 +729,11 @@ fn marchColor(
     }
 
     let density = sampleDensity(uvw);
-    if (density < 0.01 && blendMode == 0) {
+    // Phase 1e hardening: frame.skipCtl.x is min(0.01, the lowest density at which the current TF is
+    // actually non-transparent) - computed CPU-side from the baked LUT (see VolumeRenderer's
+    // setTransferFunction). A TF with nothing opaque below 0.01 behaves exactly as before; a TF with a
+    // narrow opaque feature below 0.01 tightens the threshold so that feature is never skipped past.
+    if (density < frame.skipCtl.x && blendMode == 0) {
       prevDensity = density;
       t += stepNow * 1.75;
       i += 1;
@@ -795,7 +800,11 @@ fn marchColor(
       if (alpha > SHADE_ALPHA_EPS && effAlpha > SHADE_ALPHA_EPS) {
         // Gate the expensive shadow/AO rays to samples that still meaningfully affect the image:
         // in front of the volume (remaining transmittance high) and locally opaque enough to matter.
-        let heavy = (1.0 - color.a) > 0.03 && alpha > 0.03;
+        // frame.composite.w (deferLighting) forces this off outright when a separate half-res
+        // LightingPass is going to compute AO/shadow/multi-scatter for this frame instead - without
+        // this, the inline march would pay the full heavy cost AND a second half-res computation would
+        // redo it, making "deferred" lighting strictly more expensive than not deferring at all.
+        let heavy = frame.composite.w < 0.5 && (1.0 - color.a) > 0.03 && alpha > 0.03;
         let sseed = fract(jitter + f32(i) * 0.61803399);
         var lit: vec3<f32>;
         var unlit: vec3<f32>;

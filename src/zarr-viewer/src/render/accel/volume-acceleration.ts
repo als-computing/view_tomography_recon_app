@@ -58,6 +58,15 @@ export class VolumeAcceleration implements Disposable {
   private readonly shadowMap: ShadowMap;
   private readonly lightEnv: LightingEnvironment;
   private densityPyramid: DensityPyramid | undefined;
+  // Phase 1d hardening: the pyramid's full mip chain is `rg32float` (8 bytes/voxel) - level 0 alone is
+  // exactly the base volume's voxel count × 8 bytes (~1.0 GiB at 512³, ~8.0 GiB at 1024³), ~1.14×/9.14×
+  // that once the rest of the chain is included. Allocating it unconditionally for every volume load
+  // regardless of whether the active shader config even uses it (only "quality" does, via
+  // spec.preIntegrate) risked silently blowing the GPU memory budget the viewer's own level-2
+  // streaming cap was designed to respect. `pendingVolumeSize` remembers what to allocate *if and when*
+  // a preIntegrate-enabled config is actually selected (see `runPrePasses`) — `notifyVolumeChanged`
+  // itself no longer allocates.
+  private pendingVolumeSize: readonly [number, number, number] | undefined;
   private readonly dummyDensityPyramid: ManagedTexture;
   private disposed = false;
 
@@ -190,15 +199,18 @@ export class VolumeAcceleration implements Disposable {
       this.occupancy?.dispose();
       this.occupancy = new OccupancyGrid(this.device, size);
     }
-    const pyramidSame =
+    const pyramidSizeMatches =
       this.densityPyramid &&
       this.densityPyramid.baseDims[0] === size[0] &&
       this.densityPyramid.baseDims[1] === size[1] &&
       this.densityPyramid.baseDims[2] === size[2];
-    if (!pyramidSame) {
+    if (!pyramidSizeMatches) {
+      // Dispose a stale-size pyramid immediately (can't leave a mismatched-size texture bound), but
+      // don't reallocate here — `runPrePasses` does that lazily, only if a preIntegrate config needs it.
       this.densityPyramid?.dispose();
-      this.densityPyramid = new DensityPyramid(this.device, size);
+      this.densityPyramid = undefined;
     }
+    this.pendingVolumeSize = size;
     this.dirtyOccMinMax = true;
     this.dirtyOccTf = true;
     this.dirtyShadow = true;
@@ -230,10 +242,32 @@ export class VolumeAcceleration implements Disposable {
     // Milestone 3.2: the density mip pyramid feeds the Gaussian-extended pre-integration table's
     // sigma lookup, so it's only needed for shader configs that compile PRE_INTEGRATE in — rebuilt
     // once per volume load, not per frame (`dirtyDensityPyramid` only flips true from
-    // `notifyVolumeChanged`). Not yet consumed by the raymarch bind group (wired in a later step).
-    if (spec.preIntegrate && this.densityPyramid && this.dirtyDensityPyramid && ctx.volumeTex) {
-      this.densityPyramid.rebuildFromVolume(encoder, ctx.volumeTex);
-      this.dirtyDensityPyramid = false;
+    // `notifyVolumeChanged`). Bound at binding 13 and sampled by `sampleVariance()` in the raymarch
+    // shader whenever PRE_INTEGRATE is compiled in.
+    if (spec.preIntegrate && ctx.volumeTex) {
+      // Phase 1d hardening: allocate lazily, right here, only once a preIntegrate config is actually
+      // selected — not on every volume load regardless of shader config (see the field's own doc).
+      // Allocating/disposing changes which GPU texture is bound at binding 13, so — unlike the
+      // occupancy/tile rebuilds below, which reuse their existing buffer — this must mark the bind
+      // group dirty too, or the renderer keeps sampling whatever was bound before (the dummy, or a
+      // stale pyramid) until something unrelated happens to invalidate it.
+      if (!this.densityPyramid && this.pendingVolumeSize) {
+        this.densityPyramid = new DensityPyramid(this.device, this.pendingVolumeSize);
+        this.dirtyDensityPyramid = true;
+        bindGroupDirty = true;
+      }
+      if (this.densityPyramid && this.dirtyDensityPyramid) {
+        this.densityPyramid.rebuildFromVolume(encoder, ctx.volumeTex);
+        this.dirtyDensityPyramid = false;
+      }
+    } else if (this.densityPyramid) {
+      // The active config no longer uses preintegration - free the (potentially multi-GiB) pyramid
+      // rather than hold it for an inactive feature. A shader-config switch is a deliberate HUD action,
+      // not a per-frame event, so freeing eagerly here doesn't thrash the way e.g. camera settle/
+      // unsettle would; flipping back to a preIntegrate config just reallocates+rebuilds above.
+      this.densityPyramid.dispose();
+      this.densityPyramid = undefined;
+      bindGroupDirty = true;
     }
     if (spec.occupancy && this.occupancy && ctx.volumeTex) {
       if (this.dirtyOccMinMax) {

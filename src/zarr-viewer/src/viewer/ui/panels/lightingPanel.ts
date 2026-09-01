@@ -46,7 +46,7 @@ export function lightingPanelBody(params: { rendering: WebGpuRenderingState }): 
     `<label class="whud__check" style="margin-top:6px"><input type="checkbox" data-chk="halfRes" ${r.halfRes ? "checked" : ""}/> Half resolution while navigating</label>`,
     `<label class="whud__check"><input type="checkbox" data-chk="temporalAA" ${r.temporalAA ? "checked" : ""}/> Temporal AA (accumulate when still)</label>`,
     `<label class="whud__check"><input type="checkbox" data-chk="gbufferLighting" ${r.gbufferLighting ? "checked" : ""}/> Half-res lighting while navigating (experimental)</label>`,
-    `<div class="whud__hint" style="margin-top:2px">GPU: <span id="gpuMsLabel">–</span> ms (volume pass)</div>`,
+    `<div class="whud__hint" style="margin-top:2px">GPU: <span id="gpuMsLabel" title="">–</span> ms (hover for per-pass breakdown)</div>`,
     `<div class="whud__hint">Shadows + AO cast secondary rays per sample. Enable half-res on large volumes to keep it interactive.</div>`,
   ].join("");
 }

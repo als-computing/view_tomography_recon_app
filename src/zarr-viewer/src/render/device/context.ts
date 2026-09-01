@@ -34,7 +34,24 @@ export interface GpuContext {
    * filterable option.
    */
   readonly supportsFloat32Filtering: boolean;
+  /**
+   * Whether the device's `maxColorAttachmentBytesPerSample` covers the volume pass's current 6-target
+   * pipeline (1 `rgba16float` color + 1 `r16float` depth + 4 `rgba16float` G-buffer = 42 bytes/sample —
+   * see `GBUFFER_PIPELINE_BYTES_PER_SAMPLE`). The WebGPU spec only *guarantees* 32; this app requests
+   * the adapter's real max (see `createContext`), so on typical desktop hardware this is `true`, but a
+   * constrained device (older/mobile GPU) could genuinely be capped at the 32-byte floor. `false` here
+   * means volume-pipeline creation will fail — checked eagerly (see `VolumePipeline.ensure()`) so that
+   * shows up as one clear, actionable error instead of an opaque WebGPU pipeline-validation failure.
+   * A true bandwidth-reduced pipeline variant that works within 32 bytes/sample is tracked as a
+   * follow-up (see the hardening plan's Phase 1b) — this flag only lets the failure mode be legible in
+   * the meantime, it doesn't yet make the app actually run on such a device.
+   */
+  readonly supportsGbufferTargets: boolean;
 }
+
+/** Bytes/sample the volume pass's current fixed pipeline needs: 1 rgba16float color (8) + 1 r16float
+ * depth (2) + 4 rgba16float G-buffer targets (4×8=32) = 42. See `GpuContext.supportsGbufferTargets`. */
+export const GBUFFER_PIPELINE_BYTES_PER_SAMPLE = 42;
 
 /**
  * Acquire a WebGPU device and configure the canvas for rendering.
@@ -77,8 +94,9 @@ export async function createContext(
   // hundreds of MiB — well past the 256 MiB default `maxBufferSize`. Raise the buffer/binding limits to
   // what the adapter actually supports so `writeTexture` for a large level doesn't fail validation.
   // `maxColorAttachmentBytesPerSample` similarly needs raising past the 32-byte default: the volume
-  // pass's 5 MRT outputs (color + depth-centroid + the Milestone 6 / B3 G-buffer targets) total 34
-  // bytes/sample, and the spec-default limit only guarantees 32.
+  // pass's 6 MRT outputs (color + depth-centroid + the Milestone 6 / B3 G-buffer targets) total 42
+  // bytes/sample (`GBUFFER_PIPELINE_BYTES_PER_SAMPLE`) — comfortably under typical desktop adapters'
+  // real max, but the spec-default floor only guarantees 32 (see `GpuContext.supportsGbufferTargets`).
   const requiredLimits: Record<string, number> = {
     maxBufferSize: adapter.limits.maxBufferSize,
     maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
@@ -87,6 +105,8 @@ export async function createContext(
 
   const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
   const supportsFloat32Filtering = device.features.has("float32-filterable");
+  const supportsGbufferTargets =
+    device.limits.maxColorAttachmentBytesPerSample >= GBUFFER_PIPELINE_BYTES_PER_SAMPLE;
 
   const canvasContext = canvas.getContext("webgpu");
   if (!canvasContext) {
@@ -100,5 +120,5 @@ export async function createContext(
     alphaMode: options.alphaMode ?? "opaque",
   });
 
-  return { adapter, device, canvas, canvasContext, format, supportsFloat32Filtering };
+  return { adapter, device, canvas, canvasContext, format, supportsFloat32Filtering, supportsGbufferTargets };
 }

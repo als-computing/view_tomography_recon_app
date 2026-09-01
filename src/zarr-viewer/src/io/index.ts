@@ -12,6 +12,7 @@ export {
   physicalSizeSim,
   volumeMaxExtentMeters,
   listUploadableLevels,
+  finestTargetLevel,
 } from "./volume/volume-geom.js";
 export type { UploadableLevelOptions } from "./volume/volume-geom.js";
 

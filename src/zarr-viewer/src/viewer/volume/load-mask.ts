@@ -1,8 +1,12 @@
 /**
  * Loads a mask/annotation volume (item 7 Phase B): opens its own {@link VolumeSource} and uploads a
- * single coarse level as raw class ids. Assumed to share the primary volume's exact voxel grid (it's
- * an annotation of that same scan) — no world-AABB/translation handling, unlike the shelved general
- * multi-volume-layer work, which is why this is much simpler than `load-layer.ts`.
+ * single level (matching the primary volume's own target display fidelity, not the pyramid's absolute
+ * coarsest level — see `finestTargetLevel`) as raw class ids. No progressive background refinement
+ * (unlike the primary volume's own boot logic) — deliberately scoped smaller; add it later only if a
+ * single direct load at the target level still isn't sharp enough in practice. Assumed to share the
+ * primary volume's exact voxel grid (it's an annotation of that same scan) — no world-AABB/translation
+ * handling, unlike the shelved general multi-volume-layer work, which is why this is much simpler than
+ * `load-layer.ts`.
  *
  * For now this loads via the same OME-Zarr path as the primary — the only IO format this codebase
  * currently supports. The annotation app's real export format (a TIFF stack) needs its own loader
@@ -12,7 +16,7 @@
  * @packageDocumentation
  */
 
-import { openOmeZarr, httpStore, listUploadableLevels } from "@zarr-viewer/io";
+import { openOmeZarr, httpStore, listUploadableLevels, finestTargetLevel } from "@zarr-viewer/io";
 import {
   uploadMaskVolume,
   uploadMaskArray,
@@ -20,18 +24,39 @@ import {
   type ManagedTexture,
 } from "@zarr-viewer/render";
 
+/**
+ * Default `minDisplayLevel` for {@link loadMaskVolume} when the caller doesn't pass one — matches
+ * `WebGpuVolumeViewer.ts`'s own `MIN_DISPLAY_LEVEL` (kept as a same-value fallback, not the source of
+ * truth: the viewer always passes its own constant explicitly when loading through the HUD, so the two
+ * can't silently drift apart there — this default only matters for a caller that invokes this function
+ * directly, bypassing the viewer).
+ */
+export const DEFAULT_MIN_DISPLAY_LEVEL = 2;
+
 /** A loaded mask dataset: the uploaded GPU texture plus its per-class voxel tally. */
 export interface LoadedMaskVolume {
   readonly texture: ManagedTexture;
   /** Voxel count per class id (index = class id) — see `discoverMaskClasses`. */
   readonly classCounts: Uint32Array;
-  /** The (coarsest uploadable) resolution level actually uploaded — not applicable (`undefined`) for
-   * an array-sourced mask ({@link loadMaskFromArray}), which has no level/pyramid concept. */
+  /** The resolution level actually uploaded — not applicable (`undefined`) for an array-sourced mask
+   * ({@link loadMaskFromArray}), which has no level/pyramid concept. */
   readonly level?: number;
 }
 
-/** Open `url` as an OME-Zarr mask volume and upload its coarsest uploadable level. */
-export async function loadMaskVolume(ctx: GpuContext, url: string): Promise<LoadedMaskVolume> {
+/**
+ * Open `url` as an OME-Zarr mask volume and upload the same target level the primary volume would
+ * display at (see `finestTargetLevel`) — the finest uploadable level that isn't finer than
+ * `minDisplayLevel`, or the coarsest available if the mask's pyramid has nothing that fine. Previously
+ * this always uploaded the pyramid's absolute coarsest level regardless of what the primary volume was
+ * displaying, a real fidelity gap: mask textures are `r8uint` (1 byte/voxel), cheaper to hold at a
+ * given level than the primary's own density texture, so there was no memory reason for masks to stay
+ * coarser than the volume they annotate.
+ */
+export async function loadMaskVolume(
+  ctx: GpuContext,
+  url: string,
+  minDisplayLevel = DEFAULT_MIN_DISPLAY_LEVEL,
+): Promise<LoadedMaskVolume> {
   const store = httpStore(url);
   const source = await openOmeZarr(store, { skipRangeEstimate: true });
 
@@ -40,7 +65,7 @@ export async function loadMaskVolume(ctx: GpuContext, url: string): Promise<Load
   if (levels.length === 0) {
     throw new Error(`Mask has no uploadable resolution level (GPU max 3D texture ${maxTex}).`);
   }
-  const level = levels[levels.length - 1]!; // coarsest uploadable level
+  const level = finestTargetLevel(levels, minDisplayLevel);
 
   const { texture, classCounts } = await uploadMaskVolume(ctx.device, source, { level });
   return { texture, classCounts, level };

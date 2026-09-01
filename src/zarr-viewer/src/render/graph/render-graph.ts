@@ -291,8 +291,13 @@ export class RenderGraph {
     return { order, live, slots, resourceSlot, lifetimes };
   }
 
-  /** Compile and run the graph on the device, then submit the frame. */
-  public execute(): void {
+  /**
+   * Compile and run the graph on the device, then submit the frame. `beforeSubmit`, when given, runs
+   * with the frame's encoder after every pass has recorded its commands but before `queue.submit` —
+   * for work that must see the whole frame's recorded commands first (e.g. resolving a `GpuTimer`'s
+   * query set, which needs every pass's `timestampWrites` to have already been recorded).
+   */
+  public execute(beforeSubmit?: (encoder: GPUCommandEncoder) => void): void {
     const compiled = this.compile();
     const acquired: { key: string; texture: GPUTexture }[] = [];
     const slotTextures = compiled.slots.map((desc) => {
@@ -323,6 +328,7 @@ export class RenderGraph {
     };
 
     for (const p of compiled.order) this.#passes[p]!.execute(ctx);
+    beforeSubmit?.(encoder);
     this.device.queue.submit([encoder.finish()]);
 
     for (const { key, texture } of acquired) this.#release(key, texture);

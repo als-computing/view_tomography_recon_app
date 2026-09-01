@@ -5,8 +5,12 @@
  * fullscreen-triangle render pass, mirroring {@link "./taau".TemporalAccumulator}'s pattern exactly
  * (owned plain `GPUTexture` output, `graph.importTexture` + `graph.addPass` in `resolve()`).
  *
- * Debug-only for now (Step 5): callers read the returned `lightAdd` handle for a visual sanity check.
- * Step 6 will bilateral-upsample it back to full-res and composite it into the final image.
+ * Production path when `rendering.gbufferLighting` is on and the camera is moving: `FxPipeline`
+ * bilateral-upsamples `lightAdd` back to full-res and composites it onto `colorUnlit` (see
+ * `fx-pipeline.ts`'s `LIGHTING_COMPOSITE_WGSL`). The main ray march's own heavy (AO/shadow/multi-
+ * scatter) terms are forced off while this pass runs (`VolumeRenderer.setDeferLighting()`), so this is
+ * the only place those terms are computed that frame. `mode: "debug"` (KeyL) instead blits `lightAdd`
+ * straight to the swapchain for a visual sanity check of this pass in isolation.
  *
  * @packageDocumentation
  */
@@ -65,7 +69,9 @@ ${LIGHT_STRUCT_WGSL}
 @group(0) @binding(10) var surfaceAlbedoTex: texture_2d<f32>;
 
 // Multi-scatter octaves are a quality-only enhancement (Milestone 7.3); this pass doesn't yet know
-// which shader config is active, so it's off here - a known limitation of the debug-only Step 5 pass.
+// which shader config is active, so it's off here - a known limitation of this (production) pass: a
+// moving "quality"-mode frame briefly loses multi-scatter until the camera settles and the main march
+// takes over again.
 const MS_OCTAVES: u32 = 0u;
 
 fn ign(p: vec2<f32>) -> f32 {
@@ -167,7 +173,9 @@ export interface LightingPassInputs {
   fullHeight: number;
 }
 
-/** Evaluates `evaluateLighting()` once per half-res pixel from the G-buffer. Debug-only (Step 5). */
+/** Evaluates `evaluateLighting()` once per half-res pixel from the G-buffer, with `heavy=true` (AO/
+ * shadow/multi-scatter all on) - this is the ONLY place those terms are computed while this pass is
+ * active for a frame (the main march's own heavy gate is forced off, see `setDeferLighting()`). */
 export class LightingPass {
   #w = 0;
   #h = 0;

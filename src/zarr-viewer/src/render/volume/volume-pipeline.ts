@@ -8,8 +8,8 @@
  * @packageDocumentation
  */
 
-import type { Disposable } from "@zarr-viewer/core";
-import type { GpuContext } from "../device/context.js";
+import { PrismError, type Disposable } from "@zarr-viewer/core";
+import { GBUFFER_PIPELINE_BYTES_PER_SAMPLE, type GpuContext } from "../device/context.js";
 import { ManagedBuffer } from "../resources/buffer.js";
 import { PipelineCache } from "../resources/pipeline.js";
 import {
@@ -102,8 +102,24 @@ export class VolumePipeline implements Disposable {
     this.pipeline = undefined;
   }
 
-  /** Build (or reuse) every piece of compile-time state for `shaderConfig`/`colorFormat`. */
+  /**
+   * Build (or reuse) every piece of compile-time state for `shaderConfig`/`colorFormat`.
+   * @throws {@link @zarr-viewer/core#PrismError} (`gpu_error`) if the device can't support the volume
+   * pass's fixed 6-target pipeline (see `GpuContext.supportsGbufferTargets`'s doc) — checked here, up
+   * front, so this fails with one clear, actionable message instead of an opaque WebGPU
+   * pipeline-creation validation error several lines of internal WebGPU machinery later. A pipeline
+   * variant that fits within the guaranteed-minimum 32 bytes/sample is tracked separately (not yet
+   * built) — this only makes the unsupported-device failure legible, it doesn't work around it.
+   */
   public ensure(shaderConfig: ShaderConfigName, colorFormat: GPUTextureFormat): void {
+    if (!this.ctx.supportsGbufferTargets) {
+      throw new PrismError(
+        "gpu_error",
+        `This device's maxColorAttachmentBytesPerSample (${this.ctx.device.limits.maxColorAttachmentBytesPerSample}) ` +
+          `is below what the volume pass's pipeline needs (${GBUFFER_PIPELINE_BYTES_PER_SAMPLE}). ` +
+          "A lower-bandwidth pipeline variant for constrained devices doesn't exist yet.",
+      );
+    }
     if (!this.bindGroupLayout) {
       const visFrag = GPUShaderStage.FRAGMENT;
       const visVert = GPUShaderStage.VERTEX;

@@ -13,6 +13,7 @@ import {
   physicalSizeSim,
   volumeMaxExtentMeters,
   listUploadableLevels,
+  finestTargetLevel as finestTargetLevelPure,
   type VolumeSource,
   type Store,
 } from "@zarr-viewer/io";
@@ -273,12 +274,13 @@ export async function run(
 
   // Finest multiscale level we auto-stream to. 0 = finest/largest; higher = coarser. Full-res levels
   // (0/1) are too large to hold comfortably in a browser GPU for now, so the progressive loader stops
-  // at level 2. Manual level buttons / `[` `]` remain escape hatches to go finer.
+  // at level 2. Manual level buttons / `[` `]` remain escape hatches to go finer. Also governs mask/
+  // annotation layers (see `loadMask`'s call to `loadMaskVolume`) so a loaded mask matches the primary
+  // volume's own displayed fidelity instead of defaulting to the pyramid's absolute coarsest level.
   const MIN_DISPLAY_LEVEL = 2;
   // Finest level we're willing to display: the finest available that isn't below MIN_DISPLAY_LEVEL,
   // or the coarsest level if the dataset has nothing that fine. `levels` is ascending (0 first).
-  const finestTargetLevel = (): number =>
-    levels.find((lv) => lv >= MIN_DISPLAY_LEVEL) ?? levels[levels.length - 1]!;
+  const finestTargetLevel = (): number => finestTargetLevelPure(levels, MIN_DISPLAY_LEVEL);
 
   if (levels.length === 0) {
     const hud = createViewerHud({ position: "bottom-left" });
@@ -657,7 +659,7 @@ export async function run(
     s.url = url;
     renderUi();
     try {
-      applyLoadedMask(slot, await loadMaskVolume(ctx, url));
+      applyLoadedMask(slot, await loadMaskVolume(ctx, url, MIN_DISPLAY_LEVEL));
     } catch (err) {
       s.error = err instanceof Error ? err.message : String(err);
     } finally {
@@ -1490,6 +1492,13 @@ export async function run(
     } else {
       taau.reset();
     }
+    // Phase 1a hardening: the separate half-res LightingPass below only runs while `runLightingPass`
+    // is true - the main ray march must defer its OWN heavy (AO/shadow/multi-scatter) cost exactly
+    // when that's the case, or the "half-res lighting" toggle pays full heavy cost inline AND a second
+    // half-res computation, which is strictly more expensive than not deferring at all. See
+    // VolumeRenderer.setDeferLighting()'s doc comment for the shader-side mechanism.
+    const runLightingPass = debugLightAdd || (rendering.gbufferLighting && !settled);
+    volumeRenderer.setDeferLighting(runLightingPass);
     fxPipeline.render(
       { r: 0.015, g: 0.02, b: 0.035, a: 1 },
       (pass) => {
@@ -1499,10 +1508,10 @@ export async function run(
         volumeRenderer.recordPrePasses(encoder, renderViewProj, camera.position);
       },
       taau,
-      debugLightAdd || (rendering.gbufferLighting && !settled)
+      runLightingPass
         ? {
             recordLighting: (graph, gbuffer, lw, lh) =>
-              volumeRenderer.recordLightingDebug(graph, gbuffer, lw, lh),
+              volumeRenderer.recordLighting(graph, gbuffer, lw, lh),
             mode: debugLightAdd ? "debug" : "composite",
           }
         : undefined,
@@ -1570,12 +1579,18 @@ export async function run(
       cropBox,
     });
 
-    // Milestone 6 (B3) Step 7: live GPU-ms readout in the Lighting panel for A/B-comparing the
-    // half-res lighting toggle's perf impact, without a full renderUi() rebuild every frame.
+    // Live total-GPU-ms readout in the Lighting panel for A/B-comparing the half-res lighting toggle's
+    // perf impact, without a full renderUi() rebuild every frame. Total = sum of every timed pass
+    // (volume + lighting-composite + TAAU currently - see FxPipeline.lastGpuMs's doc for what isn't
+    // included yet); per-pass breakdown is in the tooltip so this stays a single-number HUD readout.
     const gpuMsLabel = ui.querySelector<HTMLElement>("#gpuMsLabel");
     if (gpuMsLabel) {
       const ms = fxPipeline.lastGpuMs;
       gpuMsLabel.textContent = ms === undefined ? "–" : ms.toFixed(2);
+      gpuMsLabel.title =
+        fxPipeline.lastGpuSamples.length > 0
+          ? fxPipeline.lastGpuSamples.map((s) => `${s.label}: ${s.ms.toFixed(2)}ms`).join("\n")
+          : "";
     }
 
     // Record what we just rendered, and keep the budget alive while anything is still converging so the

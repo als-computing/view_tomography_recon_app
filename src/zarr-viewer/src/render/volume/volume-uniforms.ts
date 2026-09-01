@@ -1,5 +1,5 @@
 /**
- * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 136 floats at fixed
+ * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 140 floats at fixed
  * offsets matching `VOLUME_FRAME_UNIFORM_SIZE`/the WGSL `Frame` struct). Kept as a single flat
  * `write()` function rather than incremental setter-driven mutation, since the buffer's whole point is
  * one contiguous upload per frame — see `volume-raymarch.ts` for the WGSL-side layout this must match
@@ -79,6 +79,11 @@ export interface VolumeFrameParams {
   viewMode: VolumeViewMode;
   linearOutput: boolean;
   earlyRayTermination: number;
+  /** Phase 1a hardening: true while a separate half-res LightingPass will compute AO/shadow/multi-
+   * scatter this frame — forces the main march's own `heavy` gate off (see
+   * VolumeRenderer.setDeferLighting()'s doc comment). Packed into `Frame.composite.w`, previously
+   * unused padding. */
+  deferLighting: boolean;
   specStrength: number;
   roughnessL: number;
   shadowEnable: boolean;
@@ -109,6 +114,11 @@ export interface VolumeFrameParams {
   /** Two independent mask/annotation slots (item 7 Phase B), fixed at exactly two — not generalized
    * to N. Both same-grid as the primary — no separate world box. */
   masks: readonly [MaskSlotParams, MaskSlotParams];
+  /** Phase 1e hardening: `min(0.01, lowest density at which the current TF is non-transparent)` —
+   * the raymarch's empty-space skip only ever discards densities below this, so a TF with an opaque
+   * feature under the old fixed 0.01 threshold is never silently dropped. Computed CPU-side from the
+   * baked TF LUT (see `VolumeRenderer.setTransferFunction`). */
+  lowDensitySkipThreshold: number;
 }
 
 /** One mask slot's frame-uniform inputs. */
@@ -121,7 +131,7 @@ export interface MaskSlotParams {
 }
 
 /**
- * Pack one frame's worth of uniforms into `d` (136 floats, fixed offsets — see inline comments for
+ * Pack one frame's worth of uniforms into `d` (140 floats, fixed offsets — see inline comments for
  * each named group). Does not upload to the GPU; the caller writes `d` to the uniform buffer.
  * `invViewProj` must already be the inverted view-projection for this frame.
  */
@@ -199,7 +209,7 @@ export function writeVolumeFrameUniform(
   d[56] = alphaComposite;
   d[57] = p.linearOutput ? 1 : 0; // Frame.composite.y → linear-HDR output flag
   d[58] = p.earlyRayTermination;
-  d[59] = 0;
+  d[59] = p.deferLighting ? 1 : 0; // Frame.composite.w → defer heavy lighting to the half-res pass
   // lightCtl0: numLights, masterAmbient, specStrength, roughness
   d[60] = accel.lightCount;
   d[61] = p.masterAmbient;
@@ -276,4 +286,9 @@ export function writeVolumeFrameUniform(
   d[133] = mask1.dims[0];
   d[134] = mask1.dims[1];
   d[135] = mask1.dims[2];
+  // skipCtl: lowDensitySkipThreshold (Phase 1e hardening), yzw unused.
+  d[136] = p.lowDensitySkipThreshold;
+  d[137] = 0;
+  d[138] = 0;
+  d[139] = 0;
 }

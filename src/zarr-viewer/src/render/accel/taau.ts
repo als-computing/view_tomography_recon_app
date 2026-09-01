@@ -13,6 +13,7 @@
 import { ManagedBuffer } from "../resources/buffer.js";
 import { PipelineCache } from "../resources/pipeline.js";
 import type { RenderGraph, ResourceHandle } from "../graph/render-graph.js";
+import type { GpuTimer } from "./gpu-timer.js";
 
 /** Van der Corput / Halton low-discrepancy sample for sub-pixel jitter. */
 export function halton(index: number, base: number): number {
@@ -200,6 +201,7 @@ export class TemporalAccumulator {
     depth: ResourceHandle,
     w: number,
     h: number,
+    timer?: GpuTimer,
   ): ResourceHandle {
     this.#ensureTextures(w, h);
     this.#ensurePipeline();
@@ -255,6 +257,7 @@ export class TemporalAccumulator {
           colorAttachments: [
             { view: ctx.texture(nextH).createView(), loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: "store" },
           ],
+          timestampWrites: timer?.timestampWrites("taau"),
         });
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, bg);

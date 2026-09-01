@@ -14,7 +14,7 @@
 import type { GpuContext } from "../device/context.js";
 import { RenderGraph, type ResourceHandle } from "../graph/render-graph.js";
 import { PostStack, type Effect } from "@zarr-viewer/fx";
-import { GpuTimer } from "../accel/gpu-timer.js";
+import { GpuTimer, type GpuTimerSample } from "../accel/gpu-timer.js";
 import { PipelineCache } from "../resources/pipeline.js";
 import { ManagedBuffer } from "../resources/buffer.js";
 import type { TemporalAccumulator } from "../accel/taau.js";
@@ -105,9 +105,11 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   let base = floor(hpos);
   let fracPos = hpos - base;
 
-  var sumColor = vec3<f32>(0.0);
+  // rgb = diffuseSpec, a = ambient-occlusion (see LightingPass's doc comment) - filtered together so
+  // AO gets the same edge-stopping bilateral treatment as the color it's spatially correlated with.
+  var sumColor = vec4<f32>(0.0);
   var sumW = 0.0;
-  var sumColorLin = vec3<f32>(0.0);
+  var sumColorLin = vec4<f32>(0.0);
   var sumWLin = 0.0;
   for (var dy = 0; dy < 2; dy = dy + 1) {
     for (var dx = 0; dx < 2; dx = dx + 1) {
@@ -116,7 +118,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
       let neighborUv = (texel + vec2<f32>(0.5)) / halfSize;
       let nD = textureSampleLevel(depthTex, samp, neighborUv, 0.0).r;
       let nN = textureSampleLevel(normalTex, samp, neighborUv, 0.0).xyz;
-      let c = textureLoad(lightAddTex, vec2<i32>(texel), 0).rgb;
+      let c = textureLoad(lightAddTex, vec2<i32>(texel), 0);
       let w = bilateralWeight(fullDepth, nD, fullNormal, nN, params.sigmaDepth, params.sigmaNormal) * bw;
       sumColor += c * w;
       sumW += w;
@@ -124,13 +126,18 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
       sumWLin += bw;
     }
   }
-  var lightAdd = vec3<f32>(0.0);
+  var lightAdd = vec4<f32>(0.0);
   if (sumW > 1e-5) {
     lightAdd = sumColor / sumW;
   } else if (sumWLin > 1e-5) {
     lightAdd = sumColorLin / sumWLin;
   }
-  return vec4<f32>(unlit.rgb + lightAdd, unlit.a);
+  // unlit.rgb carries the ambient+rim terms with NO AO applied (the main march's heavy gate is forced
+  // off while this pass runs - see VolumeRenderer.setDeferLighting()) - apply the real AO (computed
+  // once, here, at half-res) to that ambient base, then add the direct diffuse/spec contribution.
+  // Previously this only ever read lightAdd's .rgb, silently discarding the AO channel entirely.
+  let ao = clamp(lightAdd.a, 0.0, 1.0);
+  return vec4<f32>(unlit.rgb * (1.0 - ao) + lightAdd.rgb, unlit.a);
 }
 `;
 
@@ -163,9 +170,18 @@ export class FxPipeline {
     return this.#renderScale;
   }
 
-  /** Last resolved GPU time for the volume pass, if timestamp-query is available. */
+  /**
+   * Last resolved total GPU frame time (sum of every timed pass — currently volume, lighting-
+   * composite, and TAAU; the post-processing effect chain isn't individually timed, see
+   * `GpuTimer.lastTotalMs`'s doc), if timestamp-query is available.
+   */
   public get lastGpuMs(): number | undefined {
-    return this.#timer.lastSample?.ms;
+    return this.#timer.lastTotalMs;
+  }
+
+  /** Per-pass breakdown backing {@link lastGpuMs}, for a diagnostics view. */
+  public get lastGpuSamples(): readonly GpuTimerSample[] {
+    return this.#timer.lastSamples;
   }
 
   public constructor(ctx: GpuContext) {
@@ -222,12 +238,15 @@ export class FxPipeline {
     const rh = Math.max(1, Math.round(h * this.#renderScale));
     const graph = this.#graph.reset();
     const timer = this.#timer;
+    timer.beginFrame();
 
     const hdr = graph.createTexture({ size: [rw, rh, 1], format: HDR_FORMAT, usage: HDR_USAGE });
     // Milestone 5.1: second render target = the per-pixel depth centroid (for TAAU reprojection).
     const depth = graph.createTexture({ size: [rw, rh, 1], format: VOLUME_DEPTH_FORMAT, usage: HDR_USAGE });
-    // Milestone 6 (B3) G-buffer targets, see volume-raymarch.ts's FragOut - populated for real,
-    // not yet consumed by anything downstream.
+    // Milestone 6 (B3) G-buffer targets, see volume-raymarch.ts's FragOut - always written (below,
+    // consumed by LightingPass + the lighting-composite pass, when `lighting` is supplied. Always
+    // declared/written regardless (see the render-target-specialization item in the hardening plan -
+    // a settled/direct frame currently pays for these writes even when nothing reads them this frame).
     const colorUnlit = graph.createTexture({ size: [rw, rh, 1], format: HDR_FORMAT, usage: HDR_USAGE });
     const surfacePos = graph.createTexture({ size: [rw, rh, 1], format: HDR_FORMAT, usage: HDR_USAGE });
     const surfaceNormal = graph.createTexture({ size: [rw, rh, 1], format: HDR_FORMAT, usage: HDR_USAGE });
@@ -281,7 +300,6 @@ export class FxPipeline {
         });
         recordVolume(pass);
         pass.end();
-        timer.resolve(ctx.encoder);
       },
     });
 
@@ -318,7 +336,7 @@ export class FxPipeline {
           pass.end();
         },
       });
-      graph.execute();
+      graph.execute((encoder) => timer.resolve(encoder));
       timer.afterSubmit();
       return;
     }
@@ -359,6 +377,7 @@ export class FxPipeline {
             colorAttachments: [
               { view: ctx.texture(hdrLit).createView(), loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: "store" },
             ],
+            timestampWrites: timer.timestampWrites("lighting-composite"),
           });
           pass.setPipeline(pipeline);
           pass.setBindGroup(0, bg);
@@ -371,10 +390,15 @@ export class FxPipeline {
 
     // Milestone 5: temporally accumulate the jittered volume frame into persistent history before the
     // post stack, reprojecting the previous frame via the per-pixel depth. Disabled → raw frame to post.
-    const sceneColor = taau && taau.enabled ? taau.resolve(graph, sceneSource, depth, rw, rh) : sceneSource;
+    const sceneColor =
+      taau && taau.enabled ? taau.resolve(graph, sceneSource, depth, rw, rh, timer) : sceneSource;
 
+    // The post-processing effect chain (bloom/tonemap/FXAA/sharpen/vignette, @zarr-viewer/fx) isn't
+    // individually timed - a variable-length chain built from independent effect modules, not worth
+    // threading a GpuTimer through yet. lastGpuMs/lastGpuSamples cover volume + lighting-composite +
+    // TAAU only; see GpuTimer.lastTotalMs's doc.
     this.#stack.build(graph, sceneColor, { size: [rw, rh, 1], format: HDR_FORMAT, output: out });
-    graph.execute();
+    graph.execute((encoder) => timer.resolve(encoder));
     timer.afterSubmit();
   }
 

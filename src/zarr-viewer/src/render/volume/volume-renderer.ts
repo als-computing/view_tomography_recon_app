@@ -128,12 +128,19 @@ export class VolumeRenderer implements Disposable {
   private frameIndex = 0;
   private shaderConfig: ShaderConfigName = "baseline";
   private earlyRayTermination = 0.995;
+  // Phase 1a hardening: true while a separate half-res LightingPass is going to compute AO/shadow/
+  // multi-scatter for this frame - forces the main ray march's own `heavy` gate off (see
+  // setDeferLighting()'s doc comment), so those expensive per-sample terms are computed exactly once
+  // per frame (at half-res), not twice (once inline at full-res and thrown away, once at half-res).
+  private deferLighting = false;
   private visEnabled = false;
   private internalWidth = 1;
   private internalHeight = 1;
   private lastLut: Uint8Array | undefined;
   private lastLutSize = 512;
   private tfHash = "lut:00000000";
+  // Phase 1e hardening: see setTransferFunction()'s computation of this and skipCtl's WGSL doc.
+  private lowDensitySkipThreshold = 0.01;
   // Occupancy grid, tile compactor, visibility feedback, opacity shadow map, and the multi-light
   // storage buffer, plus their rebuild bookkeeping — see render/accel/volume-acceleration.ts.
   private readonly acceleration: VolumeAcceleration;
@@ -345,6 +352,19 @@ export class VolumeRenderer implements Disposable {
     // per-sample row from the density pyramid's local variance at the current LOD.
     const alphaCurve = new Float32Array(lutSize);
     for (let i = 0; i < lutSize; i++) alphaCurve[i] = (lut[i * 4 + 3] ?? 0) / 255;
+    // Phase 1e hardening: the raymarch's empty-space skip discards any sample below this threshold
+    // without ever consulting the TF (a fixed cutoff would silently drop a TF feature narrower than
+    // it). Tighten the cutoff to just below wherever this TF actually starts being non-transparent, so
+    // a TF with nothing meaningful under 0.01 behaves exactly as before (same 0.01 cutoff) while a TF
+    // with an opaque feature closer to 0 isn't skipped past.
+    let lowDensitySkipThreshold = 0.01;
+    for (let i = 0; i < lutSize; i++) {
+      if (alphaCurve[i]! > 1e-3) {
+        lowDensitySkipThreshold = Math.min(0.01, i / Math.max(1, lutSize - 1));
+        break;
+      }
+    }
+    this.lowDensitySkipThreshold = lowDensitySkipThreshold;
     const sigmaBuckets = defaultSigmaBuckets();
     const tTable = buildGaussianPreintegrationTable(alphaCurve, sigmaBuckets);
     this.tPreintTex?.dispose();
@@ -478,6 +498,20 @@ export class VolumeRenderer implements Disposable {
   /** Early-ray-termination alpha threshold in `(0, 1]` (default `0.995`). */
   public setEarlyRayTermination(threshold: number): void {
     this.earlyRayTermination = Math.min(1, Math.max(0.5, threshold));
+  }
+
+  /**
+   * Phase 1a hardening: call with `true` exactly when a separate half-res `LightingPass` is going to
+   * run this frame (the caller already computes this to decide whether to invoke that pass — pass the
+   * same value here). When `true`, the main ray march's `heavy` gate (`volume-raymarch.ts`) is forced
+   * off regardless of per-sample transmittance/opacity, so the expensive AO/shadow/multi-scatter terms
+   * inside `evaluateLighting()` cost nothing inline — they're computed once, at half-res, by the
+   * separate pass instead. Without this, "deferred" lighting was strictly more expensive than not
+   * deferring: full heavy cost paid inline every frame, plus a second half-res computation whose AO
+   * output was discarded and whose RGB output replaced (not reused) the inline result.
+   */
+  public setDeferLighting(defer: boolean): void {
+    this.deferLighting = defer;
   }
 
   /** Internal HDR size the volume pass renders into (for tile compaction). */
@@ -794,6 +828,7 @@ export class VolumeRenderer implements Disposable {
       viewMode: this.viewMode,
       linearOutput: this.linearOutput,
       earlyRayTermination: this.earlyRayTermination,
+      deferLighting: this.deferLighting,
       specStrength: this.specStrength,
       roughnessL: this.roughnessL,
       shadowEnable: this.shadowEnable,
@@ -825,17 +860,20 @@ export class VolumeRenderer implements Disposable {
         { enabled: this.masks[0].enabled, dims: this.masks[0].tex?.desc.size ?? [1, 1, 1] },
         { enabled: this.masks[1].enabled, dims: this.masks[1].tex?.desc.size ?? [1, 1, 1] },
       ],
+      lowDensitySkipThreshold: this.lowDensitySkipThreshold,
     });
     this.pipelineMgr.uniformBuffer.write(this.frameData);
   }
 
   /**
-   * Milestone 6 (B3) Step 5, debug-only: add the half-res lighting pass to `graph`, reading `gbuffer`
-   * (the just-recorded volume pass's `surfacePos`/`surfaceNormal`/`surfaceAlbedo` targets), and return
-   * the `lightAdd` handle for {@link "../post/fx-pipeline".FxPipeline.render}'s debug blit. `undefined`
-   * before the volume/TF are loaded.
+   * Add the half-res `LightingPass` to `graph`, reading `gbuffer` (the just-recorded volume pass's
+   * `surfacePos`/`surfaceNormal`/`surfaceAlbedo` targets), and return the `lightAdd` handle. Called
+   * from the production render path whenever `setDeferLighting(true)` was also called this frame
+   * ({@link "../post/fx-pipeline".FxPipeline.render} either composites the result onto `colorUnlit`,
+   * or — for the `KeyL` diagnostic toggle — blits it straight to the swapchain). `undefined` before the
+   * volume/TF are loaded.
    */
-  public recordLightingDebug(
+  public recordLighting(
     graph: RenderGraph,
     gbuffer: LightingPassGbuffer,
     width: number,

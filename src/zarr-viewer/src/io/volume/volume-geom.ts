@@ -105,3 +105,16 @@ export function listUploadableLevels(
   }
   return out;
 }
+
+/**
+ * The finest level in `levels` (ascending, as {@link listUploadableLevels} returns them) that isn't
+ * finer than `minDisplayLevel`, or the coarsest available level if nothing in `levels` qualifies (e.g.
+ * the dataset has no level that coarse). Shared by the primary volume's own boot/auto-refine logic and
+ * any secondary same-grid volume (e.g. a mask/annotation layer) that wants to target the same display
+ * fidelity — extracted so the two can't drift back apart the way they once did (a mask layer was found
+ * loading at the pyramid's absolute coarsest level while the primary volume was already refining up to
+ * `minDisplayLevel`, a real, unintended fidelity gap between the two).
+ */
+export function finestTargetLevel(levels: readonly number[], minDisplayLevel: number): number {
+  return levels.find((lv) => lv >= minDisplayLevel) ?? levels[levels.length - 1]!;
+}

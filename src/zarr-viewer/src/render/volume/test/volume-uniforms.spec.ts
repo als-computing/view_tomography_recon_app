@@ -48,6 +48,7 @@ const BASE_PARAMS: VolumeFrameParams = {
   viewMode: "volume",
   linearOutput: false,
   earlyRayTermination: 0.995,
+  deferLighting: false,
   specStrength: 0.4,
   roughnessL: 0.6,
   shadowEnable: false,
@@ -79,10 +80,11 @@ const BASE_PARAMS: VolumeFrameParams = {
     { enabled: false, dims: [1, 1, 1] },
     { enabled: false, dims: [1, 1, 1] },
   ],
+  lowDensitySkipThreshold: 0.01,
 };
 
 function pack(overrides: Partial<VolumeFrameParams> = {}): Float32Array {
-  const d = new Float32Array(136);
+  const d = new Float32Array(140);
   writeVolumeFrameUniform(d, new Mat4(), FAKE_ACCEL, { ...BASE_PARAMS, ...overrides });
   return d;
 }
@@ -154,6 +156,11 @@ describe("writeVolumeFrameUniform", () => {
     expect(pack({ clear: false })[56]).toBe(1);
   });
 
+  it("packs deferLighting into composite.w", () => {
+    expect(pack({ deferLighting: false })[59]).toBe(0);
+    expect(pack({ deferLighting: true })[59]).toBe(1);
+  });
+
   it("packs camera basis with fov half-extents in the w components", () => {
     const d = pack({ camAspect: 2, tanHalfFovY: 0.5 });
     expect(d[123]).toBeCloseTo(1); // tanHalfFovY * aspect
@@ -184,5 +191,10 @@ describe("writeVolumeFrameUniform", () => {
     expect(bothOn[128]).toBe(1);
     expect(bothOn[132]).toBe(1);
     expect([bothOn[133], bothOn[134], bothOn[135]]).toEqual([8, 8, 8]);
+  });
+
+  it("packs lowDensitySkipThreshold into skipCtl.x", () => {
+    expect(pack({ lowDensitySkipThreshold: 0.01 })[136]).toBeCloseTo(0.01);
+    expect(pack({ lowDensitySkipThreshold: 0.003 })[136]).toBeCloseTo(0.003);
   });
 });
