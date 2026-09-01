@@ -13,15 +13,21 @@
  */
 
 import { openOmeZarr, httpStore, listUploadableLevels } from "@zarr-viewer/io";
-import { uploadMaskVolume, type GpuContext, type ManagedTexture } from "@zarr-viewer/render";
+import {
+  uploadMaskVolume,
+  uploadMaskArray,
+  type GpuContext,
+  type ManagedTexture,
+} from "@zarr-viewer/render";
 
 /** A loaded mask dataset: the uploaded GPU texture plus its per-class voxel tally. */
 export interface LoadedMaskVolume {
   readonly texture: ManagedTexture;
   /** Voxel count per class id (index = class id) — see `discoverMaskClasses`. */
   readonly classCounts: Uint32Array;
-  /** The (coarsest uploadable) resolution level actually uploaded. */
-  readonly level: number;
+  /** The (coarsest uploadable) resolution level actually uploaded — not applicable (`undefined`) for
+   * an array-sourced mask ({@link loadMaskFromArray}), which has no level/pyramid concept. */
+  readonly level?: number;
 }
 
 /** Open `url` as an OME-Zarr mask volume and upload its coarsest uploadable level. */
@@ -38,4 +44,21 @@ export async function loadMaskVolume(ctx: GpuContext, url: string): Promise<Load
 
   const { texture, classCounts } = await uploadMaskVolume(ctx.device, source, { level });
   return { texture, classCounts, level };
+}
+
+/**
+ * Upload a caller-supplied class-id array directly — no `openOmeZarr`/`httpStore`, no network access,
+ * no level/pyramid logic. For a host app with its own client-side rasterizer that just wants to hand
+ * this viewer a finished array (e.g. a live interactive-classifier result) at whatever resolution it
+ * chooses. `data` must be exactly `dims[0]*dims[1]*dims[2]` bytes (see `uploadMaskArray`'s own doc for
+ * the exact layout). Kept `async` (trivially resolving) to match `loadMaskVolume`'s call shape, even
+ * though the underlying upload is synchronous.
+ */
+export async function loadMaskFromArray(
+  ctx: GpuContext,
+  data: Uint8Array,
+  dims: readonly [number, number, number],
+): Promise<LoadedMaskVolume> {
+  const { texture, classCounts } = uploadMaskArray(ctx.device, data, dims);
+  return { texture, classCounts };
 }

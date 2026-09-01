@@ -18,7 +18,7 @@ import {
   volumeRaymarchWgsl,
 } from "../shaders/volume-raymarch.js";
 import { type ShaderConfigName, specializationFor } from "../accel/shader-config.js";
-import { MAX_LAYERS, MASK_BINDING_BASE } from "./volume-bindings.js";
+import { MAX_LAYERS, MASK_BINDING_BASE, MASK_SLOT_COUNT } from "./volume-bindings.js";
 
 /**
  * Second render target of the volume pass (Milestone 5.1): the transmittance-weighted depth centroid,
@@ -137,15 +137,22 @@ export class VolumePipeline implements Disposable {
             visibility: visFrag,
             texture: { sampleType: "float", viewDimension: "2d" },
           },
-          // Mask/annotation layer (item 7 Phase B): both read via textureLoad (no sampler) since class
-          // IDs must never be interpolated. r8uint's sample type is "uint"; the palette is declared
-          // "unfilterable-float" (same as binding 13's density pyramid) since nothing samples it either.
-          { binding: MASK_BINDING_BASE, visibility: visFrag, texture: { sampleType: "uint", viewDimension: "3d" } },
-          {
-            binding: MASK_BINDING_BASE + 1,
-            visibility: visFrag,
-            texture: { sampleType: "unfilterable-float", viewDimension: "2d" },
-          },
+          // Mask/annotation layers (item 7 Phase B): MASK_SLOT_COUNT independent slots, each 2 bindings
+          // (density + palette), both read via textureLoad (no sampler) since class IDs must never be
+          // interpolated. r8uint's sample type is "uint"; the palette is declared "unfilterable-float"
+          // (same as binding 13's density pyramid) since nothing samples it either.
+          ...Array.from({ length: MASK_SLOT_COUNT }, (_, slot) => [
+            {
+              binding: MASK_BINDING_BASE + slot * 2,
+              visibility: visFrag,
+              texture: { sampleType: "uint" as const, viewDimension: "3d" as const },
+            },
+            {
+              binding: MASK_BINDING_BASE + slot * 2 + 1,
+              visibility: visFrag,
+              texture: { sampleType: "unfilterable-float" as const, viewDimension: "2d" as const },
+            },
+          ]).flat(),
         ],
       });
       this.pipelineLayout = this.ctx.device.createPipelineLayout({

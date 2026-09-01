@@ -15,10 +15,20 @@ export type { VolumeLevelResult, VolumeLoaderOptions } from "./volume/volume-loa
 export { BrickLoader, chooseBrickRegion } from "./volume/brick-loader.js";
 export type { BrickResult, BrickRequest, BrickLoaderOptions } from "./volume/brick-loader.js";
 
-export { uploadMaskVolume, uploadMaskPalette, asClassIdSamples, MASK_CLASS_COUNT } from "./volume/mask-texture.js";
-export type { UploadMaskVolumeOptions, UploadMaskVolumeResult } from "./volume/mask-texture.js";
+export {
+  uploadMaskVolume,
+  uploadMaskPalette,
+  uploadMaskArray,
+  asClassIdSamples,
+  MASK_CLASS_COUNT,
+} from "./volume/mask-texture.js";
+export type {
+  UploadMaskVolumeOptions,
+  UploadMaskVolumeResult,
+  UploadMaskArrayResult,
+} from "./volume/mask-texture.js";
 
-export { MAX_LAYERS } from "./volume/volume-bindings.js";
+export { MAX_LAYERS, MASK_SLOT_COUNT } from "./volume/volume-bindings.js";
 export { VolumeRenderer } from "./volume/volume-renderer.js";
 export type { VolumeRendererOptions, VolumeBlendMode, VolumeViewMode } from "./volume/volume-renderer.js";
 export type {

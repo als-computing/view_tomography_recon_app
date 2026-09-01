@@ -75,12 +75,14 @@ const BASE_PARAMS: VolumeFrameParams = {
   camUp: [0, 1, 0],
   camAspect: 800 / 600,
   tanHalfFovY: Math.tan((42 * Math.PI) / 180 / 2),
-  maskEnabled: false,
-  maskDims: [1, 1, 1],
+  masks: [
+    { enabled: false, dims: [1, 1, 1] },
+    { enabled: false, dims: [1, 1, 1] },
+  ],
 };
 
 function pack(overrides: Partial<VolumeFrameParams> = {}): Float32Array {
-  const d = new Float32Array(132);
+  const d = new Float32Array(136);
   writeVolumeFrameUniform(d, new Mat4(), FAKE_ACCEL, { ...BASE_PARAMS, ...overrides });
   return d;
 }
@@ -158,11 +160,29 @@ describe("writeVolumeFrameUniform", () => {
     expect(d[127]).toBeCloseTo(0.5);
   });
 
-  it("packs maskCtl (enable + mask voxel dims)", () => {
+  it("packs mask0Ctl/mask1Ctl (enable + mask voxel dims) independently per slot", () => {
     const off = pack();
-    expect(off[128]).toBe(0);
-    const on = pack({ maskEnabled: true, maskDims: [64, 32, 16] });
-    expect(on[128]).toBe(1);
-    expect([on[129], on[130], on[131]]).toEqual([64, 32, 16]);
+    expect(off[128]).toBe(0); // mask0 disabled
+    expect(off[132]).toBe(0); // mask1 disabled
+
+    const slot0On = pack({
+      masks: [
+        { enabled: true, dims: [64, 32, 16] },
+        { enabled: false, dims: [1, 1, 1] },
+      ],
+    });
+    expect(slot0On[128]).toBe(1);
+    expect([slot0On[129], slot0On[130], slot0On[131]]).toEqual([64, 32, 16]);
+    expect(slot0On[132]).toBe(0); // slot 1 untouched
+
+    const bothOn = pack({
+      masks: [
+        { enabled: true, dims: [64, 32, 16] },
+        { enabled: true, dims: [8, 8, 8] },
+      ],
+    });
+    expect(bothOn[128]).toBe(1);
+    expect(bothOn[132]).toBe(1);
+    expect([bothOn[133], bothOn[134], bothOn[135]]).toEqual([8, 8, 8]);
   });
 });

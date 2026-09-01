@@ -39,6 +39,13 @@ import { VolumeBindings } from "./volume-bindings.js";
 import { buildGaussianPreintegrationTable, defaultSigmaBuckets } from "./preintegration-2d.js";
 import { floatToHalf } from "./volume-texture.js";
 
+/** One mask/annotation slot's GPU-side state (item 7 Phase B). */
+interface MaskSlot {
+  tex: ManagedTexture | undefined;
+  paletteTex: ManagedTexture | undefined;
+  enabled: boolean;
+}
+
 export type { VolumeBlendMode, VolumeViewMode } from "./volume-uniforms.js";
 export { VOLUME_DEPTH_FORMAT } from "./volume-pipeline.js";
 
@@ -174,12 +181,15 @@ export class VolumeRenderer implements Disposable {
   private brickMin: [number, number, number] = [0, 0, 0];
   private brickMax: [number, number, number] = [0, 0, 0];
 
-  // Mask/annotation layer (item 7 Phase B): a same-grid r8uint class-id volume + its rgba8unorm
-  // palette (class id → color+opacity). Dummies are genuinely valid r8uint/rgba8unorm textures (unlike
-  // brickTex, nothing else bound has a compatible format to reuse as a fallback — see volume-bindings.ts).
-  private maskTex: ManagedTexture | undefined;
-  private maskPaletteTex: ManagedTexture | undefined;
-  private maskEnabled = false;
+  // Mask/annotation layers (item 7 Phase B): two independent, fixed slots (not generalized to N — see
+  // the task this was extended for), each a same-grid r8uint class-id volume + its rgba8unorm palette
+  // (class id → color+opacity). Dummies are genuinely valid r8uint/rgba8unorm textures (unlike
+  // brickTex, nothing else bound has a compatible format to reuse as a fallback — see
+  // volume-bindings.ts) and are shared across both slots (an empty stand-in needs no per-slot identity).
+  private readonly masks: [MaskSlot, MaskSlot] = [
+    { tex: undefined, paletteTex: undefined, enabled: false },
+    { tex: undefined, paletteTex: undefined, enabled: false },
+  ];
   private readonly dummyMaskTex: ManagedTexture;
   private readonly dummyMaskPalette: ManagedTexture;
 
@@ -281,19 +291,21 @@ export class VolumeRenderer implements Disposable {
   }
 
   /**
-   * Set (or clear with `null`) the mask/annotation density texture (`r8uint`, item 7 Phase B). Assumed
-   * to share the primary volume's own world box (no separate world-AABB/translation handling) — see
-   * the plan's Phase B design note for why that's a safe assumption for an annotation of this scan.
+   * Set (or clear with `null`) mask/annotation slot `slot`'s density texture (`r8uint`, item 7 Phase
+   * B — exactly two independent slots, fixed). Assumed to share the primary volume's own world box (no
+   * separate world-AABB/translation handling) — see the plan's Phase B design note for why that's a
+   * safe assumption for an annotation of this scan.
    */
-  public setMask(texture: ManagedTexture | null): void {
-    this.maskTex = texture ?? undefined;
-    this.maskEnabled = texture !== null;
+  public setMask(slot: 0 | 1, texture: ManagedTexture | null): void {
+    const s = this.masks[slot];
+    s.tex = texture ?? undefined;
+    s.enabled = texture !== null;
     this.bindings.invalidate();
   }
 
-  /** Replace the mask's palette (class id → color+opacity, `rgba8unorm`, one row). */
-  public setMaskPalette(paletteTexture: ManagedTexture): void {
-    this.maskPaletteTex = paletteTexture;
+  /** Replace mask slot `slot`'s palette (class id → color+opacity, `rgba8unorm`, one row). */
+  public setMaskPalette(slot: 0 | 1, paletteTexture: ManagedTexture): void {
+    this.masks[slot].paletteTex = paletteTexture;
     this.bindings.invalidate();
   }
 
@@ -717,8 +729,14 @@ export class VolumeRenderer implements Disposable {
       preintTex: this.tPreintTex ?? this.dummyPreint,
       spec,
       acceleration: this.acceleration,
-      maskTex: this.maskTex ?? this.dummyMaskTex,
-      maskPaletteTex: this.maskPaletteTex ?? this.dummyMaskPalette,
+      maskTex: [
+        this.masks[0].tex ?? this.dummyMaskTex,
+        this.masks[1].tex ?? this.dummyMaskTex,
+      ],
+      maskPaletteTex: [
+        this.masks[0].paletteTex ?? this.dummyMaskPalette,
+        this.masks[1].paletteTex ?? this.dummyMaskPalette,
+      ],
     });
 
     const background = this.pipelineMgr.background;
@@ -803,8 +821,10 @@ export class VolumeRenderer implements Disposable {
       camUp: this.camUp,
       camAspect: this.camAspect,
       tanHalfFovY: this.tanHalfFovY,
-      maskEnabled: this.maskEnabled,
-      maskDims: this.maskTex?.desc.size ?? [1, 1, 1],
+      masks: [
+        { enabled: this.masks[0].enabled, dims: this.masks[0].tex?.desc.size ?? [1, 1, 1] },
+        { enabled: this.masks[1].enabled, dims: this.masks[1].tex?.desc.size ?? [1, 1, 1] },
+      ],
     });
     this.pipelineMgr.uniformBuffer.write(this.frameData);
   }

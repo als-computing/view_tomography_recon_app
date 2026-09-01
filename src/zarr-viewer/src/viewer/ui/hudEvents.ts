@@ -53,11 +53,11 @@ export interface HudEventContext {
   setSelectedPreset(v: string): void;
   getActiveBandIndex(): number;
   setActiveBandIndex(v: number): void;
-  loadMask(url: string): void;
-  removeMask(): void;
-  setMaskClassColor(id: number, rgb: [number, number, number]): void;
-  setMaskClassOpacity(id: number, opacity: number): void;
-  toggleMaskClassVisible(id: number): void;
+  loadMask(slot: 0 | 1, url: string): void;
+  removeMask(slot: 0 | 1): void;
+  setMaskClassColor(slot: 0 | 1, id: number, rgb: readonly [number, number, number]): void;
+  setMaskClassOpacity(slot: 0 | 1, id: number, opacity: number): void;
+  toggleMaskClassVisible(slot: 0 | 1, id: number): void;
   getCollapsed(): boolean;
   setCollapsed(v: boolean): void;
   getActiveTab(): HudTab;
@@ -128,6 +128,12 @@ const LIGHTING_SLIDERS = new Set([
   "stageConeDeg",
   "stageRange",
 ]);
+
+/** Reads `data-mask-slot` off an element as `0 | 1`, or `undefined` if absent/invalid. */
+function readMaskSlot(el: HTMLElement): 0 | 1 | undefined {
+  const raw = el.dataset.maskSlot;
+  return raw === "0" ? 0 : raw === "1" ? 1 : undefined;
+}
 
 export function bindHudClick(ctx: HudEventContext): void {
   ctx.ui.addEventListener("click", (e) => {
@@ -320,17 +326,23 @@ export function bindHudClick(ctx: HudEventContext): void {
       ctx.resetCrop();
     }
     if (btn.dataset.act === "loadMask") {
-      const url = ctx.ui.querySelector<HTMLInputElement>("#maskUrlInput")?.value.trim();
-      if (url) ctx.loadMask(url);
+      const slot = readMaskSlot(btn);
+      if (slot == null) return;
+      const url = ctx.ui.querySelector<HTMLInputElement>(`#maskUrlInput${slot}`)?.value.trim();
+      if (url) ctx.loadMask(slot, url);
       return;
     }
     if (btn.dataset.act === "removeMask") {
-      ctx.removeMask();
+      const slot = readMaskSlot(btn);
+      if (slot != null) ctx.removeMask(slot);
       return;
     }
     if (btn.dataset.act === "toggleMaskClass" && btn.dataset.idx != null) {
-      ctx.toggleMaskClassVisible(Number(btn.dataset.idx));
-      ctx.renderUi(); // discrete click, not a drag - a full rebuild here is cheap and simplest
+      const slot = readMaskSlot(btn);
+      if (slot != null) {
+        ctx.toggleMaskClassVisible(slot, Number(btn.dataset.idx));
+        ctx.renderUi(); // discrete click, not a drag - a full rebuild here is cheap and simplest
+      }
       return;
     }
   });
@@ -461,16 +473,21 @@ export function bindHudInput(ctx: HudEventContext): void {
       return;
     }
     if (t.dataset.maskColor != null) {
-      ctx.setMaskClassColor(Number(t.dataset.maskColor), hexToRgb(t.value));
+      const slot = readMaskSlot(t);
+      if (slot != null) ctx.setMaskClassColor(slot, Number(t.dataset.maskColor), hexToRgb(t.value));
       return;
     }
     if (t.dataset.maskOpacity != null) {
+      const slot = readMaskSlot(t);
+      if (slot == null) return;
       const id = Number(t.dataset.maskOpacity);
       const v = Number(t.value);
-      ctx.setMaskClassOpacity(id, v);
+      ctx.setMaskClassOpacity(slot, id, v);
       // Patch the label directly (no renderUi()) - same reasoning as the tfBandRange slider: a full
       // rebuild on every drag tick would be needlessly slow and isn't needed just to show a number.
-      const label = ctx.ui.querySelector(`[data-mask-opacity-val="${id}"]`);
+      // Scoped by slot too - both slots have their own independent class-id space, so id alone could
+      // match two labels (one per slot) if both happen to have discovered the same class id.
+      const label = ctx.ui.querySelector(`[data-mask-opacity-val="${id}"][data-mask-slot="${slot}"]`);
       if (label) label.textContent = fmt(v);
       return;
     }

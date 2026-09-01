@@ -117,6 +117,79 @@ export async function uploadMaskVolume(
   return { texture, classCounts };
 }
 
+/** Result of {@link uploadMaskArray}: the GPU texture plus a per-class voxel tally. */
+export interface UploadMaskArrayResult {
+  texture: ManagedTexture;
+  classCounts: Uint32Array;
+}
+
+/**
+ * Upload an already-dense, caller-supplied class-id array directly — no `VolumeSource`/chunk
+ * iteration, no level/pyramid logic, and (unlike {@link uploadMaskVolume}) no network access at all.
+ * For a host app that has its own client-side rasterizer and just wants to hand this viewer a finished
+ * array (e.g. a live interactive-classifier result) at whatever resolution it chooses. `data` must be
+ * exactly `dims[0]*dims[1]*dims[2]` bytes, row-major x-fastest (matching `VolumeSource.chunks()`'s own
+ * voxel layout), one byte per class id.
+ */
+export function uploadMaskArray(
+  device: GPUDevice,
+  data: Uint8Array,
+  dims: readonly [number, number, number],
+): UploadMaskArrayResult {
+  const [width, height, depth] = dims;
+  const maxDim = device.limits.maxTextureDimension3D;
+  if (width > maxDim || height > maxDim || depth > maxDim) {
+    throw new Error(
+      `uploadMaskArray: ${width}×${height}×${depth} exceeds maxTextureDimension3D (${maxDim})`,
+    );
+  }
+  const expected = width * height * depth;
+  if (data.length !== expected) {
+    throw new Error(
+      `uploadMaskArray: data.length (${data.length}) doesn't match dims ${width}×${height}×${depth} (expected ${expected})`,
+    );
+  }
+
+  const texture = new ManagedTexture(device, {
+    size: [width, height, depth],
+    format: "r8uint",
+    dimension: "3d",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+
+  const classCounts = new Uint32Array(MASK_CLASS_COUNT);
+  const bytesPerRow = Math.ceil(width / 256) * 256;
+  let packed: Uint8Array<ArrayBuffer>;
+  if (bytesPerRow === width) {
+    // No row padding needed - tally in place and re-wrap for writeTexture's ArrayBuffer-narrowing
+    // workaround (see uploadMaskPalette's own comment on this).
+    for (let i = 0; i < data.length; i++) classCounts[data[i]!]++;
+    packed = new Uint8Array(data);
+  } else {
+    packed = new Uint8Array(bytesPerRow * height * depth);
+    for (let z = 0; z < depth; z++) {
+      for (let y = 0; y < height; y++) {
+        const srcRow = (z * height + y) * width;
+        const dstRow = (z * height + y) * bytesPerRow;
+        for (let x = 0; x < width; x++) {
+          const v = data[srcRow + x]!;
+          packed[dstRow + x] = v;
+          classCounts[v]!++;
+        }
+      }
+    }
+  }
+
+  device.queue.writeTexture(
+    { texture: texture.gpu },
+    packed,
+    { bytesPerRow, rowsPerImage: height },
+    { width, height, depthOrArrayLayers: depth },
+  );
+
+  return { texture, classCounts };
+}
+
 /** Read a chunk's voxel data as exact class IDs, clamped into `[0,255]` for any dtype other than the
  * expected `uint8` (masks are expected to be uint8; this is a defensive fallback, not a real format).
  * Exported (pure, no GPU dependency) so its dtype/clamping behavior is directly unit-testable. */

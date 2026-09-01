@@ -12,23 +12,37 @@ import type { ShaderSpecialization } from "../accel/shader-config.js";
 import type { VolumeAccelerationBuffers } from "../accel/volume-acceleration.js";
 
 /**
- * Hard cap on simultaneously-composited volume "layers" (item 7 of the feature plan). WebGPU has no
- * 3D texture arrays and no reliable bindless-texture support, so each layer needs its own fixed
- * bind-group slot — this is that ceiling, sized to leave headroom under the guaranteed-minimum
- * `maxSampledTexturesPerShaderStage` (16) alongside this pass's other 6 textures + 1 shared TF atlas.
- * The viewer's `LayerManager` (an unbounded list mapped onto these `MAX_LAYERS` real slots) imports
- * this constant rather than redefining it, so the two never drift apart.
+ * Hard cap on simultaneously-composited volume "layers" (item 7 of the feature plan, shelved/unused —
+ * bound but never sampled by the shader today; see `viewer/state/layer-manager.ts`). WebGPU has no 3D
+ * texture arrays and no reliable bindless-texture support, so each layer needs its own fixed
+ * bind-group slot — this is that ceiling.
+ *
+ * Reduced from 6 to 5 when the second mask/annotation slot was added: the guaranteed-minimum
+ * `maxSampledTexturesPerShaderStage` every conformant WebGPU implementation must support is 16, and
+ * this pass's fixed sampled-texture count (6 existing + `MAX_LAYERS` shelved layer slots + 1 shared
+ * TF atlas + 4 mask-slot textures with two mask slots) must not exceed that floor without an explicit,
+ * checked reason to assume a higher device limit. At `MAX_LAYERS = 6` the total would be 17 (over
+ * budget); at 5 it's exactly 16 (at the floor, not over it — safe on every conformant device). These
+ * slots are unused today, so shrinking the reservation costs nothing now; it only lowers the ceiling
+ * available if/when that shelved feature is ever built out for real, at which point this trade should
+ * be revisited (e.g. via texture atlasing, per that feature's own design note) rather than exceeding
+ * the guaranteed floor. The viewer's `LayerManager` imports this constant rather than redefining it.
  */
-export const MAX_LAYERS = 6;
+export const MAX_LAYERS = 5;
 
 /**
- * First binding index after the (shelved) `MAX_LAYERS` slots + TF atlas. The mask/annotation layer
- * (item 7 Phase B) takes the next two: `MASK_BINDING_BASE` (density texture, `r8uint`) and
- * `MASK_BINDING_BASE + 1` (palette, `rgba8unorm`) — unrelated to and independent of the shelved
- * layer-slot bindings above, both read via `textureLoad` (no sampler — class IDs must never be
- * interpolated), so no new sampler binding is needed either.
+ * First binding index after the (shelved) `MAX_LAYERS` slots + TF atlas. Two independent mask/
+ * annotation slots (item 7 Phase B, extended to two slots so a host app can show two independent
+ * per-voxel class predictions at once) each take two bindings: `MASK_BINDING_BASE + slot*2` (density
+ * texture, `r8uint`) and `MASK_BINDING_BASE + slot*2 + 1` (palette, `rgba8unorm`) — unrelated to and
+ * independent of the shelved layer-slot bindings above, both read via `textureLoad` (no sampler —
+ * class IDs must never be interpolated), so no new sampler binding is needed either.
  */
 export const MASK_BINDING_BASE = 14 + MAX_LAYERS + 1;
+
+/** Fixed number of independent mask/annotation slots (see `MASK_BINDING_BASE`'s doc). Exactly two,
+ * not generalized to N — see the task brief this was added for. */
+export const MASK_SLOT_COUNT = 2;
 
 /**
  * The subset of `VolumeAcceleration`'s shape the bind group needs. A structural type (rather than
@@ -64,14 +78,14 @@ export interface VolumeBindingsParams {
   /** Shared transfer-function atlas (one row per layer slot). Falls back to `tfTex` when unset. */
   layerTfTex?: ManagedTexture;
   /**
-   * Mask/annotation density texture (`r8uint`) and its palette (`rgba8unorm`, one row's worth of
-   * class-id → color+opacity entries). Required (not optional with an internal fallback) — the caller
-   * resolves real-vs-dummy itself, same pattern as `preintTex`, since a dummy must be a genuinely valid
-   * `r8uint`/`rgba8unorm` texture (unlike `brickTex`, nothing else bound here has a compatible format
-   * to reuse as a fallback).
+   * Two independent mask/annotation density textures (`r8uint`) and their palettes (`rgba8unorm`, one
+   * row's worth of class-id → color+opacity entries each), index = slot (`0..MASK_SLOT_COUNT-1`).
+   * Required (not optional with an internal fallback) — the caller resolves real-vs-dummy itself, same
+   * pattern as `preintTex`, since a dummy must be a genuinely valid `r8uint`/`rgba8unorm` texture
+   * (unlike `brickTex`, nothing else bound here has a compatible format to reuse as a fallback).
    */
-  maskTex: ManagedTexture;
-  maskPaletteTex: ManagedTexture;
+  maskTex: readonly [ManagedTexture, ManagedTexture];
+  maskPaletteTex: readonly [ManagedTexture, ManagedTexture];
 }
 
 /** Owns the volume ray-march pass's single per-frame `GPUBindGroup`. */
@@ -124,8 +138,16 @@ export class VolumeBindings {
           binding: 14 + MAX_LAYERS,
           resource: (params.layerTfTex ?? params.tfTex).createView({ dimension: "2d" }),
         },
-        { binding: MASK_BINDING_BASE, resource: params.maskTex.createView({ dimension: "3d" }) },
-        { binding: MASK_BINDING_BASE + 1, resource: params.maskPaletteTex.createView({ dimension: "2d" }) },
+        ...Array.from({ length: MASK_SLOT_COUNT }, (_, slot) => [
+          {
+            binding: MASK_BINDING_BASE + slot * 2,
+            resource: params.maskTex[slot]!.createView({ dimension: "3d" as const }),
+          },
+          {
+            binding: MASK_BINDING_BASE + slot * 2 + 1,
+            resource: params.maskPaletteTex[slot]!.createView({ dimension: "2d" as const }),
+          },
+        ]).flat(),
       ],
     });
     return this.bindGroup;

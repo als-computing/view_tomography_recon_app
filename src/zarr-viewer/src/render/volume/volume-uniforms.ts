@@ -1,5 +1,5 @@
 /**
- * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 132 floats at fixed
+ * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 136 floats at fixed
  * offsets matching `VOLUME_FRAME_UNIFORM_SIZE`/the WGSL `Frame` struct). Kept as a single flat
  * `write()` function rather than incremental setter-driven mutation, since the buffer's whole point is
  * one contiguous upload per frame — see `volume-raymarch.ts` for the WGSL-side layout this must match
@@ -106,16 +106,22 @@ export interface VolumeFrameParams {
   camUp: readonly [number, number, number];
   camAspect: number;
   tanHalfFovY: number;
-  /** Mask/annotation layer (item 7 Phase B). Same-grid as the primary — no separate world box. */
-  maskEnabled: boolean;
-  /** The mask texture's own voxel dimensions (may differ from the primary's *currently displayed*
-   * level even though both share the same physical grid) — needed to convert a uvw sample into an
-   * exact mask voxel index for `textureLoad`. */
-  maskDims: readonly [number, number, number];
+  /** Two independent mask/annotation slots (item 7 Phase B), fixed at exactly two — not generalized
+   * to N. Both same-grid as the primary — no separate world box. */
+  masks: readonly [MaskSlotParams, MaskSlotParams];
+}
+
+/** One mask slot's frame-uniform inputs. */
+export interface MaskSlotParams {
+  enabled: boolean;
+  /** This slot's mask texture's own voxel dimensions (may differ from the primary's *currently
+   * displayed* level even though both share the same physical grid) — needed to convert a uvw sample
+   * into an exact mask voxel index for `textureLoad`. */
+  dims: readonly [number, number, number];
 }
 
 /**
- * Pack one frame's worth of uniforms into `d` (132 floats, fixed offsets — see inline comments for
+ * Pack one frame's worth of uniforms into `d` (136 floats, fixed offsets — see inline comments for
  * each named group). Does not upload to the GPU; the caller writes `d` to the uniform buffer.
  * `invViewProj` must already be the inverted view-projection for this frame.
  */
@@ -260,9 +266,14 @@ export function writeVolumeFrameUniform(
   d[125] = p.camUp[1];
   d[126] = p.camUp[2];
   d[127] = p.tanHalfFovY;
-  // maskCtl: enable, mask voxel dims (xyz) — item 7 Phase B.
-  d[128] = p.maskEnabled ? 1 : 0;
-  d[129] = p.maskDims[0];
-  d[130] = p.maskDims[1];
-  d[131] = p.maskDims[2];
+  // mask0Ctl / mask1Ctl: enable, mask voxel dims (xyz), one vec4 per slot — item 7 Phase B.
+  const [mask0, mask1] = p.masks;
+  d[128] = mask0.enabled ? 1 : 0;
+  d[129] = mask0.dims[0];
+  d[130] = mask0.dims[1];
+  d[131] = mask0.dims[2];
+  d[132] = mask1.enabled ? 1 : 0;
+  d[133] = mask1.dims[0];
+  d[134] = mask1.dims[1];
+  d[135] = mask1.dims[2];
 }

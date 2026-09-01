@@ -96,7 +96,7 @@ import { postfxPanelBody } from "./ui/panels/postfxPanel.js";
 import { lightingPanelBody } from "./ui/panels/lightingPanel.js";
 import { presetsPanelBody, sanitizeSelectedPreset } from "./ui/panels/presetsPanel.js";
 import { annotationsPanelBody } from "./ui/panels/annotationsPanel.js";
-import { loadMaskVolume } from "./volume/load-mask.js";
+import { loadMaskVolume, loadMaskFromArray } from "./volume/load-mask.js";
 import { discoverMaskClasses, buildMaskPalette, type MaskClassState } from "./state/mask-classes.js";
 
 export type { WebGpuRenderingState, WebGpuCroppingState } from "./RenderingState.js";
@@ -130,6 +130,20 @@ export interface WebGpuViewerInstance {
   setCropping: (state: WebGpuCroppingState) => void;
   on: (event: WebGpuViewerEvent, cb: () => void) => void;
   off: (event: WebGpuViewerEvent, cb: () => void) => void;
+  /**
+   * Mask/annotation layers (item 7 Phase B): exactly two independent, fixed slots — not generalized to
+   * N. A host app drives these directly (no HUD interaction required); the built-in Annotations panel
+   * calls the same underlying implementation, so either path produces the identical visual result.
+   */
+  loadMask: (slot: 0 | 1, url: string) => void;
+  /** Upload a caller-supplied class-id array directly — no network access, no level/pyramid logic. */
+  loadMaskFromArray: (slot: 0 | 1, data: Uint8Array, dims: readonly [number, number, number]) => void;
+  removeMask: (slot: 0 | 1) => void;
+  setMaskClassColor: (slot: 0 | 1, id: number, rgb: readonly [number, number, number]) => void;
+  setMaskClassOpacity: (slot: 0 | 1, id: number, opacity: number) => void;
+  toggleMaskClassVisible: (slot: 0 | 1, id: number) => void;
+  /** `undefined` until that slot has a mask loaded (or after `removeMask`). */
+  getMaskClasses: (slot: 0 | 1) => readonly MaskClassState[] | undefined;
   dispose: () => void;
 }
 
@@ -225,6 +239,13 @@ export async function run(
     setCropping: () => {},
     on: () => {},
     off: () => {},
+    loadMask: () => {},
+    loadMaskFromArray: () => {},
+    removeMask: () => {},
+    setMaskClassColor: () => {},
+    setMaskClassOpacity: () => {},
+    toggleMaskClassVisible: () => {},
+    getMaskClasses: () => undefined,
     dispose: () => handle.dispose(),
   });
 
@@ -398,15 +419,27 @@ export async function run(
   // not part of the serializable WebGpuRenderingState (mirrors selectedPreset's pattern).
   let activeBandIndex = 0;
 
-  // Mask/annotation layer (item 7 Phase B) - viewer-local state, not part of WebGpuRenderingState
-  // (mirrors how the primary dataset's own URL/source isn't part of it either).
-  let maskUrl = "";
-  let maskLoading = false;
-  let maskError: string | undefined;
-  // undefined = nothing loaded; an array (possibly empty, if the mask is all-background) once loaded.
-  let maskClasses: MaskClassState[] | undefined;
-  let maskGpuTex: ManagedTexture | undefined;
-  let maskPaletteGpuTex: ManagedTexture | undefined;
+  // Mask/annotation layers (item 7 Phase B) - viewer-local state, not part of WebGpuRenderingState
+  // (mirrors how the primary dataset's own URL/source isn't part of it either). Exactly two independent
+  // slots, fixed - not generalized to N (see the task this was extended for).
+  interface MaskSlotState {
+    url: string;
+    loading: boolean;
+    error: string | undefined;
+    // undefined = nothing loaded; an array (possibly empty, if the mask is all-background) once loaded.
+    classes: MaskClassState[] | undefined;
+    gpuTex: ManagedTexture | undefined;
+    paletteGpuTex: ManagedTexture | undefined;
+  }
+  const newMaskSlotState = (): MaskSlotState => ({
+    url: "",
+    loading: false,
+    error: undefined,
+    classes: undefined,
+    gpuTex: undefined,
+    paletteGpuTex: undefined,
+  });
+  const maskSlots: [MaskSlotState, MaskSlotState] = [newMaskSlotState(), newMaskSlotState()];
 
   // Progressive coarse→fine loader: owns the per-level GPU textures and streams finer levels toward
   // `targetLevel`, never downgrading what's displayed. `level` tracks the level currently on screen.
@@ -588,57 +621,116 @@ export async function run(
     }
   };
 
-  // Rebuild + push the mask palette texture from the current maskClasses state (item 7 Phase B). A
-  // no-op until a mask is loaded. Always allocates a new texture (mirrors setTransferFunction's own
-  // LUT-rebuild-on-every-change pattern) and disposes the previous one — otherwise every color/opacity/
-  // visibility edit would leak a 1KB texture.
-  const applyMaskPalette = (): void => {
-    if (!maskClasses) return;
-    const bytes = buildMaskPalette(maskClasses);
+  // Rebuild + push mask slot `slot`'s palette texture from its current classes state (item 7 Phase B).
+  // A no-op until that slot has a mask loaded. Always allocates a new texture (mirrors
+  // setTransferFunction's own LUT-rebuild-on-every-change pattern) and disposes the previous one —
+  // otherwise every color/opacity/visibility edit would leak a 1KB texture.
+  const applyMaskPalette = (slot: 0 | 1): void => {
+    const s = maskSlots[slot];
+    if (!s.classes) return;
+    const bytes = buildMaskPalette(s.classes);
     const next = uploadMaskPalette(ctx.device, bytes);
-    maskPaletteGpuTex?.dispose();
-    maskPaletteGpuTex = next;
-    volumeRenderer.setMaskPalette(next);
+    s.paletteGpuTex?.dispose();
+    s.paletteGpuTex = next;
+    volumeRenderer.setMaskPalette(slot, next);
     requestRender();
     markInteracting();
   };
 
-  const loadMask = async (url: string): Promise<void> => {
-    maskLoading = true;
-    maskError = undefined;
-    maskUrl = url;
+  // Shared tail for both load paths: swap in the new texture, discover classes, build the palette.
+  const applyLoadedMask = (
+    slot: 0 | 1,
+    loaded: { texture: ManagedTexture; classCounts: Uint32Array },
+  ): void => {
+    const s = maskSlots[slot];
+    s.gpuTex?.dispose();
+    s.gpuTex = loaded.texture;
+    volumeRenderer.setMask(slot, loaded.texture);
+    s.classes = discoverMaskClasses(loaded.classCounts);
+    applyMaskPalette(slot);
+  };
+
+  const loadMask = async (slot: 0 | 1, url: string): Promise<void> => {
+    const s = maskSlots[slot];
+    s.loading = true;
+    s.error = undefined;
+    s.url = url;
     renderUi();
     try {
-      const { texture, classCounts } = await loadMaskVolume(ctx, url);
-      maskGpuTex?.dispose();
-      maskGpuTex = texture;
-      volumeRenderer.setMask(texture);
-      maskClasses = discoverMaskClasses(classCounts);
-      applyMaskPalette();
+      applyLoadedMask(slot, await loadMaskVolume(ctx, url));
     } catch (err) {
-      maskError = err instanceof Error ? err.message : String(err);
+      s.error = err instanceof Error ? err.message : String(err);
     } finally {
-      maskLoading = false;
+      s.loading = false;
       requestRender();
       renderUi();
     }
   };
 
-  const removeMask = (): void => {
-    volumeRenderer.setMask(null);
-    maskGpuTex?.dispose();
-    maskGpuTex = undefined;
-    maskPaletteGpuTex?.dispose();
-    maskPaletteGpuTex = undefined;
-    maskClasses = undefined;
-    maskError = undefined;
+  const loadMaskArray = async (
+    slot: 0 | 1,
+    data: Uint8Array,
+    dims: readonly [number, number, number],
+  ): Promise<void> => {
+    const s = maskSlots[slot];
+    s.loading = true;
+    s.error = undefined;
+    s.url = ""; // array-sourced - no URL to show/persist
+    renderUi();
+    try {
+      applyLoadedMask(slot, await loadMaskFromArray(ctx, data, dims));
+    } catch (err) {
+      s.error = err instanceof Error ? err.message : String(err);
+    } finally {
+      s.loading = false;
+      requestRender();
+      renderUi();
+    }
+  };
+
+  const removeMask = (slot: 0 | 1): void => {
+    const s = maskSlots[slot];
+    volumeRenderer.setMask(slot, null);
+    s.gpuTex?.dispose();
+    s.gpuTex = undefined;
+    s.paletteGpuTex?.dispose();
+    s.paletteGpuTex = undefined;
+    s.classes = undefined;
+    s.error = undefined;
     requestRender();
     renderUi();
   };
   session.onDispose(() => {
-    maskGpuTex?.dispose();
-    maskPaletteGpuTex?.dispose();
+    for (const s of maskSlots) {
+      s.gpuTex?.dispose();
+      s.paletteGpuTex?.dispose();
+    }
   });
+
+  // Shared per-class mutators - both the public WebGpuViewerInstance API and the built-in HUD's
+  // hudEventCtx call these same functions, so driving a mask via a host app produces an identical
+  // result to driving it through the panel.
+  const setMaskClassColor = (slot: 0 | 1, id: number, rgb: readonly [number, number, number]): void => {
+    const cls = maskSlots[slot].classes?.find((c) => c.id === id);
+    if (cls) {
+      cls.color = [...rgb];
+      applyMaskPalette(slot);
+    }
+  };
+  const setMaskClassOpacity = (slot: 0 | 1, id: number, opacity: number): void => {
+    const cls = maskSlots[slot].classes?.find((c) => c.id === id);
+    if (cls) {
+      cls.opacity = opacity;
+      applyMaskPalette(slot);
+    }
+  };
+  const toggleMaskClassVisible = (slot: 0 | 1, id: number): void => {
+    const cls = maskSlots[slot].classes?.find((c) => c.id === id);
+    if (cls) {
+      cls.visible = !cls.visible;
+      applyMaskPalette(slot);
+    }
+  };
 
   // Recompute the equalize remap + displayed histogram from the raw distribution and current toggle.
   const recomputeEqualize = (): void => {
@@ -974,13 +1066,22 @@ export async function run(
     // interaction silently snapped the sidebar back to the top. <details> open/close state already
     // survives via `openSections`; scroll position needs the same explicit save/restore.
     const controlsBody = controlsPanelBody(rendering);
-    const annotationsBody = annotationsPanelBody({
-      maskUrl,
-      maskLoading,
-      maskError,
-      maskLoaded: maskClasses !== undefined,
-      classes: maskClasses ?? [],
-    });
+    const annotationsBody = annotationsPanelBody([
+      {
+        maskUrl: maskSlots[0].url,
+        maskLoading: maskSlots[0].loading,
+        maskError: maskSlots[0].error,
+        maskLoaded: maskSlots[0].classes !== undefined,
+        classes: maskSlots[0].classes ?? [],
+      },
+      {
+        maskUrl: maskSlots[1].url,
+        maskLoading: maskSlots[1].loading,
+        maskError: maskSlots[1].error,
+        maskLoaded: maskSlots[1].classes !== undefined,
+        classes: maskSlots[1].classes ?? [],
+      },
+    ]);
     const allPanels: { id: PanelId; title: string; body: string }[] = [
       { id: "data", title: "Data", body: dataBody },
       { id: "tf", title: "Transfer Function", body: tfBody },
@@ -1094,31 +1195,13 @@ export async function run(
     setActiveBandIndex: (v) => {
       activeBandIndex = v;
     },
-    loadMask: (url) => {
-      void loadMask(url);
+    loadMask: (slot, url) => {
+      void loadMask(slot, url);
     },
-    removeMask: () => removeMask(),
-    setMaskClassColor: (id, rgb) => {
-      const cls = maskClasses?.find((c) => c.id === id);
-      if (cls) {
-        cls.color = rgb;
-        applyMaskPalette();
-      }
-    },
-    setMaskClassOpacity: (id, opacity) => {
-      const cls = maskClasses?.find((c) => c.id === id);
-      if (cls) {
-        cls.opacity = opacity;
-        applyMaskPalette();
-      }
-    },
-    toggleMaskClassVisible: (id) => {
-      const cls = maskClasses?.find((c) => c.id === id);
-      if (cls) {
-        cls.visible = !cls.visible;
-        applyMaskPalette();
-      }
-    },
+    removeMask: (slot) => removeMask(slot),
+    setMaskClassColor,
+    setMaskClassOpacity,
+    toggleMaskClassVisible,
     getCollapsed: () => collapsed,
     setCollapsed: (v) => {
       collapsed = v;
@@ -1537,6 +1620,17 @@ export async function run(
     off: (event, cb) => {
       viewerListeners[event].delete(cb);
     },
+    loadMask: (slot, url) => {
+      void loadMask(slot, url);
+    },
+    loadMaskFromArray: (slot, data, dims) => {
+      void loadMaskArray(slot, data, dims);
+    },
+    removeMask: (slot) => removeMask(slot),
+    setMaskClassColor,
+    setMaskClassOpacity,
+    toggleMaskClassVisible,
+    getMaskClasses: (slot) => maskSlots[slot].classes,
     dispose: () => handle.dispose(),
   };
   return instance;
