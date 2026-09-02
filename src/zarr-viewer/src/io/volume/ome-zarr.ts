@@ -10,7 +10,7 @@
 import { units } from "@zarr-viewer/core";
 import type { Store } from "./zarr/store.js";
 import { readGroupAttrs, readArrayMeta } from "./zarr/metadata.js";
-import { openZarrArray, estimateValueRange } from "./zarr/array.js";
+import { openZarrArray, estimateValueRange, padValueRange } from "./zarr/array.js";
 import type { VolumeChunk, VolumeDType, VolumeSource } from "./volume-source.js";
 
 /** Options for {@link openOmeZarr}. */
@@ -206,7 +206,11 @@ export async function openOmeZarr(
   let valueRange: readonly [number, number] = options.valueRange ?? [0, 1];
   if (!options.valueRange && !options.skipRangeEstimate) {
     const coarse = levels.length - 1;
-    valueRange = await estimateValueRange(levels[coarse]!.source, 0);
+    // Widened (see padValueRange's doc comment): the coarsest-level scan below is exact for that
+    // level, but real finer-level values routinely fall outside it (box-filter downsampling
+    // compresses variance) and would otherwise hard-clamp on upload — most visibly, a real region
+    // reads as exactly empty and vanishes.
+    valueRange = padValueRange(await estimateValueRange(levels[coarse]!.source, 0));
     // Propagate range onto level sources by re-wrapping — OmeZarrVolumeSource holds the range.
   }
 

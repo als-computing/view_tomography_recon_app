@@ -36,7 +36,7 @@ export { httpStore, memoryStore, fileSystemStore, normalizeStoreKey } from "./vo
 export type { Store } from "./volume/zarr/store.js";
 export { readArrayMeta, readGroupAttrs, parseNumpyDtype } from "./volume/zarr/metadata.js";
 export type { ZarrArrayMeta, ParsedDType, ZarrCompressor } from "./volume/zarr/metadata.js";
-export { openZarrArray, estimateValueRange } from "./volume/zarr/array.js";
+export { openZarrArray, estimateValueRange, padValueRange } from "./volume/zarr/array.js";
 export type { OpenZarrArrayOptions } from "./volume/zarr/array.js";
 export { openOmeZarr } from "./volume/ome-zarr.js";
 export type { OpenOmeZarrOptions } from "./volume/ome-zarr.js";

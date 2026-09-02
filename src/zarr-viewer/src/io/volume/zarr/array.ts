@@ -447,3 +447,28 @@ export async function estimateValueRange(source: VolumeSource, level = 0): Promi
   if (min === max) return [min, min + 1];
   return [min, max];
 }
+
+/**
+ * Widens an estimated `[min, max]` (from {@link estimateValueRange}) by `fraction` of its span on
+ * each side. `estimateValueRange` only ever scans the *coarsest* pyramid level (scanning a full-res
+ * finest level would be prohibitively expensive over the network) — but that level's voxels are
+ * box-filter averages of finer voxels, which compresses variance, so real finer-level values routinely
+ * fall outside the coarse-derived range. Normalizing against an under-wide range then hard-clamps
+ * those real values (frequently to exactly the low end), which the ray march's empty-space skip reads
+ * as air — a real region can silently vanish (confirmed live: this was the root cause of a mask-blend
+ * regression once a downstream `max()` floor that happened to mask it was removed).
+ *
+ * This is a bounded, cheap, but *imperfect* mitigation, not a fix — it doesn't scan finer levels, so a
+ * true outlier further than `fraction * span` beyond the coarse range can still clamp. A tighter fix
+ * (bounded/sampled scan of the finest level) is a real, larger follow-up if this heuristic proves
+ * insufficient in practice; `fraction` is a single tunable constant for that reason.
+ */
+export function padValueRange(
+  range: readonly [number, number],
+  fraction = 0.15,
+): [number, number] {
+  const [min, max] = range;
+  const span = max - min || 1;
+  const pad = span * fraction;
+  return [min - pad, max + pad];
+}
