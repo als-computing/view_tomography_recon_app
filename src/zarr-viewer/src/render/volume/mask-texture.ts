@@ -159,7 +159,7 @@ export function uploadMaskArray(
 
   const classCounts = new Uint32Array(MASK_CLASS_COUNT);
   const bytesPerRow = Math.ceil(width / 256) * 256;
-  let packed: Uint8Array<ArrayBuffer>;
+  let packed: Uint8Array;
   if (bytesPerRow === width) {
     // No row padding needed - tally in place and re-wrap for writeTexture's ArrayBuffer-narrowing
     // workaround (see uploadMaskPalette's own comment on this).
@@ -182,7 +182,12 @@ export function uploadMaskArray(
 
   device.queue.writeTexture(
     { texture: texture.gpu },
-    packed,
+    // Re-wrap at the call site, same portable pattern as `uploadMaskPalette` above (a plain
+    // `Uint8Array` variable doesn't always narrow to the `ArrayBuffer`-backed form `writeTexture`
+    // wants) - keeps `packed`'s own declared type the plain, non-generic `Uint8Array` every
+    // TypeScript version understands, instead of the `Uint8Array<ArrayBuffer>` parameterization
+    // syntax that only exists from TS 5.7+ and broke a downstream consumer's older build outright.
+    new Uint8Array(packed),
     { bytesPerRow, rowsPerImage: height },
     { width, height, depthOrArrayLayers: depth },
   );
