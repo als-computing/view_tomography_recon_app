@@ -458,8 +458,16 @@ export async function run(
   // eased, currently-applied multiplier.
   const NAV_SAMPLE_DIST = 1.5; // coarse step multiplier held during navigation
   const NAV_SETTLE = 0.15; // seconds of camera stillness before refining back to the configured value
+  // Backlog item: cap how long the settled/full-quality TAAU accumulation run itself takes, not just
+  // how many samples it accumulates. taau.maxAccum (64 frames) bounds *quality*, but each of those
+  // frames pays full per-sample heavy-lighting cost - on a slow GPU/large dataset that can run well
+  // past a second, and resuming navigation mid-run has to wait out whatever's still in flight, which
+  // reads as lag. Stopping early holds whatever's accumulated so far (usually visually converged long
+  // before the sample cap) as the resting frame instead of grinding through the rest.
+  const TAAU_SETTLE_TIME_CAP_S = 0.5;
   let navSampleDist = 1;
   let taauPrevSettled = false; // tracks the moving↔settled edge so TAAU reseeds fine detail on settle
+  let settledElapsed = 0; // seconds since the moving→settled edge, reset whenever not settled
   // Milestone 6 (B3) Step 5, debug-only: KeyL shows the half-res lightAdd buffer instead of the real
   // image, for a visual sanity check of the new G-buffer lighting pass. Removed once B3 ships for real.
   let debugLightAdd = false;
@@ -1361,8 +1369,11 @@ export async function run(
     // lingering true stops mattering: once the accumulated image is as good as it's going to get, more
     // frames only cost time (each one re-runs the full per-sample lighting path, since half-res/
     // half-res-lighting are both off once settled - see `settled` below) without improving anything, so
-    // don't let isAnimating alone keep the loop rendering past that point.
-    const taauFullyConverged = rendering.temporalAA && taau.sampleCount >= taau.maxAccum;
+    // don't let isAnimating alone keep the loop rendering past that point. Also stop once the settled
+    // run has been going for TAAU_SETTLE_TIME_CAP_S, regardless of sample count - see its own comment.
+    const taauFullyConverged =
+      rendering.temporalAA &&
+      (taau.sampleCount >= taau.maxAccum || settledElapsed >= TAAU_SETTLE_TIME_CAP_S);
     if ((controls.isAnimating && !taauFullyConverged) || !camsEqual(camNow, lastRenderCam)) requestRender();
     if (canvas.width !== lastRenderW || canvas.height !== lastRenderH) requestRender();
     if (renderFrames <= 0) return;
@@ -1474,7 +1485,14 @@ export async function run(
     if (rendering.temporalAA) {
       // On the moving→settled edge, reseed accumulation so the sharp frames replace the coarse in-motion
       // history; a moving view keeps converging via reprojection rather than resetting.
-      if (settled && !taauPrevSettled) taau.reset();
+      if (settled && !taauPrevSettled) {
+        taau.reset();
+        settledElapsed = 0;
+      } else if (settled) {
+        settledElapsed += dt;
+      } else {
+        settledElapsed = 0;
+      }
       taauPrevSettled = settled;
       // Reprojection inputs use the UN-jittered matrices (jitter is only for the render's sub-pixel
       // supersampling). While moving, reproject history at the orbit-pivot depth; when settled, plain avg.
@@ -1601,7 +1619,13 @@ export async function run(
     lastRenderW = canvas.width;
     lastRenderH = canvas.height;
     const adaptiveEasing = Math.abs(navSampleDist - rendering.sampleDist) > 0.005;
-    const taauConverging = rendering.temporalAA && taau.sampleCount < taau.maxAccum;
+    // Mirrors taauFullyConverged's sample-cap-OR-time-cap logic above (recomputed here rather than
+    // reused, since settledElapsed was updated later in this same frame and this check runs after
+    // that update — using the stale earlier value would keep requesting one extra frame past the cap).
+    const taauConverging =
+      rendering.temporalAA &&
+      taau.sampleCount < taau.maxAccum &&
+      settledElapsed < TAAU_SETTLE_TIME_CAP_S;
     const brickFading = residency.isFading;
     if (adaptiveEasing || taauConverging || brickFading) requestRender();
   });
