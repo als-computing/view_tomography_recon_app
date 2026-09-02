@@ -114,8 +114,9 @@ export interface WebGpuCroppingState {
 
 /**
  * Default rendering state. Reproduces the viewer's original look: bone colormap, ACES tonemap at
- * exposure 0, one warm global directional light, everything else (FX extras, flashlight/stage,
- * shadows, AO, half-res, TAAU) off.
+ * exposure 1.2, one warm global directional light, half-res/TAAU/half-res-lighting all on (adaptive —
+ * they only apply while navigating, see `WebGpuVolumeViewer.ts`'s `settled`), everything else (FX
+ * extras, flashlight/stage, shadows, AO) off.
  */
 export function defaultRenderingState(): WebGpuRenderingState {
   return {

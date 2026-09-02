@@ -65,6 +65,14 @@ jobs:
         working-directory: src/zarr-viewer
         run: npm test
 
+      - name: Install Playwright Chromium
+        working-directory: src/zarr-viewer
+        run: npx playwright install --with-deps chromium
+
+      - name: WebGPU browser tests (Playwright)
+        working-directory: src/zarr-viewer
+        run: npx playwright test
+
       - name: Build zarr-viewer
         working-directory: src/zarr-viewer
         run: npm run build

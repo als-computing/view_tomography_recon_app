@@ -24,6 +24,6 @@
     },
     "baseUrl": "."
   },
-  "include": ["src/**/*.ts", "vite-zarr-static.ts", "vite.config.ts"],
+  "include": ["src/**/*.ts", "vite-zarr-static.ts", "vite.config.ts", "playwright.config.ts", "test/**/*.ts"],
   "exclude": ["src/fx/test", "src/render/accel/test"]
 }

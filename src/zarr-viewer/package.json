@@ -3,16 +3,18 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Standalone OME-Zarr WebGPU volume viewer (extracted from Prism Demo 26).",
+  "description": "WebGPU OME-Zarr tomography volume renderer, embedded in the parent app's React viewer.",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "test": "vitest run",
-    "coverage": "vitest run --coverage"
+    "coverage": "vitest run --coverage",
+    "test:browser": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/node": "^22.10.2",
     "@vitest/coverage-v8": "^3.2.7",
     "@webgpu/types": "^0.1.52",
