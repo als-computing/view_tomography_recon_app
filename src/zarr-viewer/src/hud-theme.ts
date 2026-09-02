@@ -271,7 +271,13 @@ const HUD_CSS = `
   position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
   height: 4px; border-radius: 999px; background: var(--whud-border); pointer-events: none;
 }
-.whud__range-fill { position: absolute; top: 0; bottom: 0; background: var(--whud-active); border-radius: 999px; }
+/* pointer-events is inherited from .whud__range-track's "none" unless overridden here - re-enable it
+   so the fill band is itself draggable (shifts both thumbs together, preserving the range width). */
+.whud__range-fill {
+  position: absolute; top: 0; bottom: 0; background: var(--whud-active); border-radius: 999px;
+  pointer-events: auto; cursor: grab;
+}
+.whud__range-fill:active { cursor: grabbing; }
 .whud__range-input {
   position: absolute; left: 0; right: 0; top: 0; width: 100%; height: 100%; margin: 0;
   background: transparent; pointer-events: none; -webkit-appearance: none; appearance: none;

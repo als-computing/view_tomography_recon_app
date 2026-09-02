@@ -734,9 +734,87 @@ export function bindHudInput(ctx: HudEventContext): void {
   });
 }
 
-/** Wire all three HUD event listeners at once. */
+/** Live drag state for {@link bindHudRangeDrag}; `null` when no drag is in progress. */
+interface RangeDragState {
+  fill: HTMLElement;
+  track: HTMLElement;
+  loEl: HTMLInputElement;
+  hiEl: HTMLInputElement;
+  startX: number;
+  startLo: number;
+  startHi: number;
+  pointerId: number;
+}
+
+/**
+ * Lets a dual-thumb `rangeSlider()` (crop X/Y/Z, TF color range, per-band TF range) be repositioned
+ * by dragging the filled band between its two thumbs, shifting both endpoints together and preserving
+ * the range's width — the fast way to move a crop ROI (or TF window) without dragging each edge
+ * separately and re-tuning the width afterward. Complements `bindHudInput`'s existing per-thumb drag
+ * (native `<input type="range">` elements) rather than replacing it; on every move this reuses that
+ * same handler (dispatches a real `input` event on the `lo` thumb) instead of duplicating its
+ * group-specific `color`/`tfBandRange`/`cropX|Y|Z` branches.
+ */
+export function bindHudRangeDrag(ctx: HudEventContext): void {
+  let drag: RangeDragState | null = null;
+
+  ctx.ui.addEventListener("pointerdown", (e) => {
+    const fill = (e.target as HTMLElement).closest<HTMLElement>("[data-range-fill]");
+    if (!fill) return;
+    const wrap = fill.closest<HTMLElement>(".whud__range");
+    const track = fill.closest<HTMLElement>(".whud__range-track");
+    const loEl = wrap?.querySelector<HTMLInputElement>('[data-range$=":lo"]');
+    const hiEl = wrap?.querySelector<HTMLInputElement>('[data-range$=":hi"]');
+    if (!wrap || !track || !loEl || !hiEl) return;
+    drag = {
+      fill,
+      track,
+      loEl,
+      hiEl,
+      startX: e.clientX,
+      startLo: Number(loEl.value),
+      startHi: Number(hiEl.value),
+      pointerId: e.pointerId,
+    };
+    fill.setPointerCapture(e.pointerId);
+    e.preventDefault(); // avoid text selection while dragging
+  });
+
+  ctx.ui.addEventListener("pointermove", (e) => {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    const rect = drag.track.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const width = drag.startHi - drag.startLo;
+    const deltaFrac = (e.clientX - drag.startX) / rect.width;
+    let lo = drag.startLo + deltaFrac;
+    let hi = drag.startHi + deltaFrac;
+    // Clamp the whole band against [0,1] without resizing it - shove both endpoints back in bounds
+    // together, rather than clamping lo/hi independently (which would shrink the range at an edge).
+    if (lo < 0) {
+      lo = 0;
+      hi = width;
+    } else if (hi > 1) {
+      hi = 1;
+      lo = 1 - width;
+    }
+    drag.loEl.value = String(lo);
+    drag.hiEl.value = String(hi);
+    drag.loEl.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+
+  const endDrag = (e: PointerEvent): void => {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    drag.fill.releasePointerCapture(e.pointerId);
+    drag = null;
+  };
+  ctx.ui.addEventListener("pointerup", endDrag);
+  ctx.ui.addEventListener("pointercancel", endDrag);
+}
+
+/** Wire all HUD event listeners at once. */
 export function bindHudEvents(ctx: HudEventContext): void {
   bindHudClick(ctx);
   bindHudChange(ctx);
   bindHudInput(ctx);
+  bindHudRangeDrag(ctx);
 }
