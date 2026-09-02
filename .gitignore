@@ -1,6 +1,10 @@
 #env
 .env
 
+# Personal machine-specific compose overrides (e.g. per-dataset bind mounts under friendly names) -
+# see README's "Add Tiled" section. Never committed; docker compose merges it automatically.
+docker-compose.override.yml
+
 # Logs
 logs
 *.log

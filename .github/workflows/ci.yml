@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: ['main']
+    branches: ['main', 'remote-tiled']
 
 jobs:
   ci:
@@ -23,8 +23,35 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Test root app
+        run: npm test
+
       - name: Build root app
         run: npm run build
+
+      - name: Validate docker-compose.yml
+        run: docker compose config -q
+
+      - name: Docker Compose smoke test
+        run: |
+          set -e
+          mkdir -p /tmp/tiled-ci-data/sample_scan
+          echo '{}' > /tmp/tiled-ci-data/sample_scan/placeholder.json
+          export DATA_PATH=/tmp/tiled-ci-data
+          docker compose build
+          docker compose up -d
+          trap 'docker compose logs; docker compose down -v' EXIT
+
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8001/api/v1/ > /dev/null && \
+               curl -sf http://localhost:5174/tomo_viewer/ > /dev/null; then
+              echo "Stack is up."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Stack did not become healthy in time." >&2
+          exit 1
 
       - name: Install zarr-viewer dependencies
         working-directory: src/zarr-viewer

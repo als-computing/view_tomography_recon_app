@@ -10,53 +10,37 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./cors.conf:/etc/nginx/cors.conf:ro
     depends_on:
-      # - tiled
+      - tiled
       - react
     restart: unless-stopped
     networks:
       - webnet
 
-  # tiled:
-  #   # build:
-  #   #   context: ./tiled
-  #   #   dockerfile: Dockerfile
-  #   image: ghcr.io/bluesky/tiled:0.2.3
-  #   environment:
-  #     - DATA_DIR=/storage/data
-  #     #- TILED_ALLOW_ORIGINS='["http://localhost:8787", "http://localhost:8082", "http://localhost:5174", "http://localhost:8000", "http://host.docker.internal:8787", "http://host.docker.internal:8082", "http://host.docker.internal:5174"]'
-  #     - TILED_SINGLE_USER_API_KEY=${TILED_SINGLE_USER_API_KEY}
-  #     - TILED_CONFIG=/deploy/config/custom_config.yml  # Point to our custom config
-  #   volumes:
-  #     - ${DATA_PATH:-./data}:/storage/data  # Mount data directory
-  #     - ./custom_config.yml:/deploy/config/custom_config.yml  # Mount custom config
-  #   expose:
-  #     - "8000"
-  #   networks:
-  #     - webnet
-  #   # command: >
-  #   #       sh -c "
-  #   #         # 1) Launch the server in the background
-  #   #         exec tiled serve config --host 0.0.0.0 --port 8000 --scalable & 
-  #   #         TILED_PID=\$!
-
-  #   #         # 2) Wait up to 30s for it to become healthy
-  #   #         sleep 30
-
-  #   #         # 3) Register your data once the server is accepting connections
-  #   #         tiled register http://localhost:8000/ /storage/data --api-key=${TILED_SINGLE_USER_API_KEY} --verbose
-
-  #   #         # 4) Hand control back to the server process so docker logs still show it
-  #   #         wait \$TILED_PID
-  #   #       "
-  #   command: sleep infinity
-  #   restart: unless-stopped
+  # Public/anonymous directory-serve Tiled (matches README's known-working native recipe). Zarr support
+  # is native upstream as of Tiled 0.2.15 (bluesky/tiled#774) - no forked image/build context needed.
+  # Folder names under DATA_PATH (sand, petiole, ...) become dataset names directly; no registration step.
+  tiled:
+    image: ghcr.io/bluesky/tiled:0.2.16
+    # --host 0.0.0.0 is required inside a container - tiled's own default (127.0.0.1) would be
+    # unreachable from the published port. --public skips API-key auth for reads (writes still need
+    # one; tiled auto-generates and prints it in the container logs if ever needed).
+    command: tiled serve directory /storage/data --host 0.0.0.0 --port 8000 --public --verbose
+    environment:
+      # JSON-array string, not space-separated - pydantic-settings' env parsing for this field
+      # requires it (confirmed against a known-working hand-run Tiled 0.2.11 container's own env).
+      - TILED_ALLOW_ORIGINS=["http://localhost:5174","http://tiled-test:5174"]
+    volumes:
+      - ${DATA_PATH:-./data}:/storage/data
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+    networks:
+      - webnet
 
   react:
     build:
       context: .
       dockerfile: react/Dockerfile
-    environment:
-      - VITE_API_TILED_URL=${VITE_API_TILED_URL:-http://localhost:8000}
     expose:
       - "5174"
     restart: unless-stopped

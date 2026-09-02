@@ -268,6 +268,16 @@ export const useTabsStore = create<TabsState>()((set, get) => {
     setServerId: (id) => {
       if (id === get().serverId) return;
       setActiveServerId(id);
+      // A Tiled access/refresh token is only valid for the server that issued it, but
+      // @blueskyproject/tiled stores it under one flat, non-server-scoped localStorage key
+      // ('tiledAccessToken'/'tiledRefreshToken'). Left in place across a server switch, a stale
+      // token from one server (e.g. staging) gets sent as an Authorization header to the other
+      // (e.g. a public/anonymous local server) — that server rejects the unrecognized token with
+      // 401, and the widget mistakes that for "this server requires login," showing its provider
+      // chooser even when the target server has no auth providers at all. Clearing on every
+      // switch is exactly what the widget's own "Clear Tokens" button does, just automatic.
+      localStorage.removeItem('tiledAccessToken');
+      localStorage.removeItem('tiledRefreshToken');
       // Old tabs hold old-origin URLs — drop them all; App opens the new server's default scan.
       graceTimers.forEach((t) => clearTimeout(t));
       graceTimers.clear();

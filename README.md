@@ -22,24 +22,24 @@ Once it is downloaded, cd into it:
 
 `cd view_tomography_recon_app`
 
-## Add Tiled
-
-Now let's also add a version of `Bluesky Tiled` that supports the `Zarr` format. In the root of `view_tomography_recon_app/`, run the following command to clone Tiled:
-
-`git clone -b add-zarr-forked https://github.com/davramov/tiled.git`
-
-Confirm that Tiled is saved in the correct location: `view_tomography_recon_app/tiled/`
-
 ## Set environment variables
 
-Create a new file `.env` in `view_tomography_recon_app/` (or rename `.env.example` ) and add the following lines (make sure to update the path to a real location):  
- 
+Create a new file `.env` in `view_tomography_recon_app/` (or rename `.env.example`) and set `DATA_PATH` to the parent directory of your reconstructed datasets:
+
 ```
 DATA_PATH=/absolute/path/to/your/reconstructions/wherever/they/are
-VITE_API_TILED_URL=http://localhost:8787/
-TILED_SINGLE_USER_API_KEY=<make a strong password>
 ```
-For the `TILED_SINGLE_USER_API_KEY`, you can use a command like `openssl rand -hex 12` to generate a strong key.
+
+`docker-compose.yml`'s `tiled` service serves that directory directly (`tiled serve directory ... --public`) - no registration step, no API key, no separate Tiled checkout. Subfolders show up as datasets by name. Tiled server URL/paths/default-dataset are configured in `src/tiledServers.ts` (`TILED_SERVERS`), not via env vars - edit that file if you need to point at a different local port or Tiled server.
+
+If your reconstructions have awkward on-disk names and you want friendlier dataset names in the catalog without renaming/copying the actual files, create a `docker-compose.override.yml` (gitignored, machine-specific - Docker Compose merges it automatically) that adds per-dataset bind mounts to the `tiled` service, e.g.:
+
+```yaml
+services:
+  tiled:
+    volumes:
+      - /absolute/path/to/rec2026..._petiole22.zarr:/storage/data/scans/petiole22.zarr:ro
+```
 
 ## Build and start the application
 
@@ -56,23 +56,18 @@ and you should see an output like this:
 ```
 (base) you@your-computer view_tomography_recon_app % docker compose ps
 NAME                                 IMAGE                              COMMAND                   SERVICE   CREATED      STATUS      PORTS
-view_tomography_recon_app-nginx-1    nginx:stable                       "/docker-entrypoint.…"    nginx     5 days ago   Up 2 days   0.0.0.0:8787->80/tcp
+view_tomography_recon_app-nginx-1    nginx:stable                       "/docker-entrypoint.…"    nginx     5 days ago   Up 2 days   0.0.0.0:5174->80/tcp
 view_tomography_recon_app-react-1    view_tomography_recon_app-react    "npm run dev -- --ho…"    react     4 days ago   Up 2 days   5174/tcp
-view_tomography_recon_app-tiled-1    view_tomography_recon_app-tiled    "sh -c '\n  # 1) Laun…"   tiled     4 days ago   Up 2 days   8000/tcp
-view_tomography_recon_app-viewer-1   view_tomography_recon_app-viewer   "npx itk-vtk-viewer …"    viewer    2 days ago   Up 2 days   8082/tcp
+view_tomography_recon_app-tiled-1    ghcr.io/bluesky/tiled:0.2.16       "tiled serve directo…"    tiled     4 days ago   Up 2 days   0.0.0.0:8001->8000/tcp
 ```
-
-## Authenticate
-
-Before we can use the app, we need to authenticate with Bluesky Tiled.
-
-In your browser, navigate to: http://localhost:8787/?api_key=TILED_SINGLE_USER_API_KEY (and make sure that you add your actual `TILED_SINGLE_USER_API_KEY`).
 
 ## Start the viewer
 
-To use the visualization app in your browser, go to: http://localhost:8787/react/
+Tiled runs in public/anonymous mode for reading, so no separate authentication step is needed. Open the app directly: http://localhost:5174/tomo_viewer/ — select "Local" in the header's server dropdown and your datasets (from `DATA_PATH`) should list in the Tiled browser widget.
 
-Note: you can access tiled and the viewer application from other computers by noting your [WAN IP address](http://wanip.info/) and using that instead of `localhost`.
+If you ever need the write-capable API key (e.g. to modify data through Tiled directly), it's printed at startup — `docker compose logs tiled`.
+
+Note: you can access the app from other computers by noting your [WAN IP address](http://wanip.info/) and using that instead of `localhost`.
 
 Voila!
 
@@ -94,26 +89,12 @@ Host your reconstructed data using `Tiled`, which we use to connect data servers
 
 #### Prepare environment
 
-`Tiled` support for `Zarr` is a work in progress, but there is a specific branch you can use for this application:
-
-*   `add-zarr-forked` branch: https://github.com/davramov/tiled/tree/add-zarr-forked
-*   This was a small addition to this PR on the source repo: https://github.com/bluesky/tiled/pull/774
-
-To install this version of Tiled, I recommend creating a new Conda environment and following the "[Install Tiled from Source](https://blueskyproject.io/tiled/tutorials/installation.html#source)" instructions:
+Zarr support is native in Tiled as of `bluesky/tiled` [PR #774](https://github.com/bluesky/tiled/pull/774) — install the regular published package (0.2.15+), no fork needed:
 
 ```
-conda create env -n "tiled_zarr_env python=3.12" 
+conda create -n tiled_zarr_env python=3.12
 conda activate tiled_zarr_env
-```
-
-#### Clone and install repository
-
-Instead of installing the main version, use this fork with Zarr support:
-
-```
-git clone -b add-zarr-forked https://github.com/davramov/tiled.git`
-cd tiled
-pip install -e ".[all]"
+pip install "tiled[all]"
 ```
 
 #### Start Tiled
