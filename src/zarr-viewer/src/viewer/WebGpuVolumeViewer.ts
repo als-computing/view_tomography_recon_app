@@ -693,6 +693,7 @@ export async function run(
   const removeMask = (slot: 0 | 1): void => {
     const s = maskSlots[slot];
     volumeRenderer.setMask(slot, null);
+    volumeRenderer.setMaskPalette(slot, null);
     s.gpuTex?.dispose();
     s.gpuTex = undefined;
     s.paletteGpuTex?.dispose();

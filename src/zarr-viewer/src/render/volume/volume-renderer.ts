@@ -310,9 +310,13 @@ export class VolumeRenderer implements Disposable {
     this.bindings.invalidate();
   }
 
-  /** Replace mask slot `slot`'s palette (class id → color+opacity, `rgba8unorm`, one row). */
-  public setMaskPalette(slot: 0 | 1, paletteTexture: ManagedTexture): void {
-    this.masks[slot].paletteTex = paletteTexture;
+  /** Set (or clear with `null`) mask slot `slot`'s palette (class id → color+opacity, `rgba8unorm`,
+   * one row) — mirrors {@link setMask}'s null-clears-the-slot shape. Without a `null` case, a caller
+   * that disposes the palette texture (e.g. removing the mask) would leave this renderer holding a
+   * stale reference to a disposed `ManagedTexture`, which throws on the next `createView()` call in
+   * `VolumeBindings.ensure()` and poisons the whole frame. */
+  public setMaskPalette(slot: 0 | 1, paletteTexture: ManagedTexture | null): void {
+    this.masks[slot].paletteTex = paletteTexture ?? undefined;
     this.bindings.invalidate();
   }
 
