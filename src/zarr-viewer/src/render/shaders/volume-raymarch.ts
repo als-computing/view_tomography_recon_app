@@ -284,9 +284,44 @@ fn visAccumulate(uvw: vec3<f32>, weight: f32) {
   atomicAdd(&visBins[idx], q);
 }
 
+// True (cheap, no texture fetch) when sampleDensity(uvw) at this point would resolve through the
+// fine ROI brick instead of the coarse volume - same AABB test sampleDensity itself runs, without
+// the actual texture load.
+fn brickResolved(uvw: vec3<f32>) -> bool {
+  if (frame.brickMin.w < 0.5) { return false; }
+  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
+  let p = uvw * (2.0 * halfExt) - halfExt;
+  let bUvw = (p - frame.brickMin.xyz) / max(frame.brickMax.xyz - frame.brickMin.xyz, vec3<f32>(1e-6));
+  return !(any(bUvw < vec3<f32>(0.0)) || any(bUvw > vec3<f32>(1.0)));
+}
+
+// Phase 2b hardening: the old fixed 0.75/textureDimensions(volumeTex) step (a) always used the
+// coarse texture's resolution even when this point actually resolves through the finer ROI brick
+// (aliased/over-blurred gradient right where the brick is supposed to add detail), and (b) took equal
+// steps per axis in raw voxel-count fraction, which is only equal in physical distance for isotropic
+// spacing - anisotropic voxel spacing (common in tomography, e.g. a coarser Z pitch) skewed gradient
+// direction/magnitude toward the finer-spaced axes.
+//
+// Fix: pick whichever texture this point actually resolves through (coarse vs. brick) for the step's
+// resolution, then size the per-axis step so it covers the same physical distance on every axis (the
+// finest axis's own voxel spacing, so resolution is never coarsened below what the old formula
+// already sampled at). For an isotropic volume (equal spacing/dims per axis) this reduces to exactly
+// the old 0.75/dims - no default-behavior change for the common case; anisotropic-spacing datasets
+// get a correctly-shaped gradient instead of a skewed one.
 fn densityGradient(uvw: vec3<f32>) -> vec3<f32> {
-  let dims = vec3<f32>(textureDimensions(volumeTex));
-  let e = 0.75 / max(dims, vec3<f32>(1.0));
+  let coarseExtent = 2.0 * max(frame.boxHalf.xyz, vec3<f32>(1e-6));
+  var texDims: vec3<f32>;
+  var worldExtent: vec3<f32>;
+  if (brickResolved(uvw)) {
+    texDims = vec3<f32>(textureDimensions(brickTex));
+    worldExtent = max(frame.brickMax.xyz - frame.brickMin.xyz, vec3<f32>(1e-6));
+  } else {
+    texDims = vec3<f32>(textureDimensions(volumeTex));
+    worldExtent = coarseExtent;
+  }
+  let voxelWorld = worldExtent / max(texDims, vec3<f32>(1.0));
+  let h = min(min(voxelWorld.x, voxelWorld.y), voxelWorld.z) * 0.75;
+  let e = vec3<f32>(h) / coarseExtent; // back into the coarse-box uvw units sampleDensity expects
   let dx = sampleDensity(uvw + vec3<f32>(e.x, 0.0, 0.0)) - sampleDensity(uvw - vec3<f32>(e.x, 0.0, 0.0));
   let dy = sampleDensity(uvw + vec3<f32>(0.0, e.y, 0.0)) - sampleDensity(uvw - vec3<f32>(0.0, e.y, 0.0));
   let dz = sampleDensity(uvw + vec3<f32>(0.0, 0.0, e.z)) - sampleDensity(uvw - vec3<f32>(0.0, 0.0, e.z));

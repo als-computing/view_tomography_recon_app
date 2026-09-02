@@ -9,9 +9,21 @@ import type { VolumeBlendMode } from "@zarr-viewer/render";
 import type { WebGpuRenderingState } from "../../RenderingState.js";
 import { segBtn, slider } from "../html.js";
 
+// Phase 2c hardening: "mip"/"average" maximize/average the TF's alpha-weighted color, not the raw
+// scalar density (see `marchColor()` in volume-raymarch.ts) — labels say so instead of implying a
+// true scalar projection.
+const BLEND_LABEL: Record<VolumeBlendMode, string> = {
+  composite: "composite",
+  mip: "TF-weighted MIP",
+  minip: "minip",
+  average: "TF-weighted average",
+};
+
 export function renderPanelBody(rendering: WebGpuRenderingState): string {
   const blends: VolumeBlendMode[] = ["composite", "mip", "minip", "average"];
-  const blendBtns = blends.map((b) => segBtn("data-blend", b, b, rendering.blendMode === b)).join("");
+  const blendBtns = blends
+    .map((b) => segBtn("data-blend", b, BLEND_LABEL[b], rendering.blendMode === b))
+    .join("");
   return [
     `<div class="whud__seg">${blendBtns}</div>`,
     `<div class="whud__hint" style="margin-top:6px">Shader config</div>`,

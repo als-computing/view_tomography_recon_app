@@ -7,7 +7,7 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 export default [
   // Ignore build output — including the vendored WebGPU renderer's own standalone build under
   // src/zarr-viewer/ (its source is TypeScript and isn't linted here anyway).
-  { ignores: ['dist', '**/dist', 'src/zarr-viewer/node_modules', '.vite'] },
+  { ignores: ['dist', '**/dist', 'src/zarr-viewer/node_modules', 'src/zarr-viewer/coverage', '.vite'] },
   {
     files: ['**/*.{js,jsx}'],
     languageOptions: {
