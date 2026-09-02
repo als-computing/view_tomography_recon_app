@@ -145,7 +145,21 @@ export interface WebGpuViewerInstance {
   toggleMaskClassVisible: (slot: 0 | 1, id: number) => void;
   /** `undefined` until that slot has a mask loaded (or after `removeMask`). */
   getMaskClasses: (slot: 0 | 1) => readonly MaskClassState[] | undefined;
+  /** Phase 4c hardening, scoped (not a budget-everything audit): estimated GPU bytes for the
+   * resource categories Phase 1 of the hardening pass already touches, plus the existing ROI-brick
+   * texture. `totalEstimatedGpuBytes` is the sum of the other three — NOT total GPU memory (the main
+   * displayed volume texture, mask textures, shadow map, occupancy grid, and TAAU history buffers are
+   * real GPU allocations not yet counted here; extend to more categories later if this proves useful). */
+  getMemoryStats: () => GpuMemoryStats;
   dispose: () => void;
+}
+
+/** See {@link WebGpuViewerInstance.getMemoryStats}. */
+export interface GpuMemoryStats {
+  gpuBrickBytes: number;
+  densityPyramidBytes: number;
+  renderTargetBytes: number;
+  totalEstimatedGpuBytes: number;
 }
 
 export async function run(
@@ -155,12 +169,30 @@ export async function run(
   const session = createViewerSession(canvas);
   resizeViewerCanvas(canvas);
 
-  const ctx = await createContext(canvas, { powerPreference: "high-performance" });
-  const maxTex = ctx.device.limits.maxTextureDimension3D;
+  // Phase 4a hardening: set once an *unrequested* device loss is detected (driver crash/reset — see
+  // `DeviceOptions.onDeviceLost`'s doc comment for why this stops at detection + a clear message
+  // rather than attempting full automatic reconstruction). The render loop checks this every frame
+  // and skips all GPU work once true, instead of throwing into a disposed/invalid device repeatedly.
+  let deviceLost = false;
+  const ctx = await createContext(canvas, {
+    powerPreference: "high-performance",
+    onDeviceLost: (info) => {
+      deviceLost = true;
+      const hud = createViewerHud({ position: "bottom-left", pointerEvents: true });
+      session.mountHud(hud);
+      hud.innerHTML = `<strong>GPU context lost</strong><div style="margin-top:8px">${
+        info.message || "The GPU device was lost unexpectedly (driver crash or reset)."
+      }</div><div style="margin-top:4px">Reload the page to continue.</div>`;
+    },
+  });
+  const maxTex = ctx.maxTextureDimension3D;
   // Free the GPU device when the session disposes. Registered first so it runs LAST (dispose is
   // LIFO), after the volume textures/buffers are released — important when the host app repeatedly
-  // toggles this renderer on and off, so WebGPU devices don't accumulate.
-  session.onDispose(() => ctx.device.destroy());
+  // toggles this renderer on and off, so WebGPU devices don't accumulate. Guarded: a device that's
+  // already lost (unrequested) is typically no longer safe/meaningful to call destroy() on again.
+  session.onDispose(() => {
+    if (!deviceLost) ctx.device.destroy();
+  });
 
   const valueRange: [number, number] = [-40, 40];
   // Everything that shapes the volume's appearance (transfer function + render params + view mode).
@@ -247,6 +279,12 @@ export async function run(
     setMaskClassOpacity: () => {},
     toggleMaskClassVisible: () => {},
     getMaskClasses: () => undefined,
+    getMemoryStats: () => ({
+      gpuBrickBytes: 0,
+      densityPyramidBytes: 0,
+      renderTargetBytes: 0,
+      totalEstimatedGpuBytes: 0,
+    }),
     dispose: () => handle.dispose(),
   });
 
@@ -1344,6 +1382,7 @@ export async function run(
   );
 
   session.loop((dt) => {
+    if (deviceLost) return; // Phase 4a hardening — stop all GPU work once the device is gone
     resizeViewerCanvas(canvas);
     controls.update(dt); // the orbit pivot is clamped to the volume bounds inside update() via targetBounds
     // Render on demand: the volume ray-march is expensive, so re-render only while something is actually
@@ -1671,6 +1710,17 @@ export async function run(
     setMaskClassOpacity,
     toggleMaskClassVisible,
     getMaskClasses: (slot) => maskSlots[slot].classes,
+    getMemoryStats: () => {
+      const gpuBrickBytes = residency.brickBytes;
+      const densityPyramidBytes = volumeRenderer.densityPyramidBytes;
+      const renderTargetBytes = fxPipeline.renderTargetBytes;
+      return {
+        gpuBrickBytes,
+        densityPyramidBytes,
+        renderTargetBytes,
+        totalEstimatedGpuBytes: gpuBrickBytes + densityPyramidBytes + renderTargetBytes,
+      };
+    },
     dispose: () => handle.dispose(),
   };
   return instance;

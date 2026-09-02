@@ -18,6 +18,35 @@ export interface TextureDesc {
   sampleCount?: number;
 }
 
+/**
+ * Bytes per texel for the `GPUTextureFormat`s this codebase actually creates (volume/mask/render-
+ * target/depth textures — see call sites of `ManagedTexture`/`device.createTexture`). Not a complete
+ * `GPUTextureFormat` table — Phase 4c hardening (GPU memory accounting) only needs formats already in
+ * use; an unrecognized format falls back to a documented estimate rather than throwing, since this
+ * feeds a best-effort memory *estimate*, not something that should crash the app.
+ */
+export function bytesPerTexel(format: GPUTextureFormat): number {
+  switch (format) {
+    case "r8unorm":
+    case "r8uint":
+      return 1;
+    case "r16float":
+      return 2;
+    case "rgba8unorm":
+    case "r32float":
+    case "depth24plus":
+    case "depth32float":
+      return 4;
+    case "rg32float":
+    case "rgba16float":
+      return 8;
+    case "rgba32float":
+      return 16;
+    default:
+      return 4; // unrecognized format — reasonable middle-ground estimate, not exact
+  }
+}
+
 /** A managed GPU texture with a cached default view. */
 export class ManagedTexture implements Disposable {
   private texture: GPUTexture | undefined;
@@ -69,6 +98,23 @@ export class ManagedTexture implements Disposable {
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
       sampleCount,
     });
+  }
+
+  /** Estimated GPU bytes this texture occupies — full mip chain, `sampleCount` multiplied in (MSAA
+   * targets store one sample-plane per sample). Phase 4c hardening: lets memory-accounting code (e.g.
+   * `getMemoryStats()`) read a texture's size generically instead of each caller re-deriving it. */
+  public get sizeBytes(): number {
+    const [w, h, d] = this.desc.size;
+    const texelBytes = bytesPerTexel(this.desc.format);
+    const mipLevelCount = this.desc.mipLevelCount ?? 1;
+    let total = 0;
+    for (let level = 0; level < mipLevelCount; level++) {
+      const lw = Math.max(1, w >> level);
+      const lh = Math.max(1, h >> level);
+      const ld = Math.max(1, d >> level);
+      total += lw * lh * ld * texelBytes;
+    }
+    return total * (this.desc.sampleCount ?? 1);
   }
 
   /** The underlying GPU texture. */

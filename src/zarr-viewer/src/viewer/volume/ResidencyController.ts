@@ -175,6 +175,12 @@ export class ResidencyController {
     return this.brickBlendCurrent !== this.brickBlendTarget;
   }
 
+  /** Estimated GPU bytes held by the currently resident ROI brick texture, or 0 when none is
+   * resident. Phase 4c hardening: feeds `getMemoryStats()`'s `gpuBrickBytes`. */
+  public get brickBytes(): number {
+    return this.brickLoader.currentBrick?.texture.sizeBytes ?? 0;
+  }
+
   private setProgress(p: { loaded: number; total: number } | null): void {
     this.progressValue = p;
     this.deps.notifyProgress(p);

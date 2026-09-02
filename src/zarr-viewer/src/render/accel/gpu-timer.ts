@@ -47,9 +47,13 @@ export class GpuTimer implements Disposable {
   public constructor(
     private readonly device: GPUDevice,
     maxPasses = 8,
+    // Phase 4b hardening: callers that already have a `GpuContext` should pass its
+    // `supportsTimestampQuery` (computed once at device creation) instead of re-deriving it here;
+    // defaults to the old self-derived check so existing/test call sites with a bare device keep working.
+    supported = device.features.has("timestamp-query"),
   ) {
     this.maxPasses = maxPasses;
-    this.supported = device.features.has("timestamp-query");
+    this.supported = supported;
     if (!this.supported) return;
     this.querySet = device.createQuerySet({ type: "timestamp", count: maxPasses * 2 });
     this.resolveBuffer = device.createBuffer({

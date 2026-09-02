@@ -499,6 +499,12 @@ export class VolumeRenderer implements Disposable {
     return this.acceleration.visibilityFeedback;
   }
 
+  /** Estimated GPU bytes held by the density pre-integration pyramid, or 0 when none is allocated
+   * (lazy, "quality"-config-only — see `VolumeAcceleration`'s own doc). Phase 4c hardening. */
+  public get densityPyramidBytes(): number {
+    return this.acceleration.densityPyramidBytes;
+  }
+
   /** Early-ray-termination alpha threshold in `(0, 1]` (default `0.995`). */
   public setEarlyRayTermination(threshold: number): void {
     this.earlyRayTermination = Math.min(1, Math.max(0.5, threshold));

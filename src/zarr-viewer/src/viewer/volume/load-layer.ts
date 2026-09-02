@@ -42,7 +42,7 @@ export async function loadLayerVolume(ctx: GpuContext, url: string, system: unit
   const store = httpStore(url);
   const source = await openOmeZarr(store, { skipRangeEstimate: true });
 
-  const maxTex = ctx.device.limits.maxTextureDimension3D;
+  const maxTex = ctx.maxTextureDimension3D;
   const levels = listUploadableLevels(source, { maxTextureDimension: maxTex });
   if (levels.length === 0) {
     throw new Error(`Layer has no uploadable resolution level (GPU max 3D texture ${maxTex}).`);

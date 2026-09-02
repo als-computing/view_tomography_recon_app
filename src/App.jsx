@@ -116,6 +116,12 @@ function App() {
   const handleWebGpuReady = useCallback((id, instance) => {
     if (instance) {
       webgpuInstancesRef.current.set(id, instance);
+      // Debug convenience only (Phase 4c hardening: makes getMemoryStats() and the rest of the
+      // WebGpuViewerInstance API reachable from the browser console) - `window.viewer` tracks
+      // whichever pane most recently became ready (the common single-pane case); every pane is
+      // also reachable via `window.__webgpuViewers` (tab id -> instance), same map this ref holds.
+      window.viewer = instance;
+      window.__webgpuViewers = webgpuInstancesRef.current;
       // Replay a WebGPU shared-link snapshot once this pane is renderable, then consume it.
       const tab = useTabsStore.getState().tabs.find((t) => t.id === id);
       const pending = tab && pendingStateRef.current.get(tab.url);
@@ -124,7 +130,12 @@ function App() {
         applyWebGpuViewState(instance, pending);
       }
     } else {
+      const removed = webgpuInstancesRef.current.get(id);
       webgpuInstancesRef.current.delete(id);
+      if (window.viewer === removed) {
+        const remaining = webgpuInstancesRef.current.values().next();
+        window.viewer = remaining.done ? undefined : remaining.value;
+      }
     }
     setWebgpuInstanceVersion((v) => v + 1);
   }, []);

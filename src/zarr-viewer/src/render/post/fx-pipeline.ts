@@ -184,11 +184,17 @@ export class FxPipeline {
     return this.#timer.lastSamples;
   }
 
+  /** Estimated GPU bytes held by this pipeline's transient render-target pool (HDR/depth/G-buffer/
+   * lighting-composite targets). Phase 4c hardening: feeds `getMemoryStats()`'s `renderTargetBytes`. */
+  public get renderTargetBytes(): number {
+    return this.#graph.poolBytes();
+  }
+
   public constructor(ctx: GpuContext) {
     this.#ctx = ctx;
     this.#graph = new RenderGraph(ctx.device);
     this.#stack = new PostStack([]);
-    this.#timer = new GpuTimer(ctx.device);
+    this.#timer = new GpuTimer(ctx.device, 8, ctx.supportsTimestampQuery);
     this.#debugCache = new PipelineCache(ctx.device);
     this.#compositeCache = new PipelineCache(ctx.device);
   }

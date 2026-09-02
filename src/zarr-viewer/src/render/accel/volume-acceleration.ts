@@ -161,6 +161,13 @@ export class VolumeAcceleration implements Disposable {
     return this.densityPyramid?.texture ?? this.dummyDensityPyramid;
   }
 
+  /** Estimated GPU bytes held by the real density pyramid, or 0 when none is allocated (lazy — see
+   * `pendingVolumeSize`'s doc comment) — unlike {@link densityPyramidTexture}, does NOT count the 1x1x1
+   * dummy. Phase 4c hardening: feeds `getMemoryStats()`'s `densityPyramidBytes`. */
+  public get densityPyramidBytes(): number {
+    return this.densityPyramid?.texture.sizeBytes ?? 0;
+  }
+
   /**
    * Enable/point the opacity shadow map (Milestone 7.1). A meaningful change of direction (or the
    * enable) marks the map dirty so it rebuilds on the next pre-pass; unchanged inputs cost nothing.

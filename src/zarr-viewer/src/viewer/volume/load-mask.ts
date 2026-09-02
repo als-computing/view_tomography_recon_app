@@ -60,7 +60,7 @@ export async function loadMaskVolume(
   const store = httpStore(url);
   const source = await openOmeZarr(store, { skipRangeEstimate: true });
 
-  const maxTex = ctx.device.limits.maxTextureDimension3D;
+  const maxTex = ctx.maxTextureDimension3D;
   const levels = listUploadableLevels(source, { maxTextureDimension: maxTex });
   if (levels.length === 0) {
     throw new Error(`Mask has no uploadable resolution level (GPU max 3D texture ${maxTex}).`);

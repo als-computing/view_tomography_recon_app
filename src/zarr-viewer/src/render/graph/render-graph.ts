@@ -15,6 +15,7 @@
  */
 
 import { PrismError } from "@zarr-viewer/core";
+import { bytesPerTexel } from "../resources/texture.js";
 
 /** A handle to a transient or imported graph resource. */
 export type ResourceHandle = number & { readonly __brand: "ResourceHandle" };
@@ -332,6 +333,28 @@ export class RenderGraph {
     this.device.queue.submit([encoder.finish()]);
 
     for (const { key, texture } of acquired) this.#release(key, texture);
+  }
+
+  /** Estimated GPU bytes currently held by this graph's pooled (transient render-target) textures —
+   * called between frames, every texture used last frame is back in the pool (see `execute()`'s
+   * `#release` call after each pass runs), so this reflects the graph's current working set. Phase 4c
+   * hardening: feeds `WebGpuVolumeViewer.getMemoryStats()`'s `renderTargetBytes`. */
+  public poolBytes(): number {
+    let total = 0;
+    for (const list of this.#pool.values()) {
+      for (const t of list) {
+        const texelBytes = bytesPerTexel(t.format);
+        let texBytes = 0;
+        for (let level = 0; level < t.mipLevelCount; level++) {
+          const w = Math.max(1, t.width >> level);
+          const h = Math.max(1, t.height >> level);
+          const d = Math.max(1, t.depthOrArrayLayers >> level);
+          texBytes += w * h * d * texelBytes;
+        }
+        total += texBytes * t.sampleCount;
+      }
+    }
+    return total;
   }
 
   /** Destroy all pooled textures. */
