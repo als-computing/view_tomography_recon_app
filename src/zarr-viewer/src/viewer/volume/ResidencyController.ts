@@ -14,7 +14,6 @@ import type { Node } from "@zarr-viewer/scene";
 import type { OrbitControls } from "@zarr-viewer/controls";
 import type { Mat4 } from "@zarr-viewer/math";
 import { cropIsSet, focalRoiUvw } from "./roi-geometry.js";
-import { camsEqual, type CameraPoseLike } from "../camera/compare.js";
 import type { WebGpuCroppingState } from "../RenderingState.js";
 
 /** Seconds of camera stillness before (re)streaming a new ROI region. */
@@ -86,7 +85,6 @@ export class ResidencyController {
   private regionServedFor = 0;
   private roiRequestInFlight = false; // a brick request is streaming (drives the reset guard + progress bar)
   private roiReqSeq = 0; // monotonic id so a superseded request's finally() can't clobber a newer one
-  private prevRoiCam: CameraPoseLike;
   private progressValue: { loaded: number; total: number } | null = null;
   /**
    * Sticky visibility-hint bin (Milestone 1), + the priority it had when picked. The vis-bin readback
@@ -102,7 +100,6 @@ export class ResidencyController {
 
   public constructor(deps: ResidencyDeps) {
     this.deps = deps;
-    this.prevRoiCam = deps.controls.getState();
     this.brickLoader = new BrickLoader(deps.device, {
       supportsFloat32Filtering: deps.supportsFloat32Filtering,
     });
@@ -209,10 +206,17 @@ export class ResidencyController {
    */
   public update(dt: number): void {
     const { deps: d } = this;
-    const cs = d.controls.getState();
-    if (!camsEqual(cs, this.prevRoiCam)) {
+    // Was a raw camsEqual(getState(), prevRoiCam) pose comparison - camsEqual's tolerance is relative
+    // to coordinate magnitude and "balloons to several world units" for a dataset whose camera offset
+    // is large (see WebGpuVolumeViewer.ts's own render-loop comment on exactly this), so a genuinely
+    // still-converging damping tail could fall under that bloated tolerance and be misread as "camera
+    // unchanged" - roiIdle then accumulates prematurely, which (via `settled`/TAAU) can gate off the
+    // render loop's own scale-independent isAnimating check and freeze the canvas mid-interaction until
+    // new input forces a few more frames through. `controls.isAnimating` (normalized directions +
+    // relative distance error) is already the scale-independent signal built for exactly this; use it
+    // directly instead of a second, less reliable "is the camera still" test.
+    if (d.controls.isAnimating) {
       this.roiIdle = 0;
-      this.prevRoiCam = cs;
     } else {
       this.roiIdle += dt;
     }

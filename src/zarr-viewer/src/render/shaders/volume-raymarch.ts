@@ -168,7 +168,17 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 }
 
 fn intersectAabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
-  let inv = 1.0 / rd;
+  // Guard each axis away from exactly zero (preserving sign) before taking the reciprocal. An
+  // unguarded 1.0/rd is +-inf on a near-axis-aligned ray component, and inf*0 = NaN whenever the
+  // matching numerator (bmin-ro or bmax-ro) is also ~0 - routine here, since uvw naturally lands on
+  // grid-cell boundaries as the ray steps through the occupancy grid (this fn's most frequent caller),
+  // and near-axis-aligned view angles are passed through during ordinary camera rotation, not just a
+  // rare exact coincidence. A NaN tNear/tFar poisons every later sample on that ray, rendering that
+  // pixel as background - intermittent, per-pixel volume dropout tied to view angle.
+  let EPS = 1e-6;
+  let sign_ = select(vec3<f32>(1.0), vec3<f32>(-1.0), rd < vec3<f32>(0.0));
+  let safeRd = select(rd, sign_ * EPS, abs(rd) < vec3<f32>(EPS));
+  let inv = 1.0 / safeRd;
   let t0 = (bmin - ro) * inv;
   let t1 = (bmax - ro) * inv;
   let tmin = min(t0, t1);

@@ -71,8 +71,15 @@ struct TileParams {
 @group(0) @binding(3) var<storage, read_write> compacted: array<TileInst>;
 @group(0) @binding(4) var<storage, read_write> drawArgs: array<atomic<u32>>;
 
+// Must match volume-raymarch.ts's own copy (both bind the same conceptual test) - see that file's
+// comment for why the reciprocal needs an away-from-zero guard: an unguarded 1.0/rd on a near-axis-
+// aligned ray component produces NaN whenever the matching numerator is also ~0, which here would
+// wrongly cull an entire tile (never drawn at all) instead of just corrupting one ray.
 fn intersectAabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
-  let inv = 1.0 / rd;
+  let EPS = 1e-6;
+  let sign_ = select(vec3<f32>(1.0), vec3<f32>(-1.0), rd < vec3<f32>(0.0));
+  let safeRd = select(rd, sign_ * EPS, abs(rd) < vec3<f32>(EPS));
+  let inv = 1.0 / safeRd;
   let t0 = (bmin - ro) * inv;
   let t1 = (bmax - ro) * inv;
   let tmin = min(t0, t1);

@@ -403,17 +403,25 @@ class ZarrArraySource implements VolumeSource {
     return chunk;
   }
 
-  public async *chunks(level: number): AsyncIterable<VolumeChunk> {
+  public chunks(level: number): AsyncIterable<VolumeChunk> {
     if (level !== 0) throw new Error("ZarrArraySource has only level 0");
     const counts = this.diskChunkCounts();
-    // Iterate disk chunk grid; yield xyz-ordered chunks.
+    const indices: number[][] = [];
     for (let c0 = 0; c0 < counts[0]!; c0++) {
       for (let c1 = 0; c1 < counts[1]!; c1++) {
         for (let c2 = 0; c2 < (counts[2] ?? 1); c2++) {
-          yield await this.readDiskChunk([c0, c1, c2]);
+          indices.push([c0, c1, c2]);
         }
       }
     }
+    // Bounded-concurrency fetch, same rationale/pattern as readRegion() below: on a remote store a
+    // whole-level upload's wall-clock is dominated by fetch latency × chunk count, and a dataset whose
+    // finest level actually fits the device's texture budget (unlike every previously-tested dataset,
+    // where level 0 was always excluded by listUploadableLevels()) can have thousands of chunks here —
+    // one-at-a-time fetching serialized that entire round-trip cost, and its interleaved per-chunk
+    // decode/scatter work between awaits was frequent enough to jank the main thread mid-navigation.
+    const concurrency = Math.max(1, Math.min(READ_REGION_CONCURRENCY, indices.length));
+    return pooledMap(indices, concurrency, (ci) => this.readDiskChunk(ci));
   }
 }
 
