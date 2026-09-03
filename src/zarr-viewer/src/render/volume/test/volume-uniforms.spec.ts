@@ -64,10 +64,12 @@ const BASE_PARAMS: VolumeFrameParams = {
   measurePlaneGray: 0.5,
   measurePlaneAlpha: 0.35,
   measureForward: [0, 0, 1],
-  brickMin: [0, 0, 0],
-  brickMax: [0, 0, 0],
-  brickEnabled: false,
-  brickBlend: 1,
+  bricks: [
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+  ],
   visEnabled: false,
   internalWidth: 800,
   internalHeight: 600,
@@ -84,7 +86,7 @@ const BASE_PARAMS: VolumeFrameParams = {
 };
 
 function pack(overrides: Partial<VolumeFrameParams> = {}): Float32Array {
-  const d = new Float32Array(140);
+  const d = new Float32Array(164);
   writeVolumeFrameUniform(d, new Mat4(), FAKE_ACCEL, { ...BASE_PARAMS, ...overrides });
   return d;
 }
@@ -144,11 +146,11 @@ describe("writeVolumeFrameUniform", () => {
     expect(d[28]).toBe(1); // keyRad
     expect(d[60]).toBe(2); // lightCount
     const occ = FAKE_ACCEL.occupancyGrid;
-    expect([d[88], d[89], d[90]]).toEqual(occ);
+    expect([d[112], d[113], d[114]]).toEqual(occ);
     const vis = FAKE_ACCEL.visGrid;
-    expect([d[92], d[93], d[94]]).toEqual(vis);
-    for (let k = 0; k < 16; k++) expect(d[100 + k]).toBe(k);
-    expect(d[116]).toBe(1); // shadowActive
+    expect([d[116], d[117], d[118]]).toEqual(vis);
+    for (let k = 0; k < 16; k++) expect(d[124 + k]).toBe(k);
+    expect(d[140]).toBe(1); // shadowActive
   });
 
   it("packs the alpha-composite flag from `clear`", () => {
@@ -163,14 +165,14 @@ describe("writeVolumeFrameUniform", () => {
 
   it("packs camera basis with fov half-extents in the w components", () => {
     const d = pack({ camAspect: 2, tanHalfFovY: 0.5 });
-    expect(d[123]).toBeCloseTo(1); // tanHalfFovY * aspect
-    expect(d[127]).toBeCloseTo(0.5);
+    expect(d[147]).toBeCloseTo(1); // tanHalfFovY * aspect
+    expect(d[151]).toBeCloseTo(0.5);
   });
 
   it("packs mask0Ctl/mask1Ctl (enable + mask voxel dims) independently per slot", () => {
     const off = pack();
-    expect(off[128]).toBe(0); // mask0 disabled
-    expect(off[132]).toBe(0); // mask1 disabled
+    expect(off[152]).toBe(0); // mask0 disabled
+    expect(off[156]).toBe(0); // mask1 disabled
 
     const slot0On = pack({
       masks: [
@@ -178,9 +180,9 @@ describe("writeVolumeFrameUniform", () => {
         { enabled: false, dims: [1, 1, 1] },
       ],
     });
-    expect(slot0On[128]).toBe(1);
-    expect([slot0On[129], slot0On[130], slot0On[131]]).toEqual([64, 32, 16]);
-    expect(slot0On[132]).toBe(0); // slot 1 untouched
+    expect(slot0On[152]).toBe(1);
+    expect([slot0On[153], slot0On[154], slot0On[155]]).toEqual([64, 32, 16]);
+    expect(slot0On[156]).toBe(0); // slot 1 untouched
 
     const bothOn = pack({
       masks: [
@@ -188,13 +190,37 @@ describe("writeVolumeFrameUniform", () => {
         { enabled: true, dims: [8, 8, 8] },
       ],
     });
-    expect(bothOn[128]).toBe(1);
-    expect(bothOn[132]).toBe(1);
-    expect([bothOn[133], bothOn[134], bothOn[135]]).toEqual([8, 8, 8]);
+    expect(bothOn[152]).toBe(1);
+    expect(bothOn[156]).toBe(1);
+    expect([bothOn[157], bothOn[158], bothOn[159]]).toEqual([8, 8, 8]);
   });
 
   it("packs lowDensitySkipThreshold into skipCtl.x", () => {
-    expect(pack({ lowDensitySkipThreshold: 0.01 })[136]).toBeCloseTo(0.01);
-    expect(pack({ lowDensitySkipThreshold: 0.003 })[136]).toBeCloseTo(0.003);
+    expect(pack({ lowDensitySkipThreshold: 0.01 })[160]).toBeCloseTo(0.01);
+    expect(pack({ lowDensitySkipThreshold: 0.003 })[160]).toBeCloseTo(0.003);
+  });
+
+  it("packs bricks[0..3] world min/max (w = enabled/blend) at floats 80..111, one slot at a time", () => {
+    const allOff = pack();
+    for (let i = 0; i < 4; i++) {
+      expect(allOff[80 + i * 4 + 3]).toBe(0); // enabled
+    }
+
+    const withSlot2 = pack({
+      bricks: [
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+        { enabled: true, worldMin: [-0.1, -0.2, -0.3], worldMax: [0.1, 0.2, 0.3], blend: 0.5 },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+      ],
+    });
+    [withSlot2[88], withSlot2[89], withSlot2[90]].forEach((v, i) => expect(v).toBeCloseTo([-0.1, -0.2, -0.3][i]!));
+    expect(withSlot2[91]).toBe(1);
+    [withSlot2[104], withSlot2[105], withSlot2[106]].forEach((v, i) => expect(v).toBeCloseTo([0.1, 0.2, 0.3][i]!));
+    expect(withSlot2[107]).toBe(0.5);
+    // Other slots untouched (still disabled).
+    expect(withSlot2[83]).toBe(0);
+    expect(withSlot2[95]).toBe(0);
+    expect(withSlot2[92 + 3]).toBe(0);
   });
 });

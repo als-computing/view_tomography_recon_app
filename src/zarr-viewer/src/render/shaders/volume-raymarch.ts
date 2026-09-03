@@ -12,8 +12,10 @@ import { PREINTEGRATION_SIGMA_MAX } from "../volume/preintegration-2d.js";
 import { VOLUME_LIGHTING_SHARED_WGSL } from "./volume-lighting-shared.js";
 import { MASK_BINDING_BASE } from "../volume/volume-bindings.js";
 
-/** Byte size of the volume frame uniform block (mat4 + 24 × vec4 + shadow mat4 + shadowCtl + camRight/camUp). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 560;
+/** Byte size of the volume frame uniform block (mat4 + 24 × vec4 + shadow mat4 + shadowCtl + camRight/
+ * camUp + 4-slot brick arrays — item 9 stage 9a grew this from 560 by 96 bytes replacing the old
+ * single brickMin/brickMax vec4 pair with 4-slot brickWorldMin/brickWorldMax arrays). */
+export const VOLUME_FRAME_UNIFORM_SIZE = 656;
 
 /** Compile-time specialization for {@link volumeRaymarchWgsl}. */
 export interface VolumeRaymarchSpec {
@@ -73,8 +75,11 @@ struct Frame {
   lightCtl2: vec4<f32>,      // x = aoEnable, y = aoRadius (uvw frac), z = aoIntensity, w = aoSamples
   measurePlane: vec4<f32>,   // x = enable, y = depth (world, along view axis), z = gray, w = alpha
   measureFwd: vec4<f32>,     // xyz = camera forward (world, unit); marks the measure plane in depth
-  brickMin: vec4<f32>,       // xyz = ROI brick world min, w = enable (1 = composite fine brick)
-  brickMax: vec4<f32>,       // xyz = ROI brick world max, w = brickBlend fade weight [0,1]
+  // Item 9 stage 9a: up to 4 simultaneously-resident ROI brick slots (was a single brickMin/brickMax
+  // vec4 pair). Only slot 0 is ever populated by the CPU side today — slots 1-3 are always disabled,
+  // so this is byte-for-byte the old single-brick model in degenerate form.
+  brickWorldMin: array<vec4<f32>, 4>, // per-slot world min, w = enable (1 = composite this slot)
+  brickWorldMax: array<vec4<f32>, 4>, // per-slot world max, w = blend fade weight [0,1]
   accelOcc: vec4<f32>,       // xyz = occupancy macrocell grid, w unused
   visGrid: vec4<f32>,        // xyz = vis-bin grid, w = visEnable (1 = accumulate)
   screen: vec4<f32>,         // xy = internal pixels, z = tile size
@@ -177,20 +182,40 @@ fn ign(p: vec2<f32>) -> f32 {
   return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
 }
 
-fn sampleDensity(uvw: vec3<f32>) -> f32 {
-  let coarse = textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r;
-  if (frame.brickMin.w < 0.5) { return coarse; } // no high-res ROI brick
-  // Map the world point (uvw is over the full coarse box) into the ROI brick's [0,1]^3.
+// Item 9 stage 9a: which (if any) of the 4 brick slots' world AABB contains this point - same test
+// sampleDensity/brickResolved themselves need, extracted once so both share it. Returns 4u for "none".
+// First-match-wins by slot order (slots shouldn't normally overlap under a well-behaved policy, but
+// this makes overlap well-defined rather than undefined behavior).
+fn resolveBrickSlot(uvw: vec3<f32>) -> u32 {
   let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
   let p = uvw * (2.0 * halfExt) - halfExt;
-  let bUvw = (p - frame.brickMin.xyz) / max(frame.brickMax.xyz - frame.brickMin.xyz, vec3<f32>(1e-6));
-  if (any(bUvw < vec3<f32>(0.0)) || any(bUvw > vec3<f32>(1.0))) { return coarse; }
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    let bmin = frame.brickWorldMin[i];
+    if (bmin.w < 0.5) { continue; } // slot disabled
+    let bmax = frame.brickWorldMax[i];
+    let bUvw = (p - bmin.xyz) / max(bmax.xyz - bmin.xyz, vec3<f32>(1e-6));
+    if (any(bUvw < vec3<f32>(0.0)) || any(bUvw > vec3<f32>(1.0))) { continue; }
+    return i;
+  }
+  return 4u;
+}
+
+fn sampleDensity(uvw: vec3<f32>) -> f32 {
+  let coarse = textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r;
+  let slot = resolveBrickSlot(uvw);
+  if (slot >= 4u) { return coarse; } // no resident brick covers this point
+  // Map the world point (uvw is over the full coarse box) into this slot's [0,1]^3.
+  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
+  let p = uvw * (2.0 * halfExt) - halfExt;
+  let bmin = frame.brickWorldMin[slot];
+  let bmax = frame.brickWorldMax[slot];
+  let bUvw = (p - bmin.xyz) / max(bmax.xyz - bmin.xyz, vec3<f32>(1e-6));
   let fine = textureSampleLevel(brickTex, volumeSampler, bUvw, 0.0).r;
   // Overlay only: never punch holes in the coarse volume (empty / noisy L0 voxels) and never fill
   // empty space with fine-level reconstruction noise (that fogged out the sample when the brick
   // spanned a large Z fraction of a tomography pancake). Sharpen where coarse already has signal.
   let e = min(min(min(bUvw.x, 1.0 - bUvw.x), min(bUvw.y, 1.0 - bUvw.y)), min(bUvw.z, 1.0 - bUvw.z));
-  let w = clamp(frame.brickMax.w, 0.0, 1.0) * smoothstep(0.0, 0.06, e) * smoothstep(0.02, 0.08, coarse);
+  let w = clamp(bmax.w, 0.0, 1.0) * smoothstep(0.0, 0.06, e) * smoothstep(0.02, 0.08, coarse);
   return mix(coarse, max(coarse, fine), w);
 }
 
@@ -288,11 +313,7 @@ fn visAccumulate(uvw: vec3<f32>, weight: f32) {
 // fine ROI brick instead of the coarse volume - same AABB test sampleDensity itself runs, without
 // the actual texture load.
 fn brickResolved(uvw: vec3<f32>) -> bool {
-  if (frame.brickMin.w < 0.5) { return false; }
-  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
-  let p = uvw * (2.0 * halfExt) - halfExt;
-  let bUvw = (p - frame.brickMin.xyz) / max(frame.brickMax.xyz - frame.brickMin.xyz, vec3<f32>(1e-6));
-  return !(any(bUvw < vec3<f32>(0.0)) || any(bUvw > vec3<f32>(1.0)));
+  return resolveBrickSlot(uvw) < 4u;
 }
 
 // Phase 2b hardening: the old fixed 0.75/textureDimensions(volumeTex) step (a) always used the
@@ -312,9 +333,10 @@ fn densityGradient(uvw: vec3<f32>) -> vec3<f32> {
   let coarseExtent = 2.0 * max(frame.boxHalf.xyz, vec3<f32>(1e-6));
   var texDims: vec3<f32>;
   var worldExtent: vec3<f32>;
-  if (brickResolved(uvw)) {
+  let slot = resolveBrickSlot(uvw);
+  if (slot < 4u) {
     texDims = vec3<f32>(textureDimensions(brickTex));
-    worldExtent = max(frame.brickMax.xyz - frame.brickMin.xyz, vec3<f32>(1e-6));
+    worldExtent = max(frame.brickWorldMax[slot].xyz - frame.brickWorldMin[slot].xyz, vec3<f32>(1e-6));
   } else {
     texDims = vec3<f32>(textureDimensions(volumeTex));
     worldExtent = coarseExtent;
@@ -1024,8 +1046,8 @@ struct Frame {
   lightCtl2: vec4<f32>,
   measurePlane: vec4<f32>,
   measureFwd: vec4<f32>,
-  brickMin: vec4<f32>,
-  brickMax: vec4<f32>,
+  brickWorldMin: array<vec4<f32>, 4>,
+  brickWorldMax: array<vec4<f32>, 4>,
   accelOcc: vec4<f32>,
   visGrid: vec4<f32>,
   screen: vec4<f32>,

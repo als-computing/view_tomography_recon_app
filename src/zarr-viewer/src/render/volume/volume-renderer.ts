@@ -33,6 +33,7 @@ import {
   writeVolumeFrameUniform,
   type VolumeBlendMode,
   type VolumeViewMode,
+  type BrickSlotParams,
 } from "./volume-uniforms.js";
 import { VolumePipeline, VOLUME_DEPTH_FORMAT } from "./volume-pipeline.js";
 import { VolumeBindings } from "./volume-bindings.js";
@@ -182,11 +183,16 @@ export class VolumeRenderer implements Disposable {
   private volumeTex: ManagedTexture | undefined;
   private tfTex: ManagedTexture | undefined;
   // High-res ROI brick composited over the coarse volume (null = none; coarse tex is bound as a dummy).
+  // Item 9 stage 9a: the Frame uniform/shader side now supports up to 4 simultaneously-resident brick
+  // slots, but this renderer still only ever drives slot 0 (`brickTex` is a single texture, not yet an
+  // atlas) — slots 1-3 are always disabled. Multi-slot streaming lands in stage 9b.
   private brickTex: ManagedTexture | undefined;
-  private brickEnabled = false;
-  private brickBlend = 1; // fade weight [0,1] for smooth zoom-out
-  private brickMin: [number, number, number] = [0, 0, 0];
-  private brickMax: [number, number, number] = [0, 0, 0];
+  private readonly brickSlots: [BrickSlotParams, BrickSlotParams, BrickSlotParams, BrickSlotParams] = [
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+  ];
 
   // Mask/annotation layers (item 7 Phase B): two independent, fixed slots (not generalized to N — see
   // the task this was extended for), each a same-grid r8uint class-id volume + its rgba8unorm palette
@@ -284,17 +290,18 @@ export class VolumeRenderer implements Disposable {
     worldMax?: readonly [number, number, number],
   ): void {
     this.brickTex = texture ?? undefined;
-    this.brickEnabled = texture !== null;
+    const slot0 = this.brickSlots[0];
+    slot0.enabled = texture !== null;
     if (worldMin && worldMax) {
-      this.brickMin = [worldMin[0], worldMin[1], worldMin[2]];
-      this.brickMax = [worldMax[0], worldMax[1], worldMax[2]];
+      slot0.worldMin = [worldMin[0], worldMin[1], worldMin[2]];
+      slot0.worldMax = [worldMax[0], worldMax[1], worldMax[2]];
     }
     this.bindings.invalidate(); // texture binding changed
   }
 
   /** Fade weight [0,1] for the brick (drives smooth zoom-out); no bind-group rebuild. */
   public setBrickBlend(weight: number): void {
-    this.brickBlend = Math.min(1, Math.max(0, weight));
+    this.brickSlots[0].blend = Math.min(1, Math.max(0, weight));
   }
 
   /**
@@ -854,10 +861,7 @@ export class VolumeRenderer implements Disposable {
       measurePlaneGray: this.measurePlaneGray,
       measurePlaneAlpha: this.measurePlaneAlpha,
       measureForward: this.measureForward,
-      brickMin: this.brickMin,
-      brickMax: this.brickMax,
-      brickEnabled: this.brickEnabled,
-      brickBlend: this.brickBlend,
+      bricks: this.brickSlots,
       visEnabled: this.visEnabled,
       internalWidth: this.internalWidth,
       internalHeight: this.internalHeight,

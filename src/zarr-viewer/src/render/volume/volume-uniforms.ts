@@ -1,5 +1,5 @@
 /**
- * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 140 floats at fixed
+ * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 164 floats at fixed
  * offsets matching `VOLUME_FRAME_UNIFORM_SIZE`/the WGSL `Frame` struct). Kept as a single flat
  * `write()` function rather than incremental setter-driven mutation, since the buffer's whole point is
  * one contiguous upload per frame — see `volume-raymarch.ts` for the WGSL-side layout this must match
@@ -99,10 +99,12 @@ export interface VolumeFrameParams {
   measurePlaneGray: number;
   measurePlaneAlpha: number;
   measureForward: readonly [number, number, number];
-  brickMin: readonly [number, number, number];
-  brickMax: readonly [number, number, number];
-  brickEnabled: boolean;
-  brickBlend: number;
+  /** Up to 4 simultaneously-resident ROI brick slots (item 9 multi-brick residency; stage 9a wires
+   * the GPU/uniform plumbing up to N=4 while the CPU side still only ever populates slot 0 — slots
+   * 1-3 are always disabled, so this is byte-for-byte the old single-brick model in degenerate form,
+   * not a new behavior). Each slot's `worldMin`/`worldMax` are the world (sim-unit) box its portion
+   * of `brickTex` maps onto. */
+  bricks: readonly [BrickSlotParams, BrickSlotParams, BrickSlotParams, BrickSlotParams];
   visEnabled: boolean;
   internalWidth: number;
   internalHeight: number;
@@ -121,6 +123,15 @@ export interface VolumeFrameParams {
   lowDensitySkipThreshold: number;
 }
 
+/** One resident ROI brick slot's frame-uniform inputs (item 9, stage 9a). */
+export interface BrickSlotParams {
+  enabled: boolean;
+  worldMin: readonly [number, number, number];
+  worldMax: readonly [number, number, number];
+  /** Fade weight [0,1] for this slot (drives smooth zoom-out) — independent per slot. */
+  blend: number;
+}
+
 /** One mask slot's frame-uniform inputs. */
 export interface MaskSlotParams {
   enabled: boolean;
@@ -131,7 +142,7 @@ export interface MaskSlotParams {
 }
 
 /**
- * Pack one frame's worth of uniforms into `d` (140 floats, fixed offsets — see inline comments for
+ * Pack one frame's worth of uniforms into `d` (164 floats, fixed offsets — see inline comments for
  * each named group). Does not upload to the GPU; the caller writes `d` to the uniform buffer.
  * `invViewProj` must already be the inverted view-projection for this frame.
  */
@@ -235,60 +246,63 @@ export function writeVolumeFrameUniform(
   d[77] = p.measureForward[1];
   d[78] = p.measureForward[2];
   d[79] = 0;
-  // brickMin: ROI brick world min, w = enable
-  d[80] = p.brickMin[0];
-  d[81] = p.brickMin[1];
-  d[82] = p.brickMin[2];
-  d[83] = p.brickEnabled ? 1 : 0;
-  // brickMax: ROI brick world max, w = brickBlend fade weight
-  d[84] = p.brickMax[0];
-  d[85] = p.brickMax[1];
-  d[86] = p.brickMax[2];
-  d[87] = p.brickBlend;
+  // brickWorldMin[0..3] / brickWorldMax[0..3] (item 9, stage 9a): per-slot world min (w = enabled)
+  // then world max (w = blend fade weight), 4 slots x 2 vec4 = floats 80..111.
+  for (let i = 0; i < 4; i++) {
+    const b = p.bricks[i]!;
+    d[80 + i * 4] = b.worldMin[0];
+    d[81 + i * 4] = b.worldMin[1];
+    d[82 + i * 4] = b.worldMin[2];
+    d[83 + i * 4] = b.enabled ? 1 : 0;
+    d[96 + i * 4] = b.worldMax[0];
+    d[97 + i * 4] = b.worldMax[1];
+    d[98 + i * 4] = b.worldMax[2];
+    d[99 + i * 4] = b.blend;
+  }
   const occ = accel.occupancyGrid;
-  d[88] = occ[0];
-  d[89] = occ[1];
-  d[90] = occ[2];
-  d[91] = 0;
+  d[112] = occ[0];
+  d[113] = occ[1];
+  d[114] = occ[2];
+  d[115] = 0;
   const visGrid = accel.visGrid;
-  d[92] = visGrid[0];
-  d[93] = visGrid[1];
-  d[94] = visGrid[2];
-  d[95] = p.visEnabled ? 1 : 0;
-  d[96] = p.internalWidth;
-  d[97] = p.internalHeight;
-  d[98] = TILE_SIZE;
-  d[99] = 0;
-  // worldToLight mat4 (Milestone 7.1) at floats 100..115, then shadowCtl at 116.
+  d[116] = visGrid[0];
+  d[117] = visGrid[1];
+  d[118] = visGrid[2];
+  d[119] = p.visEnabled ? 1 : 0;
+  d[120] = p.internalWidth;
+  d[121] = p.internalHeight;
+  d[122] = TILE_SIZE;
+  d[123] = 0;
+  // worldToLight mat4 (Milestone 7.1) at floats 124..139, then shadowCtl at 140.
   const worldToLight = accel.worldToLight;
-  for (let k = 0; k < 16; k++) d[100 + k] = worldToLight[k]!;
-  d[116] = accel.shadowActive ? 1 : 0;
-  d[117] = p.reprojectFar; // shadowCtl.y → depth-centroid normalization (TAAU)
-  d[118] = 0;
-  d[119] = 0;
+  for (let k = 0; k < 16; k++) d[124 + k] = worldToLight[k]!;
+  d[140] = accel.shadowActive ? 1 : 0;
+  d[141] = p.reprojectFar; // shadowCtl.y → depth-centroid normalization (TAAU)
+  d[142] = 0;
+  d[143] = 0;
   // camRight: camera right axis (world, unit), w = tan(halfFovY) * aspect (horizontal half-extent)
-  d[120] = p.camRight[0];
-  d[121] = p.camRight[1];
-  d[122] = p.camRight[2];
-  d[123] = p.tanHalfFovY * p.camAspect;
+  d[144] = p.camRight[0];
+  d[145] = p.camRight[1];
+  d[146] = p.camRight[2];
+  d[147] = p.tanHalfFovY * p.camAspect;
   // camUp: camera up axis (world, unit), w = tan(halfFovY) (vertical half-extent)
-  d[124] = p.camUp[0];
-  d[125] = p.camUp[1];
-  d[126] = p.camUp[2];
-  d[127] = p.tanHalfFovY;
+  d[148] = p.camUp[0];
+  d[149] = p.camUp[1];
+  d[150] = p.camUp[2];
+  d[151] = p.tanHalfFovY;
   // mask0Ctl / mask1Ctl: enable, mask voxel dims (xyz), one vec4 per slot — item 7 Phase B.
   const [mask0, mask1] = p.masks;
-  d[128] = mask0.enabled ? 1 : 0;
-  d[129] = mask0.dims[0];
-  d[130] = mask0.dims[1];
-  d[131] = mask0.dims[2];
-  d[132] = mask1.enabled ? 1 : 0;
-  d[133] = mask1.dims[0];
-  d[134] = mask1.dims[1];
-  d[135] = mask1.dims[2];
+  d[152] = mask0.enabled ? 1 : 0;
+  d[153] = mask0.dims[0];
+  d[154] = mask0.dims[1];
+  d[155] = mask0.dims[2];
+  d[156] = mask1.enabled ? 1 : 0;
+  d[157] = mask1.dims[0];
+  d[158] = mask1.dims[1];
+  d[159] = mask1.dims[2];
   // skipCtl: lowDensitySkipThreshold (Phase 1e hardening), yzw unused.
-  d[136] = p.lowDensitySkipThreshold;
-  d[137] = 0;
-  d[138] = 0;
-  d[139] = 0;
+  d[160] = p.lowDensitySkipThreshold;
+  d[161] = 0;
+  d[162] = 0;
+  d[163] = 0;
 }

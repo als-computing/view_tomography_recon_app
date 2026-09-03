@@ -194,7 +194,16 @@ export async function run(
     if (!deviceLost) ctx.device.destroy();
   });
 
-  const valueRange: [number, number] = [-40, 40];
+  // Real per-dataset range is estimated by openOmeZarr() itself (scans the coarsest level, then pads
+  // 15% - see padValueRange's doc comment) and synced here right after each successful load; this
+  // starting guess only matters for the sliver of time before that estimate lands, and only as the
+  // PickingController's fallback before a dataset has ever loaded. Previously hardcoded and NEVER
+  // updated (skipRangeEstimate: true was passed at every load site, permanently bypassing real
+  // estimation) - happened to roughly fit already-calibrated attenuation-coefficient CT reconstructions
+  // (this app's original datasets), but silently broke any dataset in a different value domain (e.g. a
+  // raw 0-255 grayscale volume): real values would clip almost entirely to 0 or 1, rendering as a
+  // near-solid block with sharp banding wherever the sparse in-range voxels happened to fall.
+  let valueRange: [number, number] = [-40, 40];
   // Everything that shapes the volume's appearance (transfer function + render params + view mode).
   // Everything that shapes the volume's appearance, and the ROI crop box + slice planes. Defaults
   // (see defaultRenderingState/defaultCroppingState) reproduce the viewer's original look.
@@ -295,7 +304,8 @@ export async function run(
   let store: Store = httpStore(resolvedZarrUrl);
   let source: VolumeSource;
   try {
-    source = await openOmeZarr(store, { skipRangeEstimate: true, valueRange });
+    source = await openOmeZarr(store);
+    valueRange = source.valueRange as [number, number];
   } catch (err) {
     const hud = createViewerHud({ position: "bottom-left", pointerEvents: true });
     session.mountHud(hud);
@@ -1348,7 +1358,8 @@ export async function run(
         const next = await pickZarrStore();
         if (!next) return;
         store = next;
-        source = await openOmeZarr(store, { skipRangeEstimate: true, valueRange });
+        source = await openOmeZarr(store);
+        valueRange = source.valueRange as [number, number];
         levels = allowedLevels();
         picking.clear();
         loaderOpened = false; // new dataset → reopen the loader (drops old resident textures)
