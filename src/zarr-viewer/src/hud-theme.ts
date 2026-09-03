@@ -130,7 +130,8 @@ const HUD_CSS = `
 .whud--collapsed .whud__status,
 .whud--collapsed .whud__section,
 .whud--collapsed .whud__hint,
-.whud--collapsed .whud__title { display: none; }
+.whud--collapsed .whud__title,
+.whud--collapsed .whud__tab-btn { display: none; }
 .whud--collapsed .whud__header { justify-content: center; gap: 0; }
 
 .whud__status {
