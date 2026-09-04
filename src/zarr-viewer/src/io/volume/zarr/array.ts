@@ -4,6 +4,7 @@
  * @packageDocumentation
  */
 
+import { NotImplementedError } from "@zarr-viewer/core";
 import type { Store } from "./store.js";
 import { readArrayMeta, type ZarrArrayMeta } from "./metadata.js";
 import { codecFromCompressor } from "./codecs.js";
@@ -105,6 +106,13 @@ function typedView(buf: ArrayBuffer, dtype: VolumeDType, littleEndian: boolean):
   }
 }
 
+/** Construct a fill-value-filled typed array for every {@link VolumeDType} - was missing the int8/
+ * int16/uint32/int32 cases (defaulting to Float32Array), so a chunk of one of those dtypes that ever
+ * needed fill-value substitution (a missing chunk), edge cropping, or axis permutation would produce a
+ * type mismatch: the caller elsewhere assumes the returned view really is that dtype's native typed
+ * array (e.g. `data instanceof Uint16Array` in `asFloatSamples`) and silently misreads the bytes when
+ * it isn't. VolumeDType is exhaustively 8 variants (`volume-source.ts`); this switch now covers all 8,
+ * so the `default` branch is unreachable defensive code, not a real fallback path. */
 function fillBuffer(dtype: VolumeDType, count: number, fill: number): ArrayBufferView {
   switch (dtype) {
     case "float32": {
@@ -122,8 +130,28 @@ function fillBuffer(dtype: VolumeDType, count: number, fill: number): ArrayBuffe
       a.fill(fill);
       return a;
     }
+    case "int8": {
+      const a = new Int8Array(count);
+      a.fill(fill);
+      return a;
+    }
     case "uint16": {
       const a = new Uint16Array(count);
+      a.fill(fill);
+      return a;
+    }
+    case "int16": {
+      const a = new Int16Array(count);
+      a.fill(fill);
+      return a;
+    }
+    case "uint32": {
+      const a = new Uint32Array(count);
+      a.fill(fill);
+      return a;
+    }
+    case "int32": {
+      const a = new Int32Array(count);
       a.fill(fill);
       return a;
     }
@@ -182,9 +210,20 @@ function permuteChunkToXyz(
     diskShape[axisToXyz[1]]!,
     diskShape[axisToXyz[2]]!,
   ];
-  // Identity fast path.
-  if (axisToXyz[0] === 0 && axisToXyz[1] === 1 && axisToXyz[2] === 2) {
-    return { shape: [d0, d1, d2], data };
+  // Zero-copy fast path: `data` is always C-order on disk (F-order is rejected before it ever reaches
+  // here - see openZarrArrayFromMeta), meaning disk axis 2 is the fastest-varying axis in memory, axis
+  // 0 the slowest. The output this function must produce is x-fastest (VolumeChunk's own documented
+  // contract). No data movement is needed - a straight relabel suffices - only when disk axis 2 (the
+  // on-disk-fastest axis) is the one assigned to output-x, disk axis 1 stays middle (output-y), and
+  // disk axis 0 (on-disk-slowest) is assigned to output-z: i.e. axisToXyz === [2,1,0], NOT the identity
+  // [0,1,2] this used to check. [0,1,2] means output-x maps to disk axis 0 - the on-disk *slowest* axis
+  // - which is the opposite of what a zero-copy relabel requires; treating that as a fast path was a
+  // real (if never-hit-in-practice, since every current caller uses [2,1,0] for the standard z,y,x
+  // OME-NGFF axis order) correctness bug, on top of [2,1,0] - the common, ALWAYS-taken case for every
+  // real dataset in this app - needlessly paying for a full Float64Array-staged transpose it never
+  // needed.
+  if (axisToXyz[0] === 2 && axisToXyz[1] === 1 && axisToXyz[2] === 0) {
+    return { shape: [d2, d1, d0], data };
   }
 
   const n = d0 * d1 * d2;
@@ -425,6 +464,35 @@ class ZarrArraySource implements VolumeSource {
   }
 }
 
+/**
+ * Open a Zarr array from already-fetched metadata, skipping the `.zarray` fetch {@link openZarrArray}
+ * would otherwise duplicate — for a caller (like `openOmeZarr`) that already has each level's
+ * {@link ZarrArrayMeta} in hand from its own read.
+ *
+ * Rejects Fortran-order (`order: "F"`) arrays explicitly: `cropCOrderChunk`/`permuteChunkToXyz` both
+ * assume C-order (last axis fastest) linear indexing unconditionally, with no F-order branch, so an
+ * F-order array would otherwise be silently decoded with scrambled voxel order instead of failing
+ * loudly. No real dataset in this app uses F-order today (every one declares standard z,y,x C-order
+ * OME-NGFF axes), so implementing real F-order support here would be speculative; failing explicitly is
+ * the safe default until an actual F-order dataset shows up and F-order-aware strides get added to both
+ * `cropCOrderChunk` and `permuteChunkToXyz`.
+ */
+export function openZarrArrayFromMeta(
+  store: Store,
+  meta: ZarrArrayMeta,
+  options: OpenZarrArrayOptions = {},
+): VolumeSource {
+  if (meta.shape.length !== 3) {
+    throw new Error(`openZarrArrayFromMeta: expected 3D array, got shape [${meta.shape}]`);
+  }
+  if (meta.order === "F") {
+    throw new NotImplementedError(
+      `openZarrArrayFromMeta: Fortran-order ("F") arrays are not supported (path "${meta.path}")`,
+    );
+  }
+  return new ZarrArraySource(store, meta, options);
+}
+
 /** Open a Zarr array at `path` as a single-level {@link VolumeSource}. */
 export async function openZarrArray(
   store: Store,
@@ -432,10 +500,7 @@ export async function openZarrArray(
   options: OpenZarrArrayOptions = {},
 ): Promise<VolumeSource> {
   const meta = await readArrayMeta(store, path);
-  if (meta.shape.length !== 3) {
-    throw new Error(`openZarrArray: expected 3D array, got shape [${meta.shape}]`);
-  }
-  return new ZarrArraySource(store, meta, options);
+  return openZarrArrayFromMeta(store, meta, options);
 }
 
 /** Estimate `[min,max]` by scanning all chunks (ok for coarse LOD). */

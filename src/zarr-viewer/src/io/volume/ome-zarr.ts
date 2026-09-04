@@ -10,7 +10,7 @@
 import { units } from "@zarr-viewer/core";
 import type { Store } from "./zarr/store.js";
 import { readGroupAttrs, readArrayMeta } from "./zarr/metadata.js";
-import { openZarrArray, estimateValueRange, padValueRange } from "./zarr/array.js";
+import { openZarrArrayFromMeta, estimateValueRange, padValueRange } from "./zarr/array.js";
 import type { VolumeChunk, VolumeDType, VolumeSource } from "./volume-source.js";
 
 /** Options for {@link openOmeZarr}. */
@@ -27,6 +27,18 @@ interface LevelInfo {
   dimensions: readonly [number, number, number];
   /** Spacing in SI meters (x,y,z). */
   spacing: readonly [number, number, number];
+  /**
+   * Per-level translation from `coordinateTransformations`, in SI meters (x,y,z) - parsed and kept so
+   * it isn't silently lost, but **not yet applied anywhere**: the renderer today assumes every level
+   * shares one identical world box (`WebGpuVolumeViewer.ts`'s `boxHalf`/`sizeSim`, set once from
+   * level 0 and reused unchanged for whichever level is currently displayed), so per-level translation
+   * has nowhere to plug in without that geometry model changing too - a real, separate, larger piece of
+   * work (see the `indexToPhysicalAt`/`physicalToIndexAt` composed-transform idea in the Zarr I/O
+   * backlog section of the plan file) than this pass's "stop silently discarding the value" fix.
+   * `[0,0,0]` when the level declares no translation (the common case for every dataset in this app
+   * today) or none is present in its `coordinateTransformations`.
+   */
+  translation: readonly [number, number, number];
   source: VolumeSource;
 }
 
@@ -97,6 +109,14 @@ class OmeZarrVolumeSource implements VolumeSource {
 
   public spacingAt(level: number): readonly [number, number, number] {
     return this.level(level).spacing;
+  }
+
+  /** Per-level NGFF `translation`, in SI meters (x,y,z) — not part of the shared {@link VolumeSource}
+   * interface (other implementors have no NGFF-translation concept), and not yet consumed by the
+   * renderer's own geometry model (see {@link LevelInfo.translation}'s doc comment). Exposed here so
+   * the parsed value is genuinely retrievable instead of a dead end once wiring it in becomes real work. */
+  public translationAt(level: number): readonly [number, number, number] {
+    return this.level(level).translation;
   }
 
   private level(level: number): LevelInfo {
@@ -171,21 +191,34 @@ export async function openOmeZarr(
   const lengthUnit = units.resolveLengthUnit(unitName) ?? units.micrometer;
   const axisMap = axisToXyz(axes.length ? axes : [{ name: "z" }, { name: "y" }, { name: "x" }]);
 
+  // Fetch every level's .zarray in parallel (previously sequential, and previously fetched twice per
+  // level: once here, once more inside openZarrArray - now fetched once, up front, then handed to the
+  // sync openZarrArrayFromMeta below). For a 4-5 level pyramid this turns N sequential round-trip
+  // latencies into ~1.
+  const metas = await Promise.all(datasets.map((ds) => readArrayMeta(store, String(ds.path))));
+
   const levels: LevelInfo[] = [];
   let dtype: VolumeDType = "float32";
 
-  for (const ds of datasets) {
+  for (let i = 0; i < datasets.length; i++) {
+    const ds = datasets[i]!;
     const path = String(ds.path);
-    const meta = await readArrayMeta(store, path);
+    const meta = metas[i]!;
     dtype = meta.dtype;
-    const { scale } = scaleTranslation(ds.coordinateTransformations);
+    const { scale, translation } = scaleTranslation(ds.coordinateTransformations);
 
-    // NGFF scale is in axis order (same as array axes). Convert to xyz SI meters.
+    // NGFF scale/translation are in axis order (same as array axes). Convert to xyz SI meters.
     const diskScale = scale ?? meta.shape.map(() => 1);
     const spacingXyz: [number, number, number] = [
       lengthUnit.toSI(diskScale[axisMap[0]] ?? 1),
       lengthUnit.toSI(diskScale[axisMap[1]] ?? 1),
       lengthUnit.toSI(diskScale[axisMap[2]] ?? 1),
+    ];
+    const diskTranslation = translation ?? meta.shape.map(() => 0);
+    const translationXyz: [number, number, number] = [
+      lengthUnit.toSI(diskTranslation[axisMap[0]] ?? 0),
+      lengthUnit.toSI(diskTranslation[axisMap[1]] ?? 0),
+      lengthUnit.toSI(diskTranslation[axisMap[2]] ?? 0),
     ];
     const dimsXyz: [number, number, number] = [
       meta.shape[axisMap[0]] ?? 1,
@@ -193,14 +226,14 @@ export async function openOmeZarr(
       meta.shape[axisMap[2]] ?? 1,
     ];
 
-    const source = await openZarrArray(store, path, {
+    const source = openZarrArrayFromMeta(store, meta, {
       spacing: spacingXyz,
       axisToXyz: axisMap,
       spacingUnitName: unitName,
       valueRange: options.valueRange ?? [0, 1],
     });
 
-    levels.push({ path, dimensions: dimsXyz, spacing: spacingXyz, source });
+    levels.push({ path, dimensions: dimsXyz, spacing: spacingXyz, translation: translationXyz, source });
   }
 
   let valueRange: readonly [number, number] = options.valueRange ?? [0, 1];

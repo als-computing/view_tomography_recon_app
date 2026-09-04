@@ -302,8 +302,16 @@ export function floatToHalf(value: number): number {
   return sign | (exp << 10) | (mantissa >> 13);
 }
 
-/** Interpret a chunk's typed array as float samples (one per voxel). */
-function asFloatSamples(data: ArrayBufferView, dtype: VolumeSource["dtype"]): Float32Array {
+/**
+ * Interpret a chunk's typed array as float samples (one per voxel). Was missing explicit cases for
+ * `int8`/`int16`/`uint32`/`int32` (falling into the `default` branch, which reinterprets the buffer as
+ * raw `Uint8Array` bytes) — for any chunk whose real dtype was one of those four, this silently read
+ * ~2-4x too many "voxels" out of the same bytes, at the wrong element size, corrupting every value: a
+ * severe, not cosmetic, bug for any dataset using those dtypes. `int32`/`uint32` narrowing to float32
+ * loses precision only past float32's 24-bit integer range (~16.7M) - an accepted characteristic this
+ * whole density-normalization pipeline already has for `float64` input, not a new tradeoff.
+ */
+export function asFloatSamples(data: ArrayBufferView, dtype: VolumeSource["dtype"]): Float32Array {
   switch (dtype) {
     case "float32":
       return data instanceof Float32Array
@@ -318,6 +326,15 @@ function asFloatSamples(data: ArrayBufferView, dtype: VolumeSource["dtype"]): Fl
       for (let i = 0; i < u8.length; i++) out[i] = u8[i]!;
       return out;
     }
+    case "int8": {
+      const i8 =
+        data instanceof Int8Array
+          ? data
+          : new Int8Array(data.buffer, data.byteOffset, data.byteLength);
+      const out = new Float32Array(i8.length);
+      for (let i = 0; i < i8.length; i++) out[i] = i8[i]!;
+      return out;
+    }
     case "uint16": {
       const u16 =
         data instanceof Uint16Array
@@ -325,6 +342,33 @@ function asFloatSamples(data: ArrayBufferView, dtype: VolumeSource["dtype"]): Fl
           : new Uint16Array(data.buffer, data.byteOffset, data.byteLength / 2);
       const out = new Float32Array(u16.length);
       for (let i = 0; i < u16.length; i++) out[i] = u16[i]!;
+      return out;
+    }
+    case "int16": {
+      const i16 =
+        data instanceof Int16Array
+          ? data
+          : new Int16Array(data.buffer, data.byteOffset, data.byteLength / 2);
+      const out = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) out[i] = i16[i]!;
+      return out;
+    }
+    case "uint32": {
+      const u32 =
+        data instanceof Uint32Array
+          ? data
+          : new Uint32Array(data.buffer, data.byteOffset, data.byteLength / 4);
+      const out = new Float32Array(u32.length);
+      for (let i = 0; i < u32.length; i++) out[i] = u32[i]!;
+      return out;
+    }
+    case "int32": {
+      const i32 =
+        data instanceof Int32Array
+          ? data
+          : new Int32Array(data.buffer, data.byteOffset, data.byteLength / 4);
+      const out = new Float32Array(i32.length);
+      for (let i = 0; i < i32.length; i++) out[i] = i32[i]!;
       return out;
     }
     case "float64": {
@@ -335,7 +379,7 @@ function asFloatSamples(data: ArrayBufferView, dtype: VolumeSource["dtype"]): Fl
       return Float32Array.from(f64);
     }
     default: {
-      // Best-effort: treat as opaque bytes → uint8.
+      // Unreachable: VolumeSource["dtype"] is exhaustively the 8 cases above (volume-source.ts).
       void dtypeByteSize(dtype);
       const u8 = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       const out = new Float32Array(u8.length);
