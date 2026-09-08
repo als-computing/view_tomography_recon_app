@@ -52,6 +52,11 @@ struct Frame {
   shadowCtl: vec4<f32>,
   camRight: vec4<f32>,
   camUp: vec4<f32>,
+  mask0Ctl: vec4<f32>,
+  mask1Ctl: vec4<f32>,
+  skipCtl: vec4<f32>,
+  brickAtlasOrigin: array<vec4<f32>, 4>,
+  brickSlotSize: vec4<f32>,
 };
 
 ${LIGHT_STRUCT_WGSL}
@@ -103,6 +108,15 @@ fn resolveBrickSlot(uvw: vec3<f32>) -> u32 {
   return 4u;
 }
 
+// Item 9 stage 9b: brickTex (binding 6) is one shared BrickAtlas texture; must match
+// volume-raymarch.ts's brickSlotToAtlasUvw() exactly.
+fn brickSlotToAtlasUvw(slot: u32, bUvw: vec3<f32>) -> vec3<f32> {
+  let atlasDims = vec3<f32>(textureDimensions(brickTex));
+  let origin = frame.brickAtlasOrigin[slot].xyz;
+  let slotSize = max(frame.brickSlotSize.x, 1.0);
+  return (origin + bUvw * slotSize) / max(atlasDims, vec3<f32>(1.0));
+}
+
 fn sampleDensity(uvw: vec3<f32>) -> f32 {
   let coarse = textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r;
   let slot = resolveBrickSlot(uvw);
@@ -112,7 +126,7 @@ fn sampleDensity(uvw: vec3<f32>) -> f32 {
   let bmin = frame.brickWorldMin[slot];
   let bmax = frame.brickWorldMax[slot];
   let bUvw = (p - bmin.xyz) / max(bmax.xyz - bmin.xyz, vec3<f32>(1e-6));
-  let fine = textureSampleLevel(brickTex, volumeSampler, bUvw, 0.0).r;
+  let fine = textureSampleLevel(brickTex, volumeSampler, brickSlotToAtlasUvw(slot, bUvw), 0.0).r;
   let e = min(min(min(bUvw.x, 1.0 - bUvw.x), min(bUvw.y, 1.0 - bUvw.y)), min(bUvw.z, 1.0 - bUvw.z));
   let w = clamp(bmax.w, 0.0, 1.0) * smoothstep(0.0, 0.06, e) * smoothstep(0.02, 0.08, coarse);
   return mix(coarse, max(coarse, fine), w);

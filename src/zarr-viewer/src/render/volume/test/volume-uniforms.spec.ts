@@ -65,11 +65,12 @@ const BASE_PARAMS: VolumeFrameParams = {
   measurePlaneAlpha: 0.35,
   measureForward: [0, 0, 1],
   bricks: [
-    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
-    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
-    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
-    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
   ],
+  brickSlotSize: 256,
   visEnabled: false,
   internalWidth: 800,
   internalHeight: 600,
@@ -86,7 +87,7 @@ const BASE_PARAMS: VolumeFrameParams = {
 };
 
 function pack(overrides: Partial<VolumeFrameParams> = {}): Float32Array {
-  const d = new Float32Array(164);
+  const d = new Float32Array(184);
   writeVolumeFrameUniform(d, new Mat4(), FAKE_ACCEL, { ...BASE_PARAMS, ...overrides });
   return d;
 }
@@ -208,10 +209,16 @@ describe("writeVolumeFrameUniform", () => {
 
     const withSlot2 = pack({
       bricks: [
-        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
-        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
-        { enabled: true, worldMin: [-0.1, -0.2, -0.3], worldMax: [0.1, 0.2, 0.3], blend: 0.5 },
-        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+        {
+          enabled: true,
+          worldMin: [-0.1, -0.2, -0.3],
+          worldMax: [0.1, 0.2, 0.3],
+          blend: 0.5,
+          atlasOrigin: [256, 0, 0],
+        },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
       ],
     });
     [withSlot2[88], withSlot2[89], withSlot2[90]].forEach((v, i) => expect(v).toBeCloseTo([-0.1, -0.2, -0.3][i]!));
@@ -222,5 +229,22 @@ describe("writeVolumeFrameUniform", () => {
     expect(withSlot2[83]).toBe(0);
     expect(withSlot2[95]).toBe(0);
     expect(withSlot2[92 + 3]).toBe(0);
+  });
+
+  it("packs brickAtlasOrigin[0..3] at floats 164..179 and brickSlotSize at 180 (item 9 stage 9b)", () => {
+    const d = pack({
+      bricks: [
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [256, 0, 0] },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 256, 0] },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [256, 256, 0] },
+      ],
+      brickSlotSize: 256,
+    });
+    expect([d[164], d[165], d[166]]).toEqual([0, 0, 0]);
+    expect([d[168], d[169], d[170]]).toEqual([256, 0, 0]);
+    expect([d[172], d[173], d[174]]).toEqual([0, 256, 0]);
+    expect([d[176], d[177], d[178]]).toEqual([256, 256, 0]);
+    expect(d[180]).toBe(256);
   });
 });

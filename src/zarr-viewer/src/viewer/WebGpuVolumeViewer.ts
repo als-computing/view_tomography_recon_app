@@ -544,6 +544,7 @@ export async function run(
     lastViewProj,
     sim,
     applyRender: () => applyRender(),
+    requestRender: () => requestRender(),
     renderUi: () => renderUi(),
     notifyProgress: () => {
       if (roiProgressPaintQueued) return;

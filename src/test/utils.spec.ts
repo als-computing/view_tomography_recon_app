@@ -42,7 +42,7 @@ describe("getTiledBaseUrl / getProcessedPath / getDefaultZarrFileUrl", () => {
 
   it("switches when the active server changes", () => {
     setActiveServerId("staging");
-    expect(getTiledBaseUrl()).toBe("https://tiled-staging.computing.als.lbl.gov/api/v1");
+    expect(getTiledBaseUrl()).toBe("https://tiled-staging.als.lbl.gov/api/v1");
   });
 
   it("getProcessedPath follows the active server", () => {

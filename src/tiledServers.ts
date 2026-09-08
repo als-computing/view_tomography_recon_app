@@ -42,7 +42,7 @@ export const TILED_SERVERS: readonly TiledServer[] = [
   {
     id: 'staging',
     label: 'Remote',
-    apiUrl: 'https://tiled-staging.computing.als.lbl.gov/api/v1',
+    apiUrl: 'https://tiled-staging.als.lbl.gov/api/v1',
     processedPath: 'beamlines/bl832/processed',
     defaultFileId: '',
     oidcRedirectUrl: 'http://tiled-test:5174/tomo_viewer/',

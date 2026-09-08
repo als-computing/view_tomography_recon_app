@@ -182,16 +182,16 @@ export class VolumeRenderer implements Disposable {
 
   private volumeTex: ManagedTexture | undefined;
   private tfTex: ManagedTexture | undefined;
-  // High-res ROI brick composited over the coarse volume (null = none; coarse tex is bound as a dummy).
-  // Item 9 stage 9a: the Frame uniform/shader side now supports up to 4 simultaneously-resident brick
-  // slots, but this renderer still only ever drives slot 0 (`brickTex` is a single texture, not yet an
-  // atlas) — slots 1-3 are always disabled. Multi-slot streaming lands in stage 9b.
-  private brickTex: ManagedTexture | undefined;
+  // Up to 4 simultaneously-resident high-res ROI bricks, composited over the coarse volume (item 9
+  // stage 9b: brickAtlasTex is one shared BrickAtlas texture partitioned into slots, replacing stage
+  // 9a's single dedicated per-brick texture; undefined = no atlas set yet, coarse tex bound as a dummy).
+  private brickAtlasTex: ManagedTexture | undefined;
+  private brickSlotSizeValue = 0;
   private readonly brickSlots: [BrickSlotParams, BrickSlotParams, BrickSlotParams, BrickSlotParams] = [
-    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
-    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
-    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
-    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1 },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
   ];
 
   // Mask/annotation layers (item 7 Phase B): two independent, fixed slots (not generalized to N — see
@@ -280,28 +280,43 @@ export class VolumeRenderer implements Disposable {
   }
 
   /**
-   * Set (or clear with `null`) the high-res ROI brick composited over the coarse volume. `worldMin`/
-   * `worldMax` are the world (sim-unit) box the brick texture's `[0,1]³` maps onto. When cleared, the
-   * coarse texture is bound as a dummy for binding 6 and compositing is disabled.
+   * Set (or clear with `null`) the shared `BrickAtlas` texture backing all 4 brick slots (item 9 stage
+   * 9b — replaces stage 9a's per-brick dedicated texture). `slotSize` is the atlas's fixed voxels/axis
+   * per slot (shared by all 4). Rarely changes (once per atlas construction, e.g. on dataset load) —
+   * unlike per-slot updates, this rebuilds the bind group.
    */
-  public setBrick(
-    texture: ManagedTexture | null,
-    worldMin?: readonly [number, number, number],
-    worldMax?: readonly [number, number, number],
-  ): void {
-    this.brickTex = texture ?? undefined;
-    const slot0 = this.brickSlots[0];
-    slot0.enabled = texture !== null;
-    if (worldMin && worldMax) {
-      slot0.worldMin = [worldMin[0], worldMin[1], worldMin[2]];
-      slot0.worldMax = [worldMax[0], worldMax[1], worldMax[2]];
-    }
+  public setBrickAtlas(texture: ManagedTexture | null, slotSize: number): void {
+    this.brickAtlasTex = texture ?? undefined;
+    this.brickSlotSizeValue = slotSize;
     this.bindings.invalidate(); // texture binding changed
   }
 
-  /** Fade weight [0,1] for the brick (drives smooth zoom-out); no bind-group rebuild. */
-  public setBrickBlend(weight: number): void {
-    this.brickSlots[0].blend = Math.min(1, Math.max(0, weight));
+  /**
+   * Set (or clear with `null`) one resident brick slot's placement within the atlas. `worldMin`/
+   * `worldMax` are the world (sim-unit) box this slot's placed region maps onto; `atlasOrigin` is its
+   * voxel origin within the shared atlas texture (`BrickAtlas.slotVoxelOrigin`). No bind-group rebuild
+   * (only the atlas texture binding itself, set via `setBrickAtlas`, requires that).
+   */
+  public setBrickSlot(
+    slot: 0 | 1 | 2 | 3,
+    params: {
+      worldMin: readonly [number, number, number];
+      worldMax: readonly [number, number, number];
+      atlasOrigin: readonly [number, number, number];
+    } | null,
+  ): void {
+    const s = this.brickSlots[slot];
+    s.enabled = params !== null;
+    if (params) {
+      s.worldMin = [params.worldMin[0], params.worldMin[1], params.worldMin[2]];
+      s.worldMax = [params.worldMax[0], params.worldMax[1], params.worldMax[2]];
+      s.atlasOrigin = [params.atlasOrigin[0], params.atlasOrigin[1], params.atlasOrigin[2]];
+    }
+  }
+
+  /** Fade weight [0,1] for brick slot `slot` (drives smooth zoom-out/eviction); no bind-group rebuild. */
+  public setBrickSlotBlend(slot: 0 | 1 | 2 | 3, weight: number): void {
+    this.brickSlots[slot].blend = Math.min(1, Math.max(0, weight));
   }
 
   /**
@@ -776,7 +791,7 @@ export class VolumeRenderer implements Disposable {
       volumeSampler: this.pipelineMgr.sampler,
       tfTex,
       tfSampler: this.pipelineMgr.tfSamplerHandle,
-      brickTex: this.brickTex,
+      brickTex: this.brickAtlasTex,
       preintTex: this.tPreintTex ?? this.dummyPreint,
       spec,
       acceleration: this.acceleration,
@@ -862,6 +877,7 @@ export class VolumeRenderer implements Disposable {
       measurePlaneAlpha: this.measurePlaneAlpha,
       measureForward: this.measureForward,
       bricks: this.brickSlots,
+      brickSlotSize: this.brickSlotSizeValue,
       visEnabled: this.visEnabled,
       internalWidth: this.internalWidth,
       internalHeight: this.internalHeight,
@@ -903,7 +919,7 @@ export class VolumeRenderer implements Disposable {
       tfTex: tfTex.gpu,
       tfSampler: this.pipelineMgr.tfSamplerHandle,
       lightsBuffer: this.acceleration.lightBuffer,
-      brickTex: (this.brickTex ?? volumeTex).gpu,
+      brickTex: (this.brickAtlasTex ?? volumeTex).gpu,
       shadowTex: this.acceleration.shadowMapTexture.gpu,
       surfacePos: gbuffer.surfacePos,
       surfaceNormal: gbuffer.surfaceNormal,

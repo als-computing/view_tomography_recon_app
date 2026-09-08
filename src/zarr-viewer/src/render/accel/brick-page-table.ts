@@ -1,11 +1,11 @@
 /**
- * CPU-side LRU slot allocator for a future GPU brick atlas (item 8, foundation-only pass — see the
- * plan file). Maps a resident brick's key to an atlas slot index, evicting least-recently-used slots
- * once full. Pure bookkeeping, no GPU dependency at all — pairs with {@link "./brick-atlas.js".BrickAtlas}
- * once a later pass wires the two together (shader rewrite, streaming/eviction integration, and
- * accel-structure extension), none of which this class does.
+ * CPU-side LRU slot allocator for the GPU brick atlas. Maps a resident brick's key to an atlas slot
+ * index, evicting least-recently-used slots once full. Pure bookkeeping, no GPU dependency at all —
+ * pairs with {@link "./brick-atlas.js".BrickAtlas}, which owns the actual GPU texture.
  *
- * **Not yet wired into the renderer.** Nothing in the live render loop constructs or calls this today.
+ * Wired into the live render loop since item 9 stage 9b: `ResidencyController` owns one instance
+ * (capacity 4, item 9's N=4 resident-bricks choice) and calls `acquire`/`release` each frame to decide
+ * which atlas slot backs each currently-desired brick region.
  *
  * @packageDocumentation
  */

@@ -1,5 +1,5 @@
 /**
- * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 164 floats at fixed
+ * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 184 floats at fixed
  * offsets matching `VOLUME_FRAME_UNIFORM_SIZE`/the WGSL `Frame` struct). Kept as a single flat
  * `write()` function rather than incremental setter-driven mutation, since the buffer's whole point is
  * one contiguous upload per frame — see `volume-raymarch.ts` for the WGSL-side layout this must match
@@ -99,12 +99,15 @@ export interface VolumeFrameParams {
   measurePlaneGray: number;
   measurePlaneAlpha: number;
   measureForward: readonly [number, number, number];
-  /** Up to 4 simultaneously-resident ROI brick slots (item 9 multi-brick residency; stage 9a wires
-   * the GPU/uniform plumbing up to N=4 while the CPU side still only ever populates slot 0 — slots
-   * 1-3 are always disabled, so this is byte-for-byte the old single-brick model in degenerate form,
-   * not a new behavior). Each slot's `worldMin`/`worldMax` are the world (sim-unit) box its portion
-   * of `brickTex` maps onto. */
+  /** Up to 4 simultaneously-resident ROI brick slots (item 9 multi-brick residency; stage 9b wires
+   * a real shared `BrickAtlas` behind `brickTex` — each slot's `atlasOrigin` locates its data within
+   * that one texture). Each slot's `worldMin`/`worldMax` are the world (sim-unit) box its portion
+   * of the atlas maps onto. */
   bricks: readonly [BrickSlotParams, BrickSlotParams, BrickSlotParams, BrickSlotParams];
+  /** Voxels per axis of one atlas slot (all slots are equal-size cubes) — lets the shader convert a
+   * slot-local `[0,1]³` sample into the atlas's own texel coordinates via `atlasOrigin`. Shared by all
+   * 4 slots (one atlas, one slot size, chosen once at atlas construction). */
+  brickSlotSize: number;
   visEnabled: boolean;
   internalWidth: number;
   internalHeight: number;
@@ -123,13 +126,17 @@ export interface VolumeFrameParams {
   lowDensitySkipThreshold: number;
 }
 
-/** One resident ROI brick slot's frame-uniform inputs (item 9, stage 9a). */
+/** One resident ROI brick slot's frame-uniform inputs (item 9; `atlasOrigin` added in stage 9b once
+ * `brickTex` became a real shared `BrickAtlas` instead of a dedicated per-slot texture). */
 export interface BrickSlotParams {
   enabled: boolean;
   worldMin: readonly [number, number, number];
   worldMax: readonly [number, number, number];
   /** Fade weight [0,1] for this slot (drives smooth zoom-out) — independent per slot. */
   blend: number;
+  /** This slot's voxel origin within the shared atlas texture (`BrickAtlas.slotVoxelOrigin`) — lets
+   * the shader offset a slot-local `[0,1]³` sample into the atlas's own texel coordinates. */
+  atlasOrigin: readonly [number, number, number];
 }
 
 /** One mask slot's frame-uniform inputs. */
@@ -142,7 +149,7 @@ export interface MaskSlotParams {
 }
 
 /**
- * Pack one frame's worth of uniforms into `d` (164 floats, fixed offsets — see inline comments for
+ * Pack one frame's worth of uniforms into `d` (184 floats, fixed offsets — see inline comments for
  * each named group). Does not upload to the GPU; the caller writes `d` to the uniform buffer.
  * `invViewProj` must already be the inverted view-projection for this frame.
  */
@@ -305,4 +312,18 @@ export function writeVolumeFrameUniform(
   d[161] = 0;
   d[162] = 0;
   d[163] = 0;
+  // brickAtlasOrigin[0..3] (item 9 stage 9b): per-slot voxel origin within the shared BrickAtlas
+  // texture, xyz + w unused, floats 164..179.
+  for (let i = 0; i < 4; i++) {
+    const b = p.bricks[i]!;
+    d[164 + i * 4] = b.atlasOrigin[0];
+    d[165 + i * 4] = b.atlasOrigin[1];
+    d[166 + i * 4] = b.atlasOrigin[2];
+    d[167 + i * 4] = 0;
+  }
+  // brickSlotSize: voxels per axis of one atlas slot (shared by all 4 slots), yzw unused.
+  d[180] = p.brickSlotSize;
+  d[181] = 0;
+  d[182] = 0;
+  d[183] = 0;
 }

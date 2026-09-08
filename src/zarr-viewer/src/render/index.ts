@@ -12,8 +12,24 @@ export type { UploadVolumeOptions, UploadVolumeResult, VolumeTextureFormat } fro
 export type { ManagedTexture } from "./resources/texture.js";
 export { VolumeLoader } from "./volume/volume-loader.js";
 export type { VolumeLevelResult, VolumeLoaderOptions } from "./volume/volume-loader.js";
-export { BrickLoader, chooseBrickRegion } from "./volume/brick-loader.js";
-export type { BrickResult, BrickRequest, BrickLoaderOptions } from "./volume/brick-loader.js";
+export { chooseBrickRegion } from "./volume/brick-region.js";
+export {
+  ATLAS_SLOT_SIZE,
+  ATLAS_FORMAT,
+  chooseAtlasBrickRegion,
+  uploadRegionToAtlasSlot,
+} from "./volume/upload-to-atlas.js";
+export type { UploadRegionToAtlasOptions } from "./volume/upload-to-atlas.js";
+export { BrickPageTable } from "./accel/brick-page-table.js";
+export type { BrickKey, AcquireResult } from "./accel/brick-page-table.js";
+export { BrickAtlas } from "./accel/brick-atlas.js";
+export type { VoxelOrigin } from "./accel/brick-atlas.js";
+export { DefaultBrickPriorityPolicy } from "./accel/brick-priority-policy.js";
+export type {
+  BrickPriorityPolicy,
+  RankedBin,
+  SelectSecondaryBinsOptions,
+} from "./accel/brick-priority-policy.js";
 
 export {
   uploadMaskVolume,

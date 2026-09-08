@@ -14,8 +14,10 @@ import { MASK_BINDING_BASE } from "../volume/volume-bindings.js";
 
 /** Byte size of the volume frame uniform block (mat4 + 24 × vec4 + shadow mat4 + shadowCtl + camRight/
  * camUp + 4-slot brick arrays — item 9 stage 9a grew this from 560 by 96 bytes replacing the old
- * single brickMin/brickMax vec4 pair with 4-slot brickWorldMin/brickWorldMax arrays). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 656;
+ * single brickMin/brickMax vec4 pair with 4-slot brickWorldMin/brickWorldMax arrays; stage 9b grew it
+ * a further 80 bytes for `brickAtlasOrigin`/`brickSlotSize` once `brickTex` became a real shared
+ * `BrickAtlas` texture instead of one dedicated texture per (degenerate single) slot). */
+export const VOLUME_FRAME_UNIFORM_SIZE = 736;
 
 /** Compile-time specialization for {@link volumeRaymarchWgsl}. */
 export interface VolumeRaymarchSpec {
@@ -90,6 +92,12 @@ struct Frame {
   mask0Ctl: vec4<f32>,       // x = mask0Enable, yzw = mask0 voxel dims (item 7 Phase B, slot 0)
   mask1Ctl: vec4<f32>,       // x = mask1Enable, yzw = mask1 voxel dims (item 7 Phase B, slot 1)
   skipCtl: vec4<f32>,        // x = lowDensitySkipThreshold (Phase 1e hardening), yzw unused
+  // Item 9 stage 9b: brickTex (binding 6) is now one shared BrickAtlas texture partitioned into
+  // equal-size cubic slots; each slot's data lives at atlasOrigin (voxels) within it, and
+  // brickSlotSize.x (voxels/axis, shared by all slots) converts a slot-local [0,1]^3 sample into the
+  // atlas's own texel coordinates.
+  brickAtlasOrigin: array<vec4<f32>, 4>, // per-slot voxel origin within the atlas, w unused
+  brickSlotSize: vec4<f32>,  // x = voxels per axis of one atlas slot, yzw unused
 };
 
 struct OccCell { dmin: f32, dmax: f32, dist: f32, occupied: f32 }
@@ -210,6 +218,16 @@ fn resolveBrickSlot(uvw: vec3<f32>) -> u32 {
   return 4u;
 }
 
+// Item 9 stage 9b: brickTex (binding 6) is one shared BrickAtlas texture partitioned into equal-size
+// cubic slots. Converts a slot-local [0,1]^3 sample into the atlas's own [0,1]^3 texel coordinates via
+// this slot's atlasOrigin (voxels) and the shared brickSlotSize (voxels/axis).
+fn brickSlotToAtlasUvw(slot: u32, bUvw: vec3<f32>) -> vec3<f32> {
+  let atlasDims = vec3<f32>(textureDimensions(brickTex));
+  let origin = frame.brickAtlasOrigin[slot].xyz;
+  let slotSize = max(frame.brickSlotSize.x, 1.0);
+  return (origin + bUvw * slotSize) / max(atlasDims, vec3<f32>(1.0));
+}
+
 fn sampleDensity(uvw: vec3<f32>) -> f32 {
   let coarse = textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r;
   let slot = resolveBrickSlot(uvw);
@@ -220,7 +238,7 @@ fn sampleDensity(uvw: vec3<f32>) -> f32 {
   let bmin = frame.brickWorldMin[slot];
   let bmax = frame.brickWorldMax[slot];
   let bUvw = (p - bmin.xyz) / max(bmax.xyz - bmin.xyz, vec3<f32>(1e-6));
-  let fine = textureSampleLevel(brickTex, volumeSampler, bUvw, 0.0).r;
+  let fine = textureSampleLevel(brickTex, volumeSampler, brickSlotToAtlasUvw(slot, bUvw), 0.0).r;
   // Overlay only: never punch holes in the coarse volume (empty / noisy L0 voxels) and never fill
   // empty space with fine-level reconstruction noise (that fogged out the sample when the brick
   // spanned a large Z fraction of a tomography pancake). Sharpen where coarse already has signal.
@@ -345,7 +363,8 @@ fn densityGradient(uvw: vec3<f32>) -> vec3<f32> {
   var worldExtent: vec3<f32>;
   let slot = resolveBrickSlot(uvw);
   if (slot < 4u) {
-    texDims = vec3<f32>(textureDimensions(brickTex));
+    // One atlas slot's own resolution (not the shared atlas texture's full dimensions).
+    texDims = vec3<f32>(max(frame.brickSlotSize.x, 1.0));
     worldExtent = max(frame.brickWorldMax[slot].xyz - frame.brickWorldMin[slot].xyz, vec3<f32>(1e-6));
   } else {
     texDims = vec3<f32>(textureDimensions(volumeTex));

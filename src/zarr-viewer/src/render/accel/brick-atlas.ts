@@ -1,13 +1,13 @@
 /**
- * A single large 3D texture partitioned into a fixed grid of equal-size brick slots (item 8,
- * foundation-only pass — see the plan file). Pairs with {@link "./brick-page-table.js".BrickPageTable},
- * which decides which slot a given brick occupies; this class only owns the GPU texture and knows how
- * to compute a slot's voxel origin and upload data into it.
+ * A single large 3D texture partitioned into a fixed grid of equal-size brick slots. Pairs with
+ * {@link "./brick-page-table.js".BrickPageTable}, which decides which slot a given brick occupies;
+ * this class only owns the GPU texture and knows how to compute a slot's voxel origin and upload data
+ * into it.
  *
- * **Not yet wired into the renderer.** Nothing samples this texture or calls `uploadToSlot` today; no
- * production slot-size/count is chosen here either — the current single-ROI-brick system uses
- * dynamically-sized brick regions, and adapting that to a fixed-size slot grid is a real design
- * decision left to whoever does the shader-wiring pass.
+ * Wired into the live render loop since item 9 stage 9b: `ResidencyController` owns one instance (see
+ * `upload-to-atlas.ts`'s `ATLAS_SLOT_SIZE`/`ATLAS_FORMAT` for the fixed slot size/format actually used),
+ * bound at `VolumeRenderer`'s `brickTex` slot (binding 6) via `setBrickAtlas`. The shader (
+ * `volume-raymarch.ts`'s `resolveBrickSlot`/`brickSlotToAtlasUvw`) samples it directly.
  *
  * @packageDocumentation
  */

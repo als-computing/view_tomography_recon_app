@@ -190,7 +190,7 @@ export async function uploadVolume(
 }
 
 /** ROI window (voxel offset + size) a brick upload fills. */
-interface RoiBox {
+export interface RoiBox {
   ox0: number;
   oy0: number;
   oz0: number;
@@ -211,8 +211,11 @@ function encodeVoxel(view: DataView, off: number, v01: number, format: VolumeTex
  * chunk's offset (`bytesPerRow`/`height` are the whole brick's). Chunks may straddle the ROI edges, so
  * we clip to the intersection. The buffer is uploaded once (a single writeTexture) after every chunk is
  * packed, so the renderer never binds a partially-filled texture.
+ *
+ * Exported for reuse by `upload-to-atlas.ts` (item 9 stage 9b): the fetch-and-pack loop is identical
+ * whether the destination is a brand-new dedicated texture (this file's ROI branch) or one atlas slot.
  */
-function packChunkInto(
+export function packChunkInto(
   view: DataView,
   bytesPerRow: number,
   chunk: { origin: readonly [number, number, number]; shape: readonly [number, number, number]; data: ArrayBufferView },
