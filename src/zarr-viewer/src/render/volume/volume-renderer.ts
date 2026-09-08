@@ -355,7 +355,10 @@ export class VolumeRenderer implements Disposable {
       dimension: "2d",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    const bytesPerRow = Math.max(256, Math.ceil((lutSize * 4) / 256) * 256);
+    // Tight (unpadded) row - the 256-byte bytesPerRow alignment is a copyBufferToTexture()/
+    // copyTextureToBuffer() requirement, not a writeTexture() one (confirmed against the current
+    // WebGPU spec; see volume-texture.ts's uploadVolume for the same finding/fix).
+    const bytesPerRow = lutSize * 4;
     const padded = new Uint8Array(bytesPerRow);
     padded.set(lut.subarray(0, lutSize * 4));
     this.ctx.device.queue.writeTexture(
@@ -400,7 +403,9 @@ export class VolumeRenderer implements Disposable {
       dimension: "2d",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    const preintBytesPerRow = Math.max(256, Math.ceil((lutSize * 2) / 256) * 256);
+    // Tight (unpadded) row - see setTransferFunction's own comment above for why writeTexture() doesn't
+    // need the 256-byte alignment.
+    const preintBytesPerRow = lutSize * 2;
     const preintPadded = new Uint8Array(preintBytesPerRow * sigmaBuckets.length);
     const preintView = new DataView(preintPadded.buffer);
     for (let row = 0; row < sigmaBuckets.length; row++) {

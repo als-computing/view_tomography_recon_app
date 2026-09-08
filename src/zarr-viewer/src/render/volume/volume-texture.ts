@@ -101,7 +101,11 @@ export async function uploadVolume(
     // uploaded texture): the renderer only sees the brick once every chunk is in. Progress per chunk.
     const roiBox: RoiBox = { ox0, oy0, oz0, width, height, depth };
     const total = source.regionChunkCount(level, [ox0, oy0, oz0], [ox0 + width, oy0 + height, oz0 + depth]);
-    const bytesPerRow = Math.ceil((width * bytesPerElem) / 256) * 256;
+    // Tight (unpadded) rows: the 256-byte bytesPerRow alignment is a copyBufferToTexture()/
+    // copyTextureToBuffer() requirement (those go through the GPU's buffer-texture copy engine) - it
+    // does not apply to writeTexture(), which accepts any row stride and packs it internally. Confirmed
+    // against the current WebGPU spec before removing this (previously unconditional) padding.
+    const bytesPerRow = width * bytesPerElem;
     const packed = new Uint8Array(bytesPerRow * height * depth);
     const view = new DataView(packed.buffer);
     let loaded = 0;
@@ -165,8 +169,9 @@ export async function uploadVolume(
     histogram[b]++;
   }
 
-  // WebGPU requires bytesPerRow to be a multiple of 256 for writeTexture.
-  const bytesPerRow = Math.ceil((width * bytesPerElem) / 256) * 256;
+  // Tight (unpadded) rows - see the ROI branch's comment above for why writeTexture() doesn't need
+  // the 256-byte alignment copyBufferToTexture()/copyTextureToBuffer() require.
+  const bytesPerRow = width * bytesPerElem;
   const packed = new Uint8Array(bytesPerRow * height * depth);
   const view = new DataView(packed.buffer);
   for (let z = 0; z < depth; z++) {

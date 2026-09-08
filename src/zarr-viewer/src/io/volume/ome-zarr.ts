@@ -11,6 +11,7 @@ import { units } from "@zarr-viewer/core";
 import type { Store } from "./zarr/store.js";
 import { readGroupAttrs, readArrayMeta } from "./zarr/metadata.js";
 import { openZarrArrayFromMeta, estimateValueRange, padValueRange } from "./zarr/array.js";
+import { DecodedChunkCache } from "./chunk-cache.js";
 import type { VolumeChunk, VolumeDType, VolumeSource } from "./volume-source.js";
 
 /** Options for {@link openOmeZarr}. */
@@ -199,6 +200,12 @@ export async function openOmeZarr(
 
   const levels: LevelInfo[] = [];
   let dtype: VolumeDType = "float32";
+  // One decoded-chunk cache shared across every level of this pyramid (previously each level's
+  // ZarrArraySource got its own independent instance/budget) — a whole-level scan of one level and an
+  // overlapping ROI brick read of another level's chunk never collide (chunk keys embed the level's own
+  // store path), so sharing is safe, and it also dedupes concurrent in-flight fetches for the exact same
+  // chunk (e.g. two overlapping ROI requests) instead of each paying for its own fetch + decode.
+  const sharedCache = new DecodedChunkCache();
 
   for (let i = 0; i < datasets.length; i++) {
     const ds = datasets[i]!;
@@ -231,6 +238,7 @@ export async function openOmeZarr(
       axisToXyz: axisMap,
       spacingUnitName: unitName,
       valueRange: options.valueRange ?? [0, 1],
+      sharedCache,
     });
 
     levels.push({ path, dimensions: dimsXyz, spacing: spacingXyz, translation: translationXyz, source });

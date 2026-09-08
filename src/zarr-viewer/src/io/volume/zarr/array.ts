@@ -25,6 +25,13 @@ export interface OpenZarrArrayOptions {
   valueRange?: readonly [number, number];
   /** Display unit name for spacing (e.g. `"micrometer"`). */
   spacingUnitName?: string;
+  /**
+   * A `DecodedChunkCache` to share across multiple `ZarrArraySource`s (e.g. every level of one
+   * multiscale pyramid — see `openOmeZarr`, which constructs one and passes it to each level). Chunk
+   * keys already include the array's own store path, so sharing is collision-safe; without this, each
+   * `openZarrArray` call gets its own independent cache instance (and budget) as before.
+   */
+  sharedCache?: DecodedChunkCache;
 }
 
 function chunkKey(meta: ZarrArrayMeta, indices: number[]): string {
@@ -262,8 +269,10 @@ class ZarrArraySource implements VolumeSource {
   private readonly store: Store;
   private readonly axisToXyz: readonly [number, number, number];
   private readonly codec;
-  /** Decoded-chunk LRU so ROI reads / panning reuse chunks instead of re-fetching + re-decoding. */
-  private readonly chunkCache = new DecodedChunkCache();
+  /** Decoded-chunk LRU so ROI reads / panning reuse chunks instead of re-fetching + re-decoding.
+   * `options.sharedCache`, when given, lets multiple levels of one pyramid share one instance/budget
+   * instead of each getting its own — see `OpenZarrArrayOptions.sharedCache`'s own doc comment. */
+  private readonly chunkCache: DecodedChunkCache;
 
   public constructor(
     store: Store,
@@ -272,6 +281,7 @@ class ZarrArraySource implements VolumeSource {
   ) {
     this.store = store;
     this.meta = meta;
+    this.chunkCache = options.sharedCache ?? new DecodedChunkCache();
     this.axisToXyz = options.axisToXyz ?? [0, 1, 2];
     this.codec = codecFromCompressor(meta.compressor);
     this.dtype = meta.dtype;
@@ -382,11 +392,20 @@ class ZarrArraySource implements VolumeSource {
     });
   }
 
-  private async readDiskChunk(chunkIndices: number[], signal?: AbortSignal): Promise<VolumeChunk> {
+  private readDiskChunk(chunkIndices: number[], signal?: AbortSignal): Promise<VolumeChunk> {
     const key = chunkKey(this.meta, chunkIndices);
-    const cached = this.chunkCache.get(key);
-    if (cached) return cached;
-    const compressed = await this.store.get(key, signal ? { signal } : undefined);
+    return this.chunkCache.getOrFetch(key, () => this.fetchAndDecodeChunk(chunkIndices), signal);
+  }
+
+  /**
+   * The actual fetch + decode for one disk chunk — pulled out of {@link readDiskChunk} so it can be
+   * passed to `DecodedChunkCache.getOrFetch` as a signal-less `fetcher` (see that method's own doc
+   * comment for why the shared, potentially-multi-waiter fetch must not carry any one caller's abort
+   * signal). Never call this directly outside `readDiskChunk` - it always bypasses the cache.
+   */
+  private async fetchAndDecodeChunk(chunkIndices: number[]): Promise<VolumeChunk> {
+    const key = chunkKey(this.meta, chunkIndices);
+    const compressed = await this.store.get(key);
     const fullShape: [number, number, number] = [
       this.meta.chunks[0]!,
       this.meta.chunks[1]!,
@@ -438,7 +457,6 @@ class ZarrArraySource implements VolumeSource {
       originDisk[this.axisToXyz[2]]!,
     ];
     const chunk: VolumeChunk = { origin, shape, data };
-    this.chunkCache.set(chunkKey(this.meta, chunkIndices), chunk);
     return chunk;
   }
 

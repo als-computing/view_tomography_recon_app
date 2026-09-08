@@ -79,8 +79,11 @@ export async function uploadMaskVolume(
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   });
 
-  // WebGPU's writeTexture wants bytesPerRow padded to a 256-byte multiple, same as uploadVolume.
-  const bytesPerRow = Math.ceil(width / 256) * 256;
+  // Tight (unpadded) rows - the 256-byte bytesPerRow alignment is a copyBufferToTexture()/
+  // copyTextureToBuffer() requirement, not a writeTexture() one (confirmed against the current WebGPU
+  // spec - see volume-texture.ts's uploadVolume for the same finding, same fix). r8uint is 1 byte/texel,
+  // so the tight stride is simply `width`.
+  const bytesPerRow = width;
   const packed = new Uint8Array(bytesPerRow * height * depth);
   const classCounts = new Uint32Array(MASK_CLASS_COUNT);
 
@@ -157,28 +160,15 @@ export function uploadMaskArray(
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   });
 
+  // Tight (unpadded) rows, so bytesPerRow always equals `width` here - the 256-byte alignment is a
+  // copyBufferToTexture()/copyTextureToBuffer() requirement, not a writeTexture() one (see
+  // uploadMaskVolume's own comment above for the same finding). `data` is already exactly
+  // width*height*depth bytes (checked above), i.e. already tightly packed - just tally and re-wrap for
+  // writeTexture's ArrayBuffer-narrowing workaround (see uploadMaskPalette's own comment on this).
+  const bytesPerRow = width;
   const classCounts = new Uint32Array(MASK_CLASS_COUNT);
-  const bytesPerRow = Math.ceil(width / 256) * 256;
-  let packed: Uint8Array;
-  if (bytesPerRow === width) {
-    // No row padding needed - tally in place and re-wrap for writeTexture's ArrayBuffer-narrowing
-    // workaround (see uploadMaskPalette's own comment on this).
-    for (let i = 0; i < data.length; i++) classCounts[data[i]!]++;
-    packed = new Uint8Array(data);
-  } else {
-    packed = new Uint8Array(bytesPerRow * height * depth);
-    for (let z = 0; z < depth; z++) {
-      for (let y = 0; y < height; y++) {
-        const srcRow = (z * height + y) * width;
-        const dstRow = (z * height + y) * bytesPerRow;
-        for (let x = 0; x < width; x++) {
-          const v = data[srcRow + x]!;
-          packed[dstRow + x] = v;
-          classCounts[v]!++;
-        }
-      }
-    }
-  }
+  for (let i = 0; i < data.length; i++) classCounts[data[i]!]++;
+  const packed = new Uint8Array(data);
 
   device.queue.writeTexture(
     { texture: texture.gpu },
