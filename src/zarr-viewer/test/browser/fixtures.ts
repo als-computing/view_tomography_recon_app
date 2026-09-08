@@ -10,6 +10,7 @@
 import { NotImplementedError } from "@zarr-viewer/core";
 import type { VolumeChunk, VolumeSource } from "@zarr-viewer/io";
 import { uploadVolume, type ManagedTexture } from "@zarr-viewer/render";
+export type { VolumeSource } from "@zarr-viewer/io";
 
 /** A small cubic synthetic volume: `size`³ voxels of density in `[0,1]`. */
 export interface SyntheticVolume {
@@ -89,4 +90,174 @@ export async function uploadSyntheticVolume(
 ): Promise<ManagedTexture> {
   const { texture } = await uploadVolume(device, syntheticSource(volume), { level: 0 });
   return texture;
+}
+
+// --- Item 9 stage 9c: multi-level/multi-region synthetic sources -----------------------------------
+//
+// The single-level `syntheticSource()` above is enough for whole-level uploads (`uploadVolume`'s
+// `chunks()` path), but a real multi-brick ROI test needs a source whose `readRegion`/`regionChunkCount`
+// actually work (they're what `uploadRegionToAtlasSlot` calls) and, ideally, more than one resolution
+// level - general-purpose infrastructure reusable beyond just this one fixture, not special-cased to it.
+
+/** Box-downsample `vol` 2x per axis (real 8-voxel average, not a stand-in) - the simplest correct way
+ * to derive a coarser multiscale level from a finest-level `SyntheticVolume`. Odd input sizes floor. */
+export function downsample2x(vol: SyntheticVolume): SyntheticVolume {
+  const inSize = vol.size;
+  const outSize = Math.max(1, Math.floor(inSize / 2));
+  const data = new Float32Array(outSize * outSize * outSize);
+  for (let z = 0; z < outSize; z++) {
+    for (let y = 0; y < outSize; y++) {
+      for (let x = 0; x < outSize; x++) {
+        let sum = 0;
+        let count = 0;
+        for (let dz = 0; dz < 2; dz++) {
+          for (let dy = 0; dy < 2; dy++) {
+            for (let dx = 0; dx < 2; dx++) {
+              const sx = x * 2 + dx;
+              const sy = y * 2 + dy;
+              const sz = z * 2 + dz;
+              if (sx >= inSize || sy >= inSize || sz >= inSize) continue;
+              sum += vol.data[sx + sy * inSize + sz * inSize * inSize]!;
+              count++;
+            }
+          }
+        }
+        data[x + y * outSize + z * outSize * outSize] = count > 0 ? sum / count : 0;
+      }
+    }
+  }
+  return { size: outSize, data };
+}
+
+/** A cubic sub-region of constant density, for placing distinct "hot spots" in a `multiRegionVolume`. */
+export interface HotspotRegion {
+  /** Voxel-space center within the finest level. */
+  center: readonly [number, number, number];
+  /** Half-size in voxels (region spans `center ± halfSize` on each axis, clamped to the volume). */
+  halfSize: number;
+  value: number;
+}
+
+/** A `baseline`-density volume with one or more distinct constant-value cubic `regions` overlaid -
+ * unlike `sphereVolume`'s single analytically-symmetric feature, this is built for tests that need
+ * several independently-identifiable, non-overlapping regions (e.g. one per brick slot). */
+export function multiRegionVolume(size: number, baseline: number, regions: readonly HotspotRegion[]): SyntheticVolume {
+  const data = new Float32Array(size * size * size).fill(baseline);
+  for (const r of regions) {
+    const [cx, cy, cz] = r.center;
+    const x0 = Math.max(0, cx - r.halfSize);
+    const x1 = Math.min(size, cx + r.halfSize);
+    const y0 = Math.max(0, cy - r.halfSize);
+    const y1 = Math.min(size, cy + r.halfSize);
+    const z0 = Math.max(0, cz - r.halfSize);
+    const z1 = Math.min(size, cz + r.halfSize);
+    for (let z = z0; z < z1; z++) {
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          data[x + y * size + z * size * size] = r.value;
+        }
+      }
+    }
+  }
+  return { size, data };
+}
+
+/**
+ * Wraps a real multiscale pyramid (`levels[0]` finest) as a `VolumeSource` with genuinely working
+ * `readChunk`/`chunks`/`readRegion`/`regionChunkCount` - chunked into fixed `chunkSize` pieces (ragged
+ * at the volume's edges, same as a real chunked store), with `readRegion`/`regionChunkCount` yielding
+ * only chunks that actually intersect the requested box, clipped by nothing more than the box itself
+ * (each chunk keeps its own true origin/shape, matching the real `VolumeSource` contract - the caller
+ * clips into its own destination, same as every other implementation in this codebase).
+ */
+export function chunkedMultiLevelSource(levels: readonly SyntheticVolume[], chunkSize = 16): VolumeSource {
+  const spacing: readonly [number, number, number] = [1e-6, 1e-6, 1e-6];
+  const dimsAt = (level: number): readonly [number, number, number] => {
+    const s = levels[level]!.size;
+    return [s, s, s];
+  };
+
+  function* chunkOrigins(level: number): Generator<[number, number, number]> {
+    const dim = levels[level]!.size;
+    for (let z = 0; z < dim; z += chunkSize) {
+      for (let y = 0; y < dim; y += chunkSize) {
+        for (let x = 0; x < dim; x += chunkSize) {
+          yield [x, y, z];
+        }
+      }
+    }
+  }
+
+  function chunkAt(level: number, origin: readonly [number, number, number]): VolumeChunk {
+    const vol = levels[level]!;
+    const dim = vol.size;
+    const [ox, oy, oz] = origin;
+    const cw = Math.min(chunkSize, dim - ox);
+    const ch = Math.min(chunkSize, dim - oy);
+    const cd = Math.min(chunkSize, dim - oz);
+    const data = new Float32Array(cw * ch * cd);
+    for (let z = 0; z < cd; z++) {
+      for (let y = 0; y < ch; y++) {
+        for (let x = 0; x < cw; x++) {
+          data[x + y * cw + z * cw * ch] = vol.data[ox + x + (oy + y) * dim + (oz + z) * dim * dim]!;
+        }
+      }
+    }
+    return { origin: [ox, oy, oz], shape: [cw, ch, cd], data };
+  }
+
+  function intersects(
+    origin: readonly [number, number, number],
+    shape: readonly [number, number, number],
+    voxelMin: readonly [number, number, number],
+    voxelMax: readonly [number, number, number],
+  ): boolean {
+    for (let a = 0; a < 3; a++) {
+      if (origin[a]! >= voxelMax[a]! || origin[a]! + shape[a]! <= voxelMin[a]!) return false;
+    }
+    return true;
+  }
+
+  function chunkShapeAt(level: number, origin: readonly [number, number, number]): [number, number, number] {
+    const dim = levels[level]!.size;
+    return [
+      Math.min(chunkSize, dim - origin[0]),
+      Math.min(chunkSize, dim - origin[1]),
+      Math.min(chunkSize, dim - origin[2]),
+    ];
+  }
+
+  return {
+    dimensions: dimsAt(0),
+    spacing,
+    dtype: "float32",
+    valueRange: [0, 1],
+    levelCount: levels.length,
+    dimensionsAt: dimsAt,
+    spacingAt: () => spacing,
+    async readChunk(level, x, y, z): Promise<VolumeChunk> {
+      const dim = levels[level]!.size;
+      const ox = Math.min(dim, Math.floor(x / chunkSize) * chunkSize);
+      const oy = Math.min(dim, Math.floor(y / chunkSize) * chunkSize);
+      const oz = Math.min(dim, Math.floor(z / chunkSize) * chunkSize);
+      return chunkAt(level, [ox, oy, oz]);
+    },
+    async *chunks(level: number): AsyncIterable<VolumeChunk> {
+      for (const origin of chunkOrigins(level)) yield chunkAt(level, origin);
+    },
+    async *readRegion(level, voxelMin, voxelMax, signal): AsyncIterable<VolumeChunk> {
+      for (const origin of chunkOrigins(level)) {
+        signal?.throwIfAborted();
+        if (!intersects(origin, chunkShapeAt(level, origin), voxelMin, voxelMax)) continue;
+        yield chunkAt(level, origin);
+      }
+    },
+    regionChunkCount(level, voxelMin, voxelMax): number {
+      let count = 0;
+      for (const origin of chunkOrigins(level)) {
+        if (intersects(origin, chunkShapeAt(level, origin), voxelMin, voxelMax)) count++;
+      }
+      return count;
+    },
+  };
 }
