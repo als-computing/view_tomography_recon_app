@@ -248,6 +248,21 @@ export class OpacityCurveEditor {
       this.canvas.removeEventListener("pointercancel", onUp);
       this.canvas.removeEventListener("dblclick", onDblClick);
     });
+
+    // Found live: the histogram/curve could come up blank on the panel's very first open, only
+    // appearing after an unrelated action (switching TF Single/Bands mode) forced a full panel rebuild.
+    // Root cause: `redraw()` sizes the backing store from `canvas.clientWidth/clientHeight`, which read
+    // 0 (falling back to a fixed 280×72 guess) whenever this editor is constructed while its containing
+    // panel/tab is still hidden or not yet laid out - nothing ever re-measured and corrected that guess
+    // afterward, even once the panel became visible and `setHistogram()` delivered real data into the
+    // still-wrong-sized canvas. A `ResizeObserver` catches exactly that transition (hidden/zero-size →
+    // real laid-out size) and re-measures, independent of whatever unrelated UI action happens to also
+    // trigger it.
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => this.redraw());
+      ro.observe(this.canvas);
+      this.cleanups.push(() => ro.disconnect());
+    }
   }
 
   private emit(): void {

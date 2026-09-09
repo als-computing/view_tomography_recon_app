@@ -35,6 +35,15 @@ export interface CropDragDeps {
   applyRender(): void;
   /** Called once when a drag finishes, so the caller can refresh the Crop panel's sliders. */
   onDragEnd(): void;
+  /**
+   * Called on every drag tick that actually changes `cropping` (not on a pure hover-highlight repaint).
+   * Optional so this stays backward-compatible for anything constructing `CropDragController` without
+   * it, but a real caller should wire this to whatever notifies the outside world of a cropping change
+   * (e.g. `emitCropping()`) — without it, a linked peer (or anything else observing `croppingChange`)
+   * doesn't find out the crop box moved until the drag ends, unlike every other cropping interaction
+   * (HUD sliders, wheel slice-scrub) which already notify on every tick, not just release.
+   */
+  onDragChange?(): void;
 }
 
 const MIN_SPAN = 0.02; // minimum crop span per axis, in UVW - a face can't cross past this into its opposite
@@ -194,6 +203,7 @@ export class CropDragController {
       cropMax[axis] = Math.max(u01, cropMin[axis] + MIN_SPAN);
     }
     d.applyRender();
+    d.onDragChange?.();
   }
 
   public dispose(): void {

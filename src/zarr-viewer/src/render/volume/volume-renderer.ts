@@ -124,6 +124,12 @@ export class VolumeRenderer implements Disposable {
   private sliceEnableX = false;
   private sliceEnableY = false;
   private sliceEnableZ = false;
+  private sliceEnableOblique = false;
+  private obliqueNormal: [number, number, number] = [0, 0, 1];
+  private obliqueOffset = 0;
+  private overlayBoxEnabled = false;
+  private overlayBoxMin: [number, number, number] = [0, 0, 0];
+  private overlayBoxMax: [number, number, number] = [1, 1, 1];
   private showSlicePlanes = false;
   private viewMode: VolumeViewMode = "volume";
   private frameIndex = 0;
@@ -687,9 +693,54 @@ export class VolumeRenderer implements Disposable {
     else this.sliceEnableZ = enabled;
   }
 
+  /** Enable/disable the oblique-plane overlay (independent of `viewMode`, matching `setSliceEnabled`'s
+   * per-axis toggles — can be on even in `"volume"` mode). */
+  public setSliceEnabledOblique(enabled: boolean): void {
+    this.sliceEnableOblique = enabled;
+  }
+
+  /**
+   * Set the oblique cut plane: `normal` (world-space, need not be pre-normalized) and a `point` the
+   * plane passes through — the offset the shader actually uses (`dot(worldPos, normal) === offset`) is
+   * derived here so callers can think in terms of "this point, this direction" rather than the raw
+   * plane-equation form.
+   */
+  public setObliquePlane(normal: readonly [number, number, number], point: readonly [number, number, number]): void {
+    const len = Math.hypot(normal[0], normal[1], normal[2]) || 1;
+    const n: [number, number, number] = [normal[0] / len, normal[1] / len, normal[2] / len];
+    this.obliqueNormal = n;
+    this.obliqueOffset = n[0] * point[0] + n[1] * point[1] + n[2] * point[2];
+  }
+
+  /** Same as {@link setObliquePlane} but takes the raw plane-equation form (`normal` assumed already
+   * unit length, `offset` such that `dot(worldPos, normal) === offset` defines the plane) directly —
+   * for a caller (like `WebGpuCroppingState`) that already stores the plane that way, avoiding a
+   * needless point round-trip through `setObliquePlane`. */
+  public setObliquePlaneRaw(normal: readonly [number, number, number], offset: number): void {
+    this.obliqueNormal = [normal[0], normal[1], normal[2]];
+    this.obliqueOffset = offset;
+  }
+
   /** Draw axis planes as highlights in volume mode (itk-vtk `s` toggle). */
   public setSlicePlanesVisible(visible: boolean): void {
     this.showSlicePlanes = visible;
+  }
+
+  /**
+   * Green wireframe-box indicator: highlights an arbitrary axis-aligned uvw `[0,1]^3` box, independent
+   * of the crop/slice system entirely — e.g. so a "context" pane can show exactly what region a linked
+   * "detail" pane is cropped to, without cropping this pane's own rendering (`cropMin`/`cropMax` stay
+   * whatever they already are). `min`/`max` are in the same uvw `[0,1]` convention as `cropMin`/
+   * `cropMax`.
+   */
+  public setOverlayBox(
+    enabled: boolean,
+    min: readonly [number, number, number],
+    max: readonly [number, number, number],
+  ): void {
+    this.overlayBoxEnabled = enabled;
+    this.overlayBoxMin = [min[0], min[1], min[2]];
+    this.overlayBoxMax = [max[0], max[1], max[2]];
   }
 
   public setParams(
@@ -861,6 +912,12 @@ export class VolumeRenderer implements Disposable {
       sliceEnableX: this.sliceEnableX,
       sliceEnableY: this.sliceEnableY,
       sliceEnableZ: this.sliceEnableZ,
+      sliceEnableOblique: this.sliceEnableOblique,
+      obliqueNormal: this.obliqueNormal,
+      obliqueOffset: this.obliqueOffset,
+      overlayBoxEnabled: this.overlayBoxEnabled,
+      overlayBoxMin: this.overlayBoxMin,
+      overlayBoxMax: this.overlayBoxMax,
       showSlicePlanes: this.showSlicePlanes,
       viewMode: this.viewMode,
       linearOutput: this.linearOutput,

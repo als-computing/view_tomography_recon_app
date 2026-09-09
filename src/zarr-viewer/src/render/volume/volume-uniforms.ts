@@ -1,5 +1,5 @@
 /**
- * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 184 floats at fixed
+ * One-shot packer for `VolumeRenderer`'s per-frame uniform buffer (`frameData`, 188 floats at fixed
  * offsets matching `VOLUME_FRAME_UNIFORM_SIZE`/the WGSL `Frame` struct). Kept as a single flat
  * `write()` function rather than incremental setter-driven mutation, since the buffer's whole point is
  * one contiguous upload per frame — see `volume-raymarch.ts` for the WGSL-side layout this must match
@@ -28,8 +28,10 @@ export interface VolumeAccelerationLike {
 /** Volume blend / compositing mode (itk-vtk `setImageBlendMode`). */
 export type VolumeBlendMode = "composite" | "mip" | "minip" | "average";
 
-/** Primary view mode. */
-export type VolumeViewMode = "volume" | "xPlane" | "yPlane" | "zPlane";
+/** Primary view mode. `"oblique"` slices along an arbitrary world-space plane (`Frame.obliqueNormal`)
+ * instead of an axis-aligned one — unlike the other 3 plane modes, its plane is set by the caller
+ * (`VolumeFrameParams.obliqueNormal`/`obliqueOffset`), not implied by which mode is active. */
+export type VolumeViewMode = "volume" | "xPlane" | "yPlane" | "zPlane" | "oblique";
 
 const BLEND_MODE_ID: Record<VolumeBlendMode, number> = {
   composite: 0,
@@ -38,11 +40,14 @@ const BLEND_MODE_ID: Record<VolumeBlendMode, number> = {
   average: 3,
 };
 
+// 3 bits (0-7) packed into Frame.slices.w bits 4-6 — was 2 bits (4 values, exactly volume/x/y/z) before
+// "oblique" needed a 5th. Bit 7 is still free for a future 6th-8th mode.
 const VIEW_MODE_ID: Record<VolumeViewMode, number> = {
   volume: 0,
   xPlane: 1,
   yPlane: 2,
   zPlane: 3,
+  oblique: 4,
 };
 
 /** Every `VolumeRenderer` field `writeVolumeFrameUniform` needs, grouped as in the WGSL `Frame` struct. */
@@ -75,7 +80,24 @@ export interface VolumeFrameParams {
   sliceEnableX: boolean;
   sliceEnableY: boolean;
   sliceEnableZ: boolean;
+  /** Show the oblique-plane overlay/highlight (independent of `viewMode` — like `sliceEnableX/Y/Z`,
+   * this can be on even while `viewMode` is `"volume"`, e.g. for a tri-planar-style overview). */
+  sliceEnableOblique: boolean;
+  /** World-space unit normal of the oblique cut plane. Only meaningful when `viewMode === "oblique"`
+   * or `sliceEnableOblique` is true. */
+  obliqueNormal: readonly [number, number, number];
+  /** Signed plane offset: the plane is every world point `p` where `dot(p, obliqueNormal) ===
+   * obliqueOffset`. */
+  obliqueOffset: number;
   showSlicePlanes: boolean;
+  /** Green wireframe-box indicator (independent of everything else here — not part of the crop/slice
+   * system at all): highlights an arbitrary axis-aligned uvw `[0,1]^3` box, e.g. so a "context" pane can
+   * show exactly what region a linked "detail" pane is cropped to. Deliberately its own flag/fields, not
+   * reusing `cropMin`/`cropMax` — those drive the crop system's own AABB test and must stay `[0,1]`
+   * (uncropped) on a pane that shows this indicator while remaining un-cropped itself. */
+  overlayBoxEnabled: boolean;
+  overlayBoxMin: readonly [number, number, number];
+  overlayBoxMax: readonly [number, number, number];
   viewMode: VolumeViewMode;
   linearOutput: boolean;
   earlyRayTermination: number;
@@ -149,7 +171,7 @@ export interface MaskSlotParams {
 }
 
 /**
- * Pack one frame's worth of uniforms into `d` (184 floats, fixed offsets — see inline comments for
+ * Pack one frame's worth of uniforms into `d` (196 floats, fixed offsets — see inline comments for
  * each named group). Does not upload to the GPU; the caller writes `d` to the uniform buffer.
  * `invViewProj` must already be the inverted view-projection for this frame.
  */
@@ -170,7 +192,10 @@ export function writeVolumeFrameUniform(
   if (p.sliceEnableY) flags |= 2;
   if (p.sliceEnableZ) flags |= 4;
   if (p.showSlicePlanes) flags |= 8;
-  flags |= (VIEW_MODE_ID[p.viewMode] & 3) << 4;
+  // 3 bits (was 2, room for 4 modes - "oblique" needed a 5th) at bits 4-6.
+  flags |= (VIEW_MODE_ID[p.viewMode] & 7) << 4;
+  if (p.sliceEnableOblique) flags |= 128; // bit 7
+  if (p.overlayBoxEnabled) flags |= 256; // bit 8 — green wireframe-box indicator
 
   const alphaComposite = p.clear ? 0 : 1;
 
@@ -326,4 +351,19 @@ export function writeVolumeFrameUniform(
   d[181] = 0;
   d[182] = 0;
   d[183] = 0;
+  // obliqueNormal: world-space unit normal (xyz) of the oblique cut plane, w = signed plane offset
+  // (dot(worldPos, normal) === offset defines the plane).
+  d[184] = p.obliqueNormal[0];
+  d[185] = p.obliqueNormal[1];
+  d[186] = p.obliqueNormal[2];
+  d[187] = p.obliqueOffset;
+  // overlayBoxMin/overlayBoxMax: uvw-space [0,1]^3 box for the green wireframe-box indicator, w unused.
+  d[188] = p.overlayBoxMin[0];
+  d[189] = p.overlayBoxMin[1];
+  d[190] = p.overlayBoxMin[2];
+  d[191] = 0;
+  d[192] = p.overlayBoxMax[0];
+  d[193] = p.overlayBoxMax[1];
+  d[194] = p.overlayBoxMax[2];
+  d[195] = 0;
 }

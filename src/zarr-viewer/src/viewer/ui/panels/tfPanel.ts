@@ -47,6 +47,7 @@ export function tfPanelBody(rendering: WebGpuRenderingState, activeBandIndex = 0
         `<label class="whud__check" style="margin:0"><input type="checkbox" data-chk="equalizeOn" ${rendering.equalizeOn ? "checked" : ""}/> Equalize</label>` +
         `</div>`,
       slider("equalizeClip", "Clip limit", rendering.equalizeClip, 1, 8, 0.5),
+      `<button type="button" data-act="resetTf" class="whud__seg-btn" style="margin-top:6px">Reset TF</button>`,
     ].join("");
   }
 

@@ -27,6 +27,9 @@ export type PaneSide = 'left' | 'right';
 /** The volume renderer used by all viewers (app-wide toggle). */
 export type RendererKind = 'itk' | 'webgpu';
 
+/** Which axis backs a tab's 2D orthoslice pane while `linked2D3D` is on. */
+export type SliceAxis = 'x' | 'y' | 'z';
+
 export interface ReconTab {
   id: string;
   /** Zarr URL loaded into the viewer. */
@@ -35,6 +38,15 @@ export interface ReconTab {
   name: string;
   /** Which pane this tab belongs to. */
   pane: PaneSide;
+  /**
+   * WebGPU renderer only: show this tab as a linked 3D + 2D-orthoslice split (two `WebGpuNative`
+   * mounts of the SAME dataset side by side, camera-independent, synced rendering/cropping) instead
+   * of a single 3D view. Orthogonal to `pane`/the left-right dataset-compare split above — a tab can
+   * be in either pane and independently have this on or off. Default off (unchanged "3D only" view).
+   */
+  linked2D3D?: boolean;
+  /** Which axis the 2D pane shows while `linked2D3D` is on. Default `'z'` when unset. */
+  sliceAxis?: SliceAxis;
 }
 
 export interface TabsState {
@@ -68,6 +80,10 @@ export interface TabsState {
   reorderTab: (draggedId: string, beforeId: string | null) => void;
   /** Collapse the split: move every right-pane tab back into the left pane. */
   exitSplit: () => void;
+  /** Toggle a tab's linked 3D + 2D-orthoslice split view (WebGPU renderer only). */
+  toggleLinked2D3D: (id: string) => void;
+  /** Set which axis a tab's 2D pane shows while `linked2D3D` is on. */
+  setSliceAxis: (id: string, axis: SliceAxis) => void;
   setLinkCamera: (value: boolean) => void;
   setLinkRendering: (value: boolean) => void;
   setLinkCropping: (value: boolean) => void;
@@ -258,6 +274,18 @@ export const useTabsStore = create<TabsState>()((set, get) => {
         return { tabs, activeLeftId, activeRightId: null, liveIds };
       });
       reconcileGrace();
+    },
+
+    toggleLinked2D3D: (id) => {
+      set((s) => ({
+        tabs: s.tabs.map((t) => (t.id === id ? { ...t, linked2D3D: !t.linked2D3D } : t)),
+      }));
+    },
+
+    setSliceAxis: (id, axis) => {
+      set((s) => ({
+        tabs: s.tabs.map((t) => (t.id === id ? { ...t, sliceAxis: axis } : t)),
+      }));
     },
 
     setLinkCamera: (value) => set({ linkCamera: value }),

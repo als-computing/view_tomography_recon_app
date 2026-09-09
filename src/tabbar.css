@@ -125,6 +125,29 @@
   color: #1583c7;
 }
 
+/* Toggle a linked 3D + 2D-orthoslice split for this tab (WebGPU renderer only). */
+.tabbar__split2d3d {
+  border: 0;
+  background: transparent;
+  color: #8a94a6;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 1px 4px;
+  border-radius: 3px;
+  flex: 0 0 auto;
+}
+
+.tabbar__split2d3d:hover {
+  background: rgba(30, 167, 253, 0.14);
+  color: #1583c7;
+}
+
+.tabbar__split2d3d--active {
+  color: #1583c7;
+  background: rgba(30, 167, 253, 0.18);
+}
+
 .tabbar__close {
   border: 0;
   background: transparent;

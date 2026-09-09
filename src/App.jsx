@@ -22,6 +22,7 @@ import { installTiledTokenBridge } from './tiledTokenBridge';
 import { installTiledFetchInterceptor } from './ItkVtkNative/tiledAuth';
 import ItkVktNative from './ItkVtkNative/ItkVtkNative';
 import WebGpuNative, { webGpuAvailability } from './WebGpuNative/WebGpuNative';
+import WebGpuLinked2D3DPane from './WebGpuNative/WebGpuLinked2D3DPane';
 import { TiledNotifications } from './TiledNotifications';
 import { TabBar } from './TabBar';
 import { useTabsStore } from './stores/useTabsStore';
@@ -51,6 +52,8 @@ function App() {
   const moveTabToPane = useTabsStore((s) => s.moveTabToPane);
   const reorderTab = useTabsStore((s) => s.reorderTab);
   const exitSplit = useTabsStore((s) => s.exitSplit);
+  const toggleLinked2D3D = useTabsStore((s) => s.toggleLinked2D3D);
+  const setSliceAxis = useTabsStore((s) => s.setSliceAxis);
   const setLinkCamera = useTabsStore((s) => s.setLinkCamera);
   const setLinkRendering = useTabsStore((s) => s.setLinkRendering);
   const setLinkCropping = useTabsStore((s) => s.setLinkCropping);
@@ -261,6 +264,8 @@ function App() {
         onClose={closeTab}
         onReorder={reorderTab}
         onMoveToPane={moveTabToPane}
+        renderer={renderer}
+        onToggleLinked2D3D={toggleLinked2D3D}
       />
       <div className="viewer-stack">
         {tabs
@@ -271,7 +276,15 @@ function App() {
               className="viewer-pane"
               style={{ flexDirection: 'column', display: 'flex', ...paneStyle(t.id) }}
             >
-              {renderer === 'webgpu' ? (
+              {renderer === 'webgpu' && t.linked2D3D ? (
+                <WebGpuLinked2D3DPane
+                  dataUrl={t.url}
+                  axis={t.sliceAxis ?? 'z'}
+                  onAxisChange={(axis) => setSliceAxis(t.id, axis)}
+                  onExit={() => toggleLinked2D3D(t.id)}
+                  onReady3D={(instance) => handleWebGpuReady(t.id, instance)}
+                />
+              ) : renderer === 'webgpu' ? (
                 <WebGpuNative
                   dataUrl={t.url}
                   onReady={(instance) => handleWebGpuReady(t.id, instance)}

@@ -109,14 +109,23 @@ export interface WebGpuCroppingState {
   enX: boolean;
   enY: boolean;
   enZ: boolean;
+  /** World-space unit normal of the oblique cut plane (`viewMode: "oblique"`, or the overlay when
+   * `enOblique` is on independent of view mode — same pattern as `enX/enY/enZ`). */
+  obliqueNormal: [number, number, number];
+  /** Signed plane offset: the plane is every world point `p` where `dot(p, obliqueNormal) ===
+   * obliqueOffset`. */
+  obliqueOffset: number;
+  enOblique: boolean;
   showPlanes: boolean;
 }
 
 /**
- * Default rendering state. Reproduces the viewer's original look: bone colormap, ACES tonemap at
- * exposure 1.2, one warm global directional light, half-res/TAAU/half-res-lighting all on (adaptive —
- * they only apply while navigating, see `WebGpuVolumeViewer.ts`'s `settled`), everything else (FX
- * extras, flashlight/stage, shadows, AO) off.
+ * Default rendering state. Bone colormap, ACES tonemap at exposure 1.2, TAAU on (accumulates a clean
+ * supersampled image once the camera settles). Lighting preset (user-tuned, made the default): camera
+ * flashlight + shadows (flashlight-cast only) + ambient occlusion on, the global directional light off;
+ * half-res-while-navigating and half-res lighting both off (a quality-first default — full-res/full
+ * lighting even while navigating, unlike the original adaptive-everything preset this replaced). FX
+ * extras and the stage light stay off.
  */
 export function defaultRenderingState(): WebGpuRenderingState {
   return {
@@ -145,12 +154,12 @@ export function defaultRenderingState(): WebGpuRenderingState {
     fxSharpenAmount: 0.5,
     fxVignette: false,
     fxVignetteAmount: 0.4,
-    lightGlobalOn: true,
+    lightGlobalOn: false,
     lightGlobalColor: "#fff2e0",
     lightGlobalIntensity: 1,
     lightAzimuth: 38, // degrees
     lightElevation: 56, // degrees
-    lightFlashOn: false,
+    lightFlashOn: true,
     lightFlashColor: "#ffffff",
     lightFlashIntensity: 1.2,
     lightStageOn: false,
@@ -159,14 +168,14 @@ export function defaultRenderingState(): WebGpuRenderingState {
     lightAmbient: 0.22,
     lightSpecular: 0.4,
     lightRoughness: 0.6,
-    shadowOn: false,
+    shadowOn: true,
     shadowQuality: 24,
     shadowStrength: 0.85,
     shadowSoftness: 0.3,
-    shadowCastGlobal: true,
+    shadowCastGlobal: false,
     shadowCastFlash: true,
     shadowCastStage: false,
-    aoOn: false,
+    aoOn: true,
     aoRadius: 0.08,
     aoIntensity: 0.7,
     aoSamples: 6,
@@ -174,9 +183,9 @@ export function defaultRenderingState(): WebGpuRenderingState {
     flashRange: 6,
     stageConeDeg: 86,
     stageRange: 8,
-    halfRes: true, // adaptive: only applies while navigating (see WebGpuVolumeViewer.ts's `settled`)
+    halfRes: false, // adaptive: only applies while navigating (see WebGpuVolumeViewer.ts's `settled`)
     temporalAA: true, // Milestone 5: accumulate a clean supersampled image while the camera is still
-    gbufferLighting: true, // Milestone 6 (B3), adaptive: only applies while navigating
+    gbufferLighting: false, // Milestone 6 (B3), adaptive: only applies while navigating
     shaderConfig: "baseline",
     measurePlaneOn: false,
     measureDepth: 0.5, // 0..1 fraction across the volume's depth footprint (0 = front face, 1 = back)
@@ -198,6 +207,9 @@ export function defaultCroppingState(): WebGpuCroppingState {
     enX: false,
     enY: false,
     enZ: false,
+    obliqueNormal: [0, 0, 1],
+    obliqueOffset: 0,
+    enOblique: false,
     showPlanes: false,
   };
 }

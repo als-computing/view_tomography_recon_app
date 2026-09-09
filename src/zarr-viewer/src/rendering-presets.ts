@@ -5,8 +5,13 @@
  *  - The *last-used* snapshot, auto-remembered as the user tweaks controls and auto-applied on boot so
  *    a look carries over without any manual step. It's stored *per sample* (keyed by the sample id,
  *    i.e. the Zarr URL) so switching back to a tab restores that tab's own look — not whatever another
- *    tab touched most recently. A single global snapshot is also kept as the *seed* applied to a
- *    never-before-seen sample, so a brand-new tab still inherits the last look you were working with.
+ *    tab touched most recently. A never-before-seen sample gets no snapshot at all (falls through to
+ *    the coded `defaultRenderingState()`) — NOT the shared global snapshot, which an earlier version of
+ *    this module used as a "seed" for new samples; found live to be a real bug, not a feature: it meant
+ *    opening any brand-new dataset silently inherited whatever OTHER dataset's transfer function/
+ *    rendering was last touched, anywhere, rather than starting from sensible defaults. The shared
+ *    global key is still written on every change (see `setLastRendering`) and still read back for a
+ *    caller that doesn't have a `sampleKey` at all — just no longer used as a per-sample fallback.
  *  - *Named presets* (a map of name → snapshot) the user saves/applies/deletes explicitly.
  *
  * A "snapshot" is just the serializable rendering state produced by the viewer's `getRendering()`
@@ -47,15 +52,14 @@ function readSnapshotAt(key: string): RenderingSnapshot | null {
 }
 
 /**
- * The rendering snapshot to restore on boot. With a `sampleKey`, returns that sample's own last-used
- * look, falling back to the shared global snapshot when this sample has never been seen (so a new tab
- * still inherits the last look). Returns `null` if nothing was ever stored.
+ * The rendering snapshot to restore on boot. With a `sampleKey`, returns ONLY that sample's own
+ * last-used look — `null` if this exact sample has never been seen before, so a brand-new dataset
+ * starts from `defaultRenderingState()` rather than inheriting some other dataset's transfer function
+ * (see this module's own header comment for why the old global-snapshot fallback was removed). Without
+ * a `sampleKey`, falls back to the shared global snapshot.
  */
 export function getLastRendering(sampleKey?: string): RenderingSnapshot | null {
-  if (sampleKey) {
-    const own = readSnapshotAt(lastKeyFor(sampleKey));
-    if (own) return own;
-  }
+  if (sampleKey) return readSnapshotAt(lastKeyFor(sampleKey));
   return readSnapshotAt(LAST_KEY);
 }
 

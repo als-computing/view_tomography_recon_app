@@ -16,8 +16,10 @@ import { MASK_BINDING_BASE } from "../volume/volume-bindings.js";
  * camUp + 4-slot brick arrays — item 9 stage 9a grew this from 560 by 96 bytes replacing the old
  * single brickMin/brickMax vec4 pair with 4-slot brickWorldMin/brickWorldMax arrays; stage 9b grew it
  * a further 80 bytes for `brickAtlasOrigin`/`brickSlotSize` once `brickTex` became a real shared
- * `BrickAtlas` texture instead of one dedicated texture per (degenerate single) slot). */
-export const VOLUME_FRAME_UNIFORM_SIZE = 736;
+ * `BrickAtlas` texture instead of one dedicated texture per (degenerate single) slot; oblique slicing
+ * grew it a further 16 bytes for `obliqueNormal`; the green wireframe-box indicator grew it a further
+ * 32 bytes for `overlayBoxMin`/`overlayBoxMax`). */
+export const VOLUME_FRAME_UNIFORM_SIZE = 784;
 
 /** Compile-time specialization for {@link volumeRaymarchWgsl}. */
 export interface VolumeRaymarchSpec {
@@ -58,6 +60,10 @@ const SIGMA_MAX: f32 = ${PREINTEGRATION_SIGMA_MAX};
 const VIS_SCALE: f32 = 128.0;
 const SHADE_ALPHA_EPS: f32 = 1e-4;
 const TARGET_SEGMENT_OPACITY: f32 = 0.25;
+// Green solid-fill box indicator: fixed extinction coefficient (NOT derived from density/TF at all —
+// see inOverlayBox's own doc comment for why) and fill color.
+const OVERLAY_BOX_SIGMA: f32 = 1.2;
+const OVERLAY_BOX_COLOR = vec3<f32>(0.15, 0.95, 0.25);
 
 struct Frame {
   invViewProj: mat4x4<f32>,
@@ -98,6 +104,9 @@ struct Frame {
   // atlas's own texel coordinates.
   brickAtlasOrigin: array<vec4<f32>, 4>, // per-slot voxel origin within the atlas, w unused
   brickSlotSize: vec4<f32>,  // x = voxels per axis of one atlas slot, yzw unused
+  obliqueNormal: vec4<f32>, // xyz = world-space unit normal of the oblique cut plane, w = plane offset
+  overlayBoxMin: vec4<f32>, // xyz = green wireframe-box indicator min, uvw [0,1] (flags bit 8 = enable)
+  overlayBoxMax: vec4<f32>, // xyz = green wireframe-box indicator max, uvw [0,1]
 };
 
 struct OccCell { dmin: f32, dmax: f32, dist: f32, occupied: f32 }
@@ -558,6 +567,19 @@ fn inCrop(uvw: vec3<f32>) -> bool {
   return all(uvw >= mn) && all(uvw <= mx);
 }
 
+// uvw (over the full coarse box, [0,1]^3) -> world (sim units) - same conversion resolveBrickSlot/
+// sampleDensity already use for the brick-slot world test, extracted here since the oblique plane test
+// needs it too (an arbitrary-normal plane, unlike the axis-aligned tests above it, can't be expressed
+// as a simple per-component uvw comparison).
+fn uvwToWorld(uvw: vec3<f32>) -> vec3<f32> {
+  let halfExt = max(frame.boxHalf.xyz, vec3<f32>(1e-6));
+  return uvw * (2.0 * halfExt) - halfExt;
+}
+
+fn obliqueSignedDist(uvw: vec3<f32>) -> f32 {
+  return dot(uvwToWorld(uvw), frame.obliqueNormal.xyz) - frame.obliqueNormal.w;
+}
+
 fn planeHighlight(uvw: vec3<f32>, flags: u32, thickness: f32) -> f32 {
   var h = 0.0;
   if ((flags & 1u) != 0u) {
@@ -569,7 +591,24 @@ fn planeHighlight(uvw: vec3<f32>, flags: u32, thickness: f32) -> f32 {
   if ((flags & 4u) != 0u) {
     h = max(h, 1.0 - smoothstep(0.0, thickness, abs(uvw.z - frame.slices.z)));
   }
+  if ((flags & 128u) != 0u) {
+    // World-space signed distance, not a [0,1]-uvw one like the axis tests above - scale the
+    // smoothstep threshold by a representative box extent so "thickness" (a uvw-scale constant at
+    // every call site) reads as a comparable on-screen band width for the oblique plane too.
+    let extent = max(max(frame.boxHalf.x, frame.boxHalf.y), frame.boxHalf.z) * 2.0;
+    h = max(h, 1.0 - smoothstep(0.0, thickness * extent, abs(obliqueSignedDist(uvw))));
+  }
   return h;
+}
+
+// Green solid-fill box indicator: an arbitrary axis-aligned uvw box (mn/mx), independent of the crop/
+// slice system entirely — used by a "context" pane to show exactly what region a linked "detail" pane
+// is cropped to, without actually cropping this pane's own rendering. Its own compositing (see the
+// OVERLAY_BOX_SIGMA constant-extinction blend in the march loop below) is deliberately NOT gated by the
+// transfer function or by sampled density at all - it's a solid indicator, not volume content, and must
+// stay visible in air the TF renders fully transparent.
+fn inOverlayBox(uvw: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>) -> bool {
+  return all(uvw >= mn) && all(uvw <= mx);
 }
 
 fn passesViewMode(uvw: vec3<f32>, viewMode: u32, thickness: f32) -> bool {
@@ -577,6 +616,12 @@ fn passesViewMode(uvw: vec3<f32>, viewMode: u32, thickness: f32) -> bool {
   if (viewMode == 1u) { return abs(uvw.x - frame.slices.x) <= thickness; }
   if (viewMode == 2u) { return abs(uvw.y - frame.slices.y) <= thickness; }
   if (viewMode == 3u) { return abs(uvw.z - frame.slices.z) <= thickness; }
+  if (viewMode == 4u) {
+    // World-space slab half-thickness, matching planeHighlight's own scaling above (thickness alone
+    // would be a [0,1]-uvw-scale value, meaningless as a world-space distance without it).
+    let extent = max(max(frame.boxHalf.x, frame.boxHalf.y), frame.boxHalf.z) * 2.0;
+    return abs(obliqueSignedDist(uvw)) <= thickness * extent;
+  }
   return true;
 }
 
@@ -671,7 +716,7 @@ fn marchColor(
   let lighting = frame.quality.z;
   let dielectric = frame.quality.w > 0.5;
   let flags = u32(frame.slices.w);
-  let viewMode = (flags >> 4u) & 3u;
+  let viewMode = (flags >> 4u) & 7u; // 3 bits (0-7): volume/x/y/z/oblique (was 2 bits before oblique)
   let showPlanes = (flags & 8u) != 0u;
   let slabT = select(0.045, 0.014, viewMode == 0u);
 
@@ -812,6 +857,20 @@ fn marchColor(
         color = vec4<f32>(color.rgb + om * mask1.rgb * mask1.a, color.a + om * mask1.a);
         colorUnlit = vec4<f32>(colorUnlit.rgb + om * mask1.rgb * mask1.a, colorUnlit.a + om * mask1.a);
       }
+    }
+
+    // Green solid-fill box indicator (flags bit 8): a constant-extinction translucent fill wherever the
+    // ray is inside the box, composited "over" exactly like the mask layers above and for the same
+    // reason — it must stay visible even in air the primary volume renders fully transparent, which is
+    // exactly why this runs here, BEFORE the primary's density-driven skip-ahead below (that skip would
+    // otherwise happily leap straight over the box's own contribution in an empty-looking region).
+    // Its own alpha comes from a fixed OVERLAY_BOX_SIGMA extinction coefficient, never from sampleDensity
+    // or the transfer function - this is what makes it "not opacity driven by the TF."
+    if (blendMode == 0 && (flags & 256u) != 0u && inOverlayBox(uvw, frame.overlayBoxMin.xyz, frame.overlayBoxMax.xyz)) {
+      let boxAlpha = 1.0 - exp(-OVERLAY_BOX_SIGMA * stepNow);
+      let om = 1.0 - color.a;
+      color = vec4<f32>(color.rgb + om * OVERLAY_BOX_COLOR * boxAlpha, color.a + om * boxAlpha);
+      colorUnlit = vec4<f32>(colorUnlit.rgb + om * OVERLAY_BOX_COLOR * boxAlpha, colorUnlit.a + om * boxAlpha);
     }
 
     let density = sampleDensity(uvw);

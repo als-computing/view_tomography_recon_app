@@ -30,14 +30,27 @@ describe("buildFrameLights", () => {
   const fwd: [number, number, number] = [0, 0, -1];
   const extent = 2;
 
+  // Every test below sets lightGlobalOn/lightFlashOn/lightStageOn explicitly rather than relying on
+  // whatever defaultRenderingState()'s own light-mode defaults happen to be — this suite tests
+  // buildFrameLights's pure light-list-assembly logic, not the current default preset, and the two
+  // should be free to change independently (found live: the preset's lighting defaults were updated to
+  // a user-tuned config with the flashlight ON and the global light OFF, which silently broke these
+  // tests since several of them depended on the OLD "global on, flash off" defaults instead of setting
+  // their own inputs).
+
   it("emits no lights when every mode is off", () => {
     const rendering = defaultRenderingState();
     rendering.lightGlobalOn = false;
+    rendering.lightFlashOn = false;
+    rendering.lightStageOn = false;
     expect(buildFrameLights(rendering, eye, right, up, fwd, extent)).toHaveLength(0);
   });
 
-  it("emits exactly the global directional light by default (matches viewer defaults)", () => {
+  it("emits exactly the global directional light when only global is enabled", () => {
     const rendering = defaultRenderingState();
+    rendering.lightGlobalOn = true;
+    rendering.lightFlashOn = false;
+    rendering.lightStageOn = false;
     const lights = buildFrameLights(rendering, eye, right, up, fwd, extent);
     expect(lights).toHaveLength(1);
     expect(lights[0]!.castShadows).toBe(rendering.shadowCastGlobal);
@@ -45,16 +58,19 @@ describe("buildFrameLights", () => {
 
   it("adds one flashlight spot at the eye, pointed forward", () => {
     const rendering = defaultRenderingState();
+    rendering.lightGlobalOn = false;
     rendering.lightFlashOn = true;
+    rendering.lightStageOn = false;
     const lights = buildFrameLights(rendering, eye, right, up, fwd, extent);
-    expect(lights).toHaveLength(2);
-    const flash = lights[1]!;
+    expect(lights).toHaveLength(1);
+    const flash = lights[0]!;
     expect(flash.castShadows).toBe(rendering.shadowCastFlash);
   });
 
   it("adds four stage spots, one per screen corner", () => {
     const rendering = defaultRenderingState();
     rendering.lightGlobalOn = false;
+    rendering.lightFlashOn = false;
     rendering.lightStageOn = true;
     const lights = buildFrameLights(rendering, eye, right, up, fwd, extent);
     expect(lights).toHaveLength(4);
@@ -63,6 +79,7 @@ describe("buildFrameLights", () => {
 
   it("respects all three modes enabled together (1 + 1 + 4 = 6 lights)", () => {
     const rendering = defaultRenderingState();
+    rendering.lightGlobalOn = true;
     rendering.lightFlashOn = true;
     rendering.lightStageOn = true;
     const lights = buildFrameLights(rendering, eye, right, up, fwd, extent);

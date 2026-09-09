@@ -71,6 +71,7 @@ export interface HudEventContext {
   emitCropping(): void;
   setViewModeAndEmit(mode: VolumeViewMode, opts?: { openSlices?: boolean; skipRenderUi?: boolean }): void;
   resetCrop(): void;
+  resetTf(): void;
   frameSliceCamera(): void;
   recomputeEqualize(): void;
   rebuildFxStack(): void;
@@ -269,6 +270,10 @@ export function bindHudClick(ctx: HudEventContext): void {
     }
     if (btn.dataset.act === "resetCrop") {
       ctx.resetCrop();
+      return;
+    }
+    if (btn.dataset.act === "resetTf") {
+      ctx.resetTf();
       return;
     }
     if (btn.dataset.act === "frameSlice") {

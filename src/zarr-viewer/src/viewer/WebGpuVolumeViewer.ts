@@ -82,6 +82,7 @@ import {
 import {
   type CameraContext,
   frameSliceCamera as frameSliceCameraPure,
+  frameSliceIntersection as frameSliceIntersectionPure,
   enterViewMode as enterViewModePure,
   activeSlice as activeSlicePure,
   setActiveSlice as setActiveSlicePure,
@@ -101,6 +102,7 @@ import { loadMaskVolume, loadMaskFromArray } from "./volume/load-mask.js";
 import { discoverMaskClasses, buildMaskPalette, type MaskClassState } from "./state/mask-classes.js";
 
 export type { WebGpuRenderingState, WebGpuCroppingState } from "./RenderingState.js";
+export type { VolumeViewMode } from "@zarr-viewer/render";
 
 /** Change events emitted by a {@link WebGpuViewerInstance}. */
 export type WebGpuViewerEvent = "cameraChange" | "renderingChange" | "croppingChange";
@@ -129,6 +131,45 @@ export interface WebGpuViewerInstance {
   setRendering: (state: WebGpuRenderingState) => void;
   getCropping: () => WebGpuCroppingState;
   setCropping: (state: WebGpuCroppingState) => void;
+  /**
+   * Switch view mode — unlike `setRendering({ viewMode })` (which deliberately never touches camera or
+   * cropping), this is the full "enter a slice view" behavior the built-in HUD's own view-mode buttons
+   * use: for a plane mode, also enables that axis's crop-slice + overlay plane (`showPlanes`) and
+   * re-frames the camera face-on to it (`reframe`, default `true`); for `"volume"`, just restores the
+   * standard 3/4 framing when `reframe` is true. Emits `renderingChange`/`croppingChange` (both fire
+   * together — a view-mode switch always touches both groups), so a linked peer picks it up.
+   */
+  setViewMode: (mode: VolumeViewMode, reframe?: boolean) => void;
+  /**
+   * Re-center + zoom the camera onto the point where the three slice planes (`cropping.sliceX/Y/Z`)
+   * currently intersect, preserving the camera's own viewing angle (unlike a full re-frame). `zoomFraction`
+   * (default `0.15`) is the new camera distance as a fraction of the volume's largest extent — smaller
+   * is a tighter zoom. Meant for a 3D pane linked to one or more 2D slice panes, so it can focus on
+   * exactly the region they're showing from whatever angle it's already at.
+   */
+  zoomToSliceIntersection: (zoomFraction?: number) => void;
+  /**
+   * Re-face the camera along the current `cropping.obliqueNormal`, without touching `viewMode`,
+   * `cropping.enOblique`, or triggering a HUD rebuild/emit — a lightweight sibling of
+   * `setViewMode("oblique")` for a caller that already pushed a new `obliqueNormal` via `setCropping`
+   * (which never reframes the camera on its own) and just needs this pane's camera to catch up. Meant
+   * to be called every tick while continuously linking this pane's oblique plane to another pane's
+   * live camera angle — unlike `setViewMode`, safe to call at that frequency.
+   */
+  refreshObliqueFraming: () => void;
+  /**
+   * Green wireframe-box indicator: highlight an arbitrary axis-aligned uvw `[0,1]^3` box in THIS pane's
+   * own render, without cropping this pane's own volume at all (`cropping.cropMin/cropMax` are
+   * untouched) — e.g. so a "context" pane can show exactly what region a linked "detail" pane is
+   * cropped to. Deliberately its own method, not routed through `setCropping`/the standard `cropping`
+   * link group: a pane using this to show a PEER's crop box must keep its own `cropMin/cropMax` at
+   * `[0,1]` (uncropped), which the bidirectional cropping-link group would immediately overwrite if this
+   * were folded into it. A silent setter (never emits), matching `setCropping`'s own convention.
+   */
+  setOverlayBox: (enabled: boolean, min: readonly [number, number, number], max: readonly [number, number, number]) => void;
+  /** Whether the built-in HUD sidebar is collapsed to a thin strip. */
+  getCollapsed: () => boolean;
+  setCollapsed: (collapsed: boolean) => void;
   on: (event: WebGpuViewerEvent, cb: () => void) => void;
   off: (event: WebGpuViewerEvent, cb: () => void) => void;
   /**
@@ -268,6 +309,7 @@ export async function run(
     ...cropping,
     cropMin: [cropping.cropMin[0], cropping.cropMin[1], cropping.cropMin[2]],
     cropMax: [cropping.cropMax[0], cropping.cropMax[1], cropping.cropMax[2]],
+    obliqueNormal: [cropping.obliqueNormal[0], cropping.obliqueNormal[1], cropping.obliqueNormal[2]],
   });
 
   // Minimal instance for the failure paths (bad store / no uploadable LOD) — real get/set exist only
@@ -279,6 +321,12 @@ export async function run(
     setRendering: () => {},
     getCropping: readCropping,
     setCropping: () => {},
+    setViewMode: () => {},
+    zoomToSliceIntersection: () => {},
+    refreshObliqueFraming: () => {},
+    setOverlayBox: () => {},
+    getCollapsed: () => false,
+    setCollapsed: () => {},
     on: () => {},
     off: () => {},
     loadMask: () => {},
@@ -620,6 +668,24 @@ export async function run(
     renderUi();
     emitCropping();
   };
+  // Restore the transfer function to the coded defaults (colormap, color range, opacity curve/scale) and
+  // drop out of Bands mode entirely (tfBands cleared) - a "start over" button distinct from Auto-contrast
+  // (which only nudges colorLo/colorHi from the actual histogram, keeping the rest of the curve as-is).
+  // Deliberately leaves equalizeOn/equalizeClip untouched - those are a display filter layered ON TOP of
+  // whatever TF is active, not part of the TF itself.
+  const resetTf = (): void => {
+    const d = defaultRenderingState();
+    rendering.colorMap = d.colorMap;
+    rendering.colorLo = d.colorLo;
+    rendering.colorHi = d.colorHi;
+    rendering.opacityScale = d.opacityScale;
+    rendering.opacityPoints = [...d.opacityPoints];
+    rendering.tfBands = undefined;
+    activeBandIndex = 0;
+    applyTf();
+    renderUi();
+    emitRendering();
+  };
   // Baseline for the render-loop camera poll: last pose we announced (or applied from a peer), so the
   // poll only emits on a real delta and never echoes a value pushed in via setCamera().
   let lastCam: WebGpuCameraState | null = null;
@@ -821,6 +887,8 @@ export async function run(
     volumeRenderer.setSliceEnabled("x", cropping.enX);
     volumeRenderer.setSliceEnabled("y", cropping.enY);
     volumeRenderer.setSliceEnabled("z", cropping.enZ);
+    volumeRenderer.setSliceEnabledOblique(cropping.enOblique);
+    volumeRenderer.setObliquePlaneRaw(cropping.obliqueNormal, cropping.obliqueOffset);
     volumeRenderer.setSlicePlanesVisible(cropping.showPlanes);
     volumeRenderer.setCrop(cropping.cropMin, cropping.cropMax);
     volumeRenderer.setShaderConfig(rendering.shaderConfig);
@@ -832,36 +900,87 @@ export async function run(
 
   const cameraCtx: CameraContext = { controls, camera, sizeSim };
 
+  // Every function below repositions the camera PROGRAMMATICALLY (not via genuine user pointer input),
+  // by mutating `controls`/`camera` directly (the same primitives OrbitControls' own pointer handling
+  // uses) — NOT via the public `setCamera()` API, which is the only other place that rebases `lastCam`
+  // (see its own comment: "re-baseline so the loop's poll doesn't echo this peer-applied pose back
+  // out"). Without an equivalent rebase here, the render loop's own per-frame `camsEqual(camNow,
+  // lastCam)` poll (line ~1501) sees exactly the same kind of "the camera changed" signal a real user
+  // drag would produce, and emits a `cameraChange` event for it — indistinguishable, from a listener's
+  // point of view, from genuine user input. A host app driving two linked panes (e.g.
+  // `WebGpuLinked2D3DPane`'s rotation-only sync) reacts to that spurious event by pushing this pane's
+  // (self-repositioned) angle onto the OTHER pane, whose own resulting reposition then does the same
+  // thing back — a real, continuous feedback loop between the two panes, not just a one-off. Confirmed
+  // live: this is exactly what produced "crazy flickering, impossible to control" once oblique-mode's
+  // continuous `refreshObliqueFraming()` calls started running every camera-drag frame.
+  const rebaseLastCam = (): void => {
+    lastCam = controls.getState();
+  };
+
   /** Frame camera looking along the active slice normal (itk-vtk style). */
-  const frameSliceCamera = (): void =>
+  const frameSliceCamera = (): void => {
     frameSliceCameraPure(cameraCtx, rendering.viewMode, {
       x: cropping.sliceX,
       y: cropping.sliceY,
       z: cropping.sliceZ,
     });
+    rebaseLastCam();
+  };
 
-  const enterViewMode = (mode: VolumeViewMode, reframe = true): void =>
+  const enterViewMode = (mode: VolumeViewMode, reframe = true): void => {
     enterViewModePure(cameraCtx, mode, rendering, cropping, applyRender, reframe);
+    if (reframe) rebaseLastCam();
+  };
 
   /** Recenter the camera on the whole volume, regardless of the current view mode (the "Home" button). */
   const homeCamera = (): void => {
     frameSliceCameraPure(cameraCtx, "volume", { x: cropping.sliceX, y: cropping.sliceY, z: cropping.sliceZ });
+    rebaseLastCam();
     applyRender();
   };
 
-  // Floating "Home" button, hovering over the top-right of the canvas — reuses the same stage element
-  // ViewportOverlay attaches into (see below), positioned above it (higher z-index) since the overlay
-  // itself is pointer-events:none and would otherwise sit "on top" visually but never intercept clicks.
-  const homeButton = document.createElement("button");
-  homeButton.type = "button";
-  homeButton.className = "whud-home-btn";
-  homeButton.title = "Recenter on the whole volume";
-  homeButton.setAttribute("aria-label", "Recenter on the whole volume");
-  homeButton.textContent = "⌂";
-  Object.assign(homeButton.style, {
+  /** Re-center + zoom onto the point where all three slice planes currently intersect, preserving the
+   * camera's own viewing angle (unlike homeCamera/frameSliceCamera, which reset to a canonical angle).
+   * Meant for a 3D pane linked to one or more 2D slice panes, to focus on exactly what they're showing. */
+  const zoomToSliceIntersection = (zoomFraction?: number): void => {
+    frameSliceIntersectionPure(
+      cameraCtx,
+      { x: cropping.sliceX, y: cropping.sliceY, z: cropping.sliceZ },
+      zoomFraction,
+    );
+    rebaseLastCam();
+    applyRender();
+  };
+
+  /**
+   * Re-face the camera along the CURRENT `cropping.obliqueNormal` without touching `viewMode`,
+   * `cropping.enOblique`, or the HUD (no `renderUi()`, no emit) — a lighter-weight sibling of
+   * `setViewMode("oblique")` for a caller that's already updated `obliqueNormal` via `setCropping` (a
+   * silent setter) and just needs the camera to catch up. Meant for continuously re-framing a 2D
+   * oblique pane while its plane tracks another pane's camera angle in real time — calling the full
+   * `setViewMode` on every tick would also rebuild the HUD every tick (`setViewModeAndEmit`'s default
+   * `renderUi()`), which is exactly the "too-frequent full-sidebar-rebuild" class of bug already fixed
+   * elsewhere in this app's ROI streaming (see the plan's own history) - avoided here by not reusing it
+   * for a per-frame call site in the first place. Rebases `lastCam` for the same reason every other
+   * programmatic reposition in this file does — see `rebaseLastCam`'s own comment.
+   */
+  const refreshObliqueFraming = (): void => {
+    frameSliceCameraPure(
+      cameraCtx,
+      "oblique",
+      { x: cropping.sliceX, y: cropping.sliceY, z: cropping.sliceZ },
+      cropping.obliqueNormal,
+    );
+    rebaseLastCam();
+    applyRender();
+  };
+
+  // Floating "Home" / "zoom to slice intersection" buttons, hovering over the top-right of the canvas —
+  // reuse the same stage element ViewportOverlay attaches into (see below), positioned above it (higher
+  // z-index) since the overlay itself is pointer-events:none and would otherwise sit "on top" visually
+  // but never intercept clicks.
+  const floatingBtnStyle = {
     position: "absolute",
-    top: "12px",
-    right: "12px",
     zIndex: "3",
     width: "32px",
     height: "32px",
@@ -871,18 +990,36 @@ export async function run(
     color: "#e8e8ec",
     font: "16px system-ui, sans-serif",
     cursor: "pointer",
-  });
+  } as const;
+  const homeButton = document.createElement("button");
+  homeButton.type = "button";
+  homeButton.className = "whud-home-btn";
+  homeButton.title = "Recenter on the whole volume";
+  homeButton.setAttribute("aria-label", "Recenter on the whole volume");
+  homeButton.textContent = "⌂";
+  Object.assign(homeButton.style, floatingBtnStyle, { top: "12px", right: "12px" });
   homeButton.addEventListener("click", () => homeCamera());
   (canvas.parentElement ?? document.body).appendChild(homeButton);
   session.onDispose(() => homeButton.remove());
+
+  const zoomIntersectButton = document.createElement("button");
+  zoomIntersectButton.type = "button";
+  zoomIntersectButton.className = "whud-zoom-intersect-btn";
+  zoomIntersectButton.title = "Zoom to the intersection of the slice planes";
+  zoomIntersectButton.setAttribute("aria-label", "Zoom to the intersection of the slice planes");
+  zoomIntersectButton.textContent = "⌖";
+  Object.assign(zoomIntersectButton.style, floatingBtnStyle, { top: "48px", right: "12px" });
+  zoomIntersectButton.addEventListener("click", () => zoomToSliceIntersection());
+  (canvas.parentElement ?? document.body).appendChild(zoomIntersectButton);
+  session.onDispose(() => zoomIntersectButton.remove());
 
   // Switch view mode (and, for the plane modes, the slice it enables) then notify listeners — view
   // mode carries both a render mode and slice enables/overlays, so both change events fire together.
   const setViewModeAndEmit = (
     mode: VolumeViewMode,
-    opts?: { openSlices?: boolean; skipRenderUi?: boolean },
+    opts?: { openSlices?: boolean; skipRenderUi?: boolean; reframe?: boolean },
   ): void => {
-    enterViewMode(mode, true);
+    enterViewMode(mode, opts?.reframe ?? true);
     if (opts?.openSlices) {
       openSections.add("slices");
       activeTab = "volume";
@@ -1064,6 +1201,13 @@ export async function run(
     cropping,
     isVolumeView: () => rendering.viewMode === "volume",
     applyRender: () => applyRender(),
+    // Emit on every drag tick, not just at release, so a linked peer's crop box tracks live instead of
+    // only snapping into place once the mouse comes up (found live: dragging the 3D crop-box gizmo
+    // didn't move the split view's other pane until the drag ended, unlike every other crop
+    // interaction). Skip renderUi() here (a full HUD/sidebar rebuild) - too expensive to run on every
+    // pointermove tick; onDragEnd below still rebuilds it once, so the Crop panel's own sliders catch up
+    // when the drag finishes.
+    onDragChange: () => emitCropping(),
     onDragEnd: () => {
       renderUi();
       emitCropping();
@@ -1279,6 +1423,7 @@ export async function run(
     emitCropping: () => emitCropping(),
     setViewModeAndEmit: (mode, opts) => setViewModeAndEmit(mode, opts),
     resetCrop: () => resetCrop(),
+    resetTf: () => resetTf(),
     frameSliceCamera: () => frameSliceCamera(),
     recomputeEqualize: () => recomputeEqualize(),
     rebuildFxStack: () => rebuildFxStack(),
@@ -1303,6 +1448,11 @@ export async function run(
     const step = 1 / Math.max(n, 2);
     const dir = e.deltaY > 0 ? 1 : -1;
     setActiveSlice((activeSlice()?.value ?? 0.5) + dir * step);
+    // setActiveSlice only calls applyRender() - unlike every other cropping mutation path (the HUD's
+    // own slice slider, crop sliders, checkboxes), wheel-scrubbing never emitted croppingChange, so a
+    // linked peer (e.g. the 2D/3D split view) never found out the slice moved. Found live: scrubbing
+    // through slices with the mouse wheel didn't move the other pane's slice-plane indicator at all.
+    emitCropping();
     if (openSections.has("slices")) renderUi();
   };
   canvas.addEventListener("wheel", onSliceWheel, { passive: false });
@@ -1702,8 +1852,21 @@ export async function run(
       // Defensive copies so a caller mutating their own `state` object afterward can't reach in.
       cropping.cropMin = [state.cropMin[0], state.cropMin[1], state.cropMin[2]];
       cropping.cropMax = [state.cropMax[0], state.cropMax[1], state.cropMax[2]];
+      cropping.obliqueNormal = [state.obliqueNormal[0], state.obliqueNormal[1], state.obliqueNormal[2]];
       applyRender();
       renderUi();
+    },
+    setViewMode: (mode, reframe = true) => setViewModeAndEmit(mode, { reframe }),
+    zoomToSliceIntersection: (zoomFraction) => zoomToSliceIntersection(zoomFraction),
+    refreshObliqueFraming: () => refreshObliqueFraming(),
+    setOverlayBox: (enabled, min, max) => {
+      volumeRenderer.setOverlayBox(enabled, [min[0], min[1], min[2]], [max[0], max[1], max[2]]);
+      applyRender();
+    },
+    getCollapsed: () => collapsed,
+    setCollapsed: (v) => {
+      collapsed = v;
+      renderUi(); // renderUi() itself re-asserts the collapsed CSS/sidebar-width via applyCollapsed()
     },
     on: (event, cb) => {
       viewerListeners[event].add(cb);

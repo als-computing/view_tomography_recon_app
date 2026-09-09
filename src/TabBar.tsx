@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import type { PaneSide, ReconTab } from './stores/useTabsStore';
+import type { PaneSide, ReconTab, RendererKind } from './stores/useTabsStore';
 import './tabbar.css';
 
 /** dataTransfer MIME type carrying a dragged tab's id, so a tab group can accept it as a pane move. */
@@ -15,6 +15,10 @@ export interface TabBarProps {
   onReorder: (draggedId: string, beforeId: string | null) => void;
   /** Move a tab into a pane, optionally positioned before `beforeId`. */
   onMoveToPane: (id: string, pane: PaneSide, beforeId?: string | null) => void;
+  /** Which volume renderer is active — the 2D/3D split toggle only means anything on `'webgpu'`. */
+  renderer: RendererKind;
+  /** Toggle a tab's linked 3D + 2D-orthoslice split view. */
+  onToggleLinked2D3D: (id: string) => void;
 }
 
 /**
@@ -33,6 +37,8 @@ export const TabBar = ({
   onClose,
   onReorder,
   onMoveToPane,
+  renderer,
+  onToggleLinked2D3D,
 }: TabBarProps) => {
   const draggedIdRef = useRef<string | null>(null);
   const [overId, setOverId] = useState<string | null>(null);
@@ -101,6 +107,23 @@ export const TabBar = ({
           </span>
         )}
         <span className="tabbar__name">{tab.name}</span>
+        {renderer === 'webgpu' && (
+          <button
+            type="button"
+            className={['tabbar__split2d3d', tab.linked2D3D ? 'tabbar__split2d3d--active' : '']
+              .filter(Boolean)
+              .join(' ')}
+            aria-label={tab.linked2D3D ? 'Show 3D only' : 'Show linked 2D/3D split'}
+            aria-pressed={!!tab.linked2D3D}
+            title={tab.linked2D3D ? 'Show 3D only' : 'Show linked 2D slice + 3D split'}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleLinked2D3D(tab.id);
+            }}
+          >
+            ◫
+          </button>
+        )}
         <button
           type="button"
           className="tabbar__move"

@@ -20,11 +20,14 @@ export interface CameraContext {
 }
 
 /** Point the orbit camera at the active view mode: face-on to the active slice plane, or the
- * standard 3/4 framing for the full volume. */
+ * standard 3/4 framing for the full volume. `obliqueNormal` is required (and only used) for
+ * `viewMode === "oblique"` — falls back to the standard volume framing if omitted, since an oblique
+ * plane with no known normal has no face-on direction to frame. */
 export function frameSliceCamera(
   ctx: CameraContext,
   viewMode: VolumeViewMode,
   slice: { x: number; y: number; z: number },
+  obliqueNormal?: readonly [number, number, number],
 ): void {
   const { controls, camera, sizeSim } = ctx;
   const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
@@ -41,10 +44,62 @@ export function frameSliceCamera(
   } else if (viewMode === "zPlane") {
     controls.target.set(0, 0, pz);
     camera.position.set(px * 0.05, py * 0.05, pz + dist);
+  } else if (viewMode === "oblique" && obliqueNormal) {
+    // Face-on along the plane's own normal, centered on the same (sliceX/Y/Z-derived) point the other
+    // plane modes use — not necessarily exactly on the plane (that'd need re-deriving from the plane's
+    // offset too), but close enough as a camera focus point; visually indistinguishable.
+    //
+    // Distance is PRESERVED from the camera's current position, NOT the fixed full-volume `dist` the
+    // other branches use — this branch is called every frame while continuously re-facing an oblique
+    // pane along a live-tracked normal (`refreshObliqueFraming`), including right after the user's own
+    // zoom/orbit input on that same pane. Resetting to `dist` every tick silently snapped the camera
+    // back out to the full-volume framing distance on every single call, making it impossible to stay
+    // zoomed in on anything — confirmed live ("no way to control the zoomed in view").
+    const curDist =
+      Math.hypot(
+        camera.position.x - controls.target.x,
+        camera.position.y - controls.target.y,
+        camera.position.z - controls.target.z,
+      ) || dist;
+    const len = Math.hypot(obliqueNormal[0], obliqueNormal[1], obliqueNormal[2]) || 1;
+    const nx = obliqueNormal[0] / len;
+    const ny = obliqueNormal[1] / len;
+    const nz = obliqueNormal[2] / len;
+    controls.target.set(px, py, pz);
+    camera.position.set(px + nx * curDist, py + ny * curDist, pz + nz * curDist);
   } else {
     controls.target.set(0, 0, 0);
     camera.position.set(extent * 1.2, extent * 0.85, extent * 1.2);
   }
+  controls.syncFromNode();
+  controls.update(0);
+}
+
+/**
+ * Re-center and zoom the camera onto the point where all three slice planes (sliceX/Y/Z) intersect,
+ * WITHOUT resetting the viewing angle the way {@link frameSliceCamera} does — the current
+ * camera-to-target direction is preserved, only the target and distance change. Meant for a "volume"
+ * (3D) view alongside one or more linked 2D slice panes: zooming to the intersection is how the 3D
+ * pane focuses on exactly the region the 2D pane(s) are currently showing, from whatever angle the
+ * user already has it at.
+ */
+export function frameSliceIntersection(
+  ctx: CameraContext,
+  slice: { x: number; y: number; z: number },
+  zoomFraction = 0.15,
+): void {
+  const { controls, camera, sizeSim } = ctx;
+  const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
+  const px = (slice.x - 0.5) * sizeSim.x;
+  const py = (slice.y - 0.5) * sizeSim.y;
+  const pz = (slice.z - 0.5) * sizeSim.z;
+  const dx = camera.position.x - controls.target.x;
+  const dy = camera.position.y - controls.target.y;
+  const dz = camera.position.z - controls.target.z;
+  const dirLen = Math.hypot(dx, dy, dz) || 1;
+  const dist = extent * zoomFraction;
+  controls.target.set(px, py, pz);
+  camera.position.set(px + (dx / dirLen) * dist, py + (dy / dirLen) * dist, pz + (dz / dirLen) * dist);
   controls.syncFromNode();
   controls.update(0);
 }
@@ -71,14 +126,18 @@ export function enterViewMode(
   } else if (mode === "zPlane") {
     cropping.enZ = true;
     cropping.showPlanes = true;
+  } else if (mode === "oblique") {
+    cropping.enOblique = true;
+    cropping.showPlanes = true;
   }
   applyRender();
   if (reframe) {
-    frameSliceCamera(ctx, rendering.viewMode, {
-      x: cropping.sliceX,
-      y: cropping.sliceY,
-      z: cropping.sliceZ,
-    });
+    frameSliceCamera(
+      ctx,
+      rendering.viewMode,
+      { x: cropping.sliceX, y: cropping.sliceY, z: cropping.sliceZ },
+      cropping.obliqueNormal,
+    );
   }
 }
 

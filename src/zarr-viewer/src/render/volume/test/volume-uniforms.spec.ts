@@ -44,6 +44,12 @@ const BASE_PARAMS: VolumeFrameParams = {
   sliceEnableX: false,
   sliceEnableY: false,
   sliceEnableZ: false,
+  sliceEnableOblique: false,
+  obliqueNormal: [0, 0, 1],
+  obliqueOffset: 0,
+  overlayBoxEnabled: false,
+  overlayBoxMin: [0, 0, 0],
+  overlayBoxMax: [1, 1, 1],
   showSlicePlanes: false,
   viewMode: "volume",
   linearOutput: false,
@@ -87,7 +93,7 @@ const BASE_PARAMS: VolumeFrameParams = {
 };
 
 function pack(overrides: Partial<VolumeFrameParams> = {}): Float32Array {
-  const d = new Float32Array(184);
+  const d = new Float32Array(196);
   writeVolumeFrameUniform(d, new Mat4(), FAKE_ACCEL, { ...BASE_PARAMS, ...overrides });
   return d;
 }
@@ -136,8 +142,40 @@ describe("writeVolumeFrameUniform", () => {
       showSlicePlanes: true,
       viewMode: "xPlane",
     });
-    // bits 0-3 set (1+2+4+8=15), view mode id 1 shifted into bits 4-5 (1<<4=16) → 31
+    // bits 0-3 set (1+2+4+8=15), view mode id 1 shifted into bits 4-6 (1<<4=16) → 31
     expect(allSlices[51]).toBe(31);
+  });
+
+  it("packs oblique view mode (id 4, 3 bits) and sliceEnableOblique (bit 7) into the flags bitfield", () => {
+    // id 4 shifted into bits 4-6 (4<<4=64) - would have silently overflowed/aliased into bit 7 with
+    // the old 2-bit (mask 3) packing, which is exactly the regression this test guards.
+    expect(pack({ viewMode: "oblique" })[51]).toBe(64);
+    expect(pack({ sliceEnableOblique: true })[51]).toBe(128);
+    expect(pack({ viewMode: "oblique", sliceEnableOblique: true })[51]).toBe(192);
+  });
+
+  it("packs obliqueNormal/obliqueOffset at floats 184..187", () => {
+    const d = pack({ obliqueNormal: [0.6, -0.8, 0], obliqueOffset: 1.25 });
+    expect(d[184]).toBeCloseTo(0.6);
+    expect(d[185]).toBeCloseTo(-0.8);
+    expect(d[186]).toBeCloseTo(0);
+    expect(d[187]).toBeCloseTo(1.25);
+  });
+
+  it("packs overlayBoxEnabled into flags bit 8 (256)", () => {
+    expect(pack()[51]).toBe(0);
+    expect(pack({ overlayBoxEnabled: true })[51]).toBe(256);
+    expect(pack({ overlayBoxEnabled: true, sliceEnableOblique: true })[51]).toBe(384);
+  });
+
+  it("packs overlayBoxMin/overlayBoxMax at floats 188..195", () => {
+    const d = pack({ overlayBoxMin: [0.2, 0.3, 0.4], overlayBoxMax: [0.6, 0.7, 0.8] });
+    expect(d[188]).toBeCloseTo(0.2);
+    expect(d[189]).toBeCloseTo(0.3);
+    expect(d[190]).toBeCloseTo(0.4);
+    expect(d[192]).toBeCloseTo(0.6);
+    expect(d[193]).toBeCloseTo(0.7);
+    expect(d[194]).toBeCloseTo(0.8);
   });
 
   it("reads light data through the acceleration accessor", () => {

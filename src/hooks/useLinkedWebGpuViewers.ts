@@ -29,12 +29,45 @@ interface LinkOptions {
   camera: boolean;
   rendering: boolean;
   cropping: boolean;
+  /**
+   * When linking `rendering`, keep each side's OWN `viewMode` instead of copying the other's —
+   * for a 3D+2D split (one pane pinned to `"volume"`, the other pinned to whichever slice axis it
+   * shows), syncing `viewMode` along with the rest of the rendering group like the plain
+   * dataset-compare split does would force both panes into the same mode, which is exactly what a
+   * 3D+2D split must NOT do. Every other rendering field (colormap, TF, exposure, blend, lighting…)
+   * still syncs normally. Default `false` (today's dataset-compare split behavior, unchanged).
+   */
+  pinViewMode?: boolean;
+  /**
+   * When linking `cropping`, keep each side's OWN `showPlanes` (the yellow slice-plane overlay's
+   * visibility) instead of copying the other's — for a 3D+2D split, the 2D (detail) pane IS the slice
+   * already, so highlighting it there is redundant, while the 3D (context) pane needs it on to show
+   * where that slice cuts through the full volume. Every other cropping field (crop box, slice
+   * positions, per-axis enables) still syncs normally. Default `false` (today's dataset-compare split
+   * behavior, unchanged).
+   */
+  pinShowPlanes?: boolean;
+  /**
+   * When linking `rendering`, keep each side's OWN `halfRes` (render-at-half-resolution-while-
+   * navigating) instead of copying the other's — for a 3D+2D split, the 2D (detail) pane is meant to be
+   * the higher-quality zoomed-in view (full-res), while the 3D (context) pane can afford half-res since
+   * it's showing the whole volume at a coarser effective zoom. Every other rendering field still syncs
+   * normally. Default `false` (today's dataset-compare split behavior, unchanged).
+   */
+  pinHalfRes?: boolean;
 }
 
 export function useLinkedWebGpuViewers(
   a: WebGpuViewerInstance | null,
   b: WebGpuViewerInstance | null,
-  { camera, rendering, cropping }: LinkOptions,
+  {
+    camera,
+    rendering,
+    cropping,
+    pinViewMode = false,
+    pinShowPlanes = false,
+    pinHalfRes = false,
+  }: LinkOptions,
 ): void {
   useEffect(() => {
     if (!a || !b) return;
@@ -79,10 +112,19 @@ export function useLinkedWebGpuViewers(
       wireGroup('cameraChange', (from, to) => to.setCamera(from.getCamera()));
     }
     if (rendering) {
-      wireGroup('renderingChange', (from, to) => to.setRendering(from.getRendering()));
+      wireGroup('renderingChange', (from, to) => {
+        const state = from.getRendering();
+        if (pinViewMode) state.viewMode = to.getRendering().viewMode;
+        if (pinHalfRes) state.halfRes = to.getRendering().halfRes;
+        to.setRendering(state);
+      });
     }
     if (cropping) {
-      wireGroup('croppingChange', (from, to) => to.setCropping(from.getCropping()));
+      wireGroup('croppingChange', (from, to) => {
+        const state = from.getCropping();
+        if (pinShowPlanes) state.showPlanes = to.getCropping().showPlanes;
+        to.setCropping(state);
+      });
     }
 
     return () => {
@@ -94,5 +136,5 @@ export function useLinkedWebGpuViewers(
         }
       }
     };
-  }, [a, b, camera, rendering, cropping]);
+  }, [a, b, camera, rendering, cropping, pinViewMode, pinShowPlanes, pinHalfRes]);
 }
