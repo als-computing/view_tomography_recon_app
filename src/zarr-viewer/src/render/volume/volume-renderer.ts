@@ -884,11 +884,19 @@ export class VolumeRenderer implements Disposable {
     this.invViewProj.copy(viewProj);
     if (!this.invViewProj.invert()) return;
 
+    // The box's own projected depth along the CURRENT view direction (`measureForward`, kept fresh by
+    // `setCameraBasis` every frame) — see `VolumeFrameParams.viewDepth`'s own doc comment for why this
+    // is used instead of the box's fixed 3D diagonal as the iteration budget's worst-case distance.
+    const [fx, fy, fz] = this.measureForward;
+    const viewDepth =
+      2 * (this.boxHalf[0] * Math.abs(fx) + this.boxHalf[1] * Math.abs(fy) + this.boxHalf[2] * Math.abs(fz));
+
     writeVolumeFrameUniform(this.frameData, this.invViewProj, this.acceleration, {
       eye,
       clear: options.clear !== false,
       frameIndex: this.frameIndex,
       boxHalf: this.boxHalf,
+      viewDepth,
       maxSteps: this.maxSteps,
       stepSize: this.stepSize,
       densityScale: this.densityScale,

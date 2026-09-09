@@ -59,4 +59,31 @@ describe("aabbScreenBbox", () => {
     const box = aabbScreenBbox(viewProj, 800, 600, [0.5, 0.5, 0.5], 0);
     expect(box).toBeNull();
   });
+
+  it("returns null (not a garbage bbox) for a corner merely very close to the camera, not literally behind it", () => {
+    // An elongated box (long z-axis) with the camera positioned just barely in front of the near
+    // corner - z=+20 is 0.001 units away, never negative, so the old fixed 1e-6 cutoff would have let
+    // this through and divided by a near-zero cw, producing a wildly wrong bbox instead of the safe
+    // "keep all tiles" null fallback.
+    const viewProj = viewProjFor(20.001, 800, 600);
+    const box = aabbScreenBbox(viewProj, 800, 600, [0.5, 0.5, 20], 0);
+    expect(box).toBeNull();
+  });
+
+  it("still bounds normally when every corner is comfortably in front of the camera, even for an elongated box", () => {
+    const viewProj = viewProjFor(50, 800, 600);
+    const box = aabbScreenBbox(viewProj, 800, 600, [0.5, 0.5, 20], 0);
+    expect(box).not.toBeNull();
+  });
+
+  it("returns null for a MODERATELY close camera on an elongated box, well before it's near the box's own scale", () => {
+    // A 40-unit-long box (half-extent 20) with the camera 4 units from the near corner - nowhere near
+    // that corner in absolute box-scale terms (4 units vs. a 20-unit half-extent, i.e. the earlier
+    // box-scale-relative threshold of 0.1% would never trigger here), but the near corner's depth
+    // (~4) is only ~9% of the far corner's depth (~44) - well under the 25% relative cutoff. This is
+    // the exact "less extreme angle" case the more aggressive relative check exists to catch.
+    const viewProj = viewProjFor(24, 800, 600);
+    const box = aabbScreenBbox(viewProj, 800, 600, [0.5, 0.5, 20], 0);
+    expect(box).toBeNull();
+  });
 });

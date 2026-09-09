@@ -57,6 +57,13 @@ export interface VolumeFrameParams {
   clear: boolean;
   frameIndex: number;
   boxHalf: readonly [number, number, number];
+  /** The box's own projected depth along the CURRENT view direction (i.e. the longest possible ray
+   * chord through the box for this exact camera orientation — a box's support-function value along
+   * `forward`, always ≤ the box's fixed 3D diagonal). Used as the worst-case distance the iteration
+   * budget must be able to cross (see `writeVolumeFrameUniform`'s own comment) — NOT the static 3D
+   * diagonal, which overstates the needed range for any view direction not aligned with the box's own
+   * long diagonal, forcing an unnecessarily coarse step everywhere. */
+  viewDepth: number;
   maxSteps: number;
   stepSize: number;
   densityScale: number;
@@ -206,15 +213,26 @@ export function writeVolumeFrameUniform(
   d[19] = p.frameIndex;
   // Never let the step be so fine that the hard iteration cap can't cross the volume — otherwise the
   // far side is left unsampled and the volume appears to vanish. Floor the step at the budget-limited
-  // minimum (diagonal / usable steps) so the ray always reaches the far face; a requested step finer
+  // minimum (viewDepth / usable steps) so the ray always reaches the far face; a requested step finer
   // than that is clamped up (as fine as the budget allows). This makes any caller-set step (e.g. the
   // fine ROI-brick step) safe regardless of box size / sample-distance.
-  const diagonal = 2 * Math.hypot(p.boxHalf[0], p.boxHalf[1], p.boxHalf[2]);
-  const minStep = diagonal / Math.max(p.maxSteps - 8, 1);
+  //
+  // Uses `p.viewDepth` (the box's own projected depth along the CURRENT view direction), not the box's
+  // static 3D diagonal — found live: the diagonal is the worst case only for a ray that happens to run
+  // corner-to-corner along the box's own long diagonal; for any other view direction it overstates how
+  // far a ray actually needs to travel, inflating `minStep` (and so `effStep`) well past what's needed —
+  // most visible looking nearly end-on down a strongly elongated volume's long axis, or along the short
+  // axis of a flat/wide one, where the true per-ray distance is much less than the full diagonal but the
+  // old fixed-diagonal floor still forced the coarsest possible step everywhere. `viewDepth` is exactly
+  // the box's support-function value along `forward` (always ≤ the diagonal, equal to it only when
+  // looking exactly down the box's own long diagonal), so this is a tighter, still fully correct bound
+  // on the worst-case chord length for THIS frame's actual camera orientation.
+  const viewDepth = p.viewDepth;
+  const minStep = viewDepth / Math.max(p.maxSteps - 8, 1);
   const effStep = Math.max(p.stepSize, minStep, 5e-4);
   d[20] = effStep;
   d[21] = p.densityScale;
-  const neededSteps = Math.ceil(diagonal / effStep) + 8;
+  const neededSteps = Math.ceil(viewDepth / effStep) + 8;
   d[22] = Math.min(p.maxSteps, neededSteps);
   d[23] = p.exposure;
   d[24] = keyDir[0] / klen;

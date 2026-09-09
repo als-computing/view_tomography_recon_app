@@ -260,6 +260,14 @@ export async function run(
   // One-shot guard: apply the last-used rendering snapshot once, after this viewer's first level (and
   // thus its histogram) is ready. A ?share= link applied later by the app still wins.
   let bootRestoreDone = false;
+  // Set the moment ANY explicit setViewModeAndEmit call happens (HUD button, or a host app's own
+  // `setViewMode()` before real data has even loaded — e.g. a linked split-view pane forcing its own
+  // role). Found live: a host app calling `setViewMode()` synchronously on `onReady`, well before the
+  // volume's first data frame, was silently overwritten moments later by boot-restore's saved snapshot
+  // (which includes `viewMode`) once `onDisplayedLevel` finally ran — the host's explicit choice lost to
+  // a stale "last used" value with no error, no event, nothing to react to. Once true, boot-restore
+  // leaves `rendering.viewMode` untouched (see its own comment) rather than blindly overwriting it.
+  let viewModeExplicitlySet = false;
   // Name currently chosen in the Presets dropdown (drives Apply/Delete; survives HUD rebuilds).
   let selectedPreset = "";
   let baseStep = 1 / 220;
@@ -1019,6 +1027,10 @@ export async function run(
     mode: VolumeViewMode,
     opts?: { openSlices?: boolean; skipRenderUi?: boolean; reframe?: boolean },
   ): void => {
+    // Any explicit view-mode switch (HUD button, or a host app's own `setViewMode()` call — both funnel
+    // through here) is a strong signal that whoever called it wants THIS mode, not whatever the boot-
+    // restore snapshot below says - once set, boot-restore leaves `viewMode` alone (see its own comment).
+    viewModeExplicitlySet = true;
     enterViewMode(mode, opts?.reframe ?? true);
     if (opts?.openSlices) {
       openSections.add("slices");
@@ -1100,7 +1112,12 @@ export async function run(
       const saved = getLastRendering(sampleKey);
       if (saved) {
         try {
-          applyRenderingState(saved as Partial<WebGpuRenderingState>);
+          // Don't clobber a `viewMode` some caller already explicitly set before this fired (see
+          // `viewModeExplicitlySet`'s own comment) - everything else in the snapshot still applies.
+          const toApply = viewModeExplicitlySet
+            ? { ...(saved as Partial<WebGpuRenderingState>), viewMode: undefined }
+            : (saved as Partial<WebGpuRenderingState>);
+          applyRenderingState(toApply);
           // Pin the restored look as this sample's own memory immediately, so a later remount (after the
           // keep-alive grace expires) restores what this tab showed — even if another tab has since
           // changed the shared/global snapshot.
@@ -1113,8 +1130,19 @@ export async function run(
     if (histogram) curveEditor?.setHistogram(histogram);
     if (rendering.equalizeOn) applyTf(); // the remap changed with the new level's distribution
     const [sx, sy, sz] = source.spacingAt(level);
+    // Nyquist-style step floor: fine enough to resolve the FINEST-resolved axis (Math.min), not the
+    // coarsest (the original Math.max here) - found live: for an anisotropic dataset (voxel spacing
+    // differs per axis - common in tomography, e.g. z spacing vs. xy pixel size), using the coarsest
+    // axis produced a step size too coarse for the fine axes regardless of viewing direction, banding
+    // or dropping thin structure specifically when a ray travels mostly along a well-resolved axis (the
+    // exact geometry of "looking down the length" or "along the wide side" of an elongated/flat sample).
+    // `frameExtent / 400` (the worst-case-diagonal step-count cap) is a separate, legitimate performance
+    // floor - the render loop's own per-frame `effStep` (`volume-uniforms.ts`) now derives its budget
+    // from the CURRENT view direction's actual projected depth instead of the full diagonal, so a view
+    // that doesn't need the full diagonal's worst case gets to use this finer baseStep instead of being
+    // dragged back up to it - see that function's own comment.
     baseStep = Math.max(
-      Math.max(
+      Math.min(
         units.toSim(new units.Quantity(sx, units.LENGTH), sim),
         units.toSim(new units.Quantity(sy, units.LENGTH), sim),
         units.toSim(new units.Quantity(sz, units.LENGTH), sim),
@@ -1575,23 +1603,49 @@ export async function run(
     const taauFullyConverged =
       rendering.temporalAA &&
       (taau.sampleCount >= taau.maxAccum || settledElapsed >= TAAU_SETTLE_TIME_CAP_S);
-    if ((controls.isAnimating && !taauFullyConverged) || !camsEqual(camNow, lastRenderCam)) requestRender();
+    // `taauFullyConverged` is only meaningful while the camera is actually still (it's the "stop paying
+    // for more frames, the settled image is as good as it'll get" short-circuit) - `controls.isDragging`
+    // is a real-time, scale-independent signal that overrides it the moment a NEW drag starts, even
+    // though `taauFullyConverged` itself won't go false again until the NEXT settle. Without this,
+    // grabbing the camera again right after a fully-converged settle left `taauFullyConverged` stuck
+    // true for the whole new drag, collapsing this whole OR condition down to bare `camsEqual` - which
+    // uses a relative tolerance that grows with coordinate magnitude (see this function's own comment
+    // just above), so a slow/small drag at typical zoom-out distances could fall under it every single
+    // frame and the canvas would freeze mid-interaction (confirmed live: "rotating causes the volume to
+    // freeze up... usually zooming in/out a little helps" - a zoom bypasses this gate entirely via its
+    // own `bumpRender()` wheel listener, which is why it "fixes" it without addressing the actual gate).
+    // Same underlying flaw `ResidencyController` was already fixed for once (raw `camsEqual` as a
+    // stillness signal) - this is a second, independent site with the identical root cause.
+    if (
+      (controls.isAnimating && (!taauFullyConverged || controls.isDragging)) ||
+      !camsEqual(camNow, lastRenderCam)
+    )
+      requestRender();
     if (canvas.width !== lastRenderW || canvas.height !== lastRenderH) requestRender();
     if (renderFrames <= 0) return;
     renderFrames -= 1;
     // Near/far bracket the volume CENTER's depth ALONG THE VIEW AXIS (the box is centered at the world
-    // origin), from its actual projected depth (not the bounding sphere). We project the center onto
-    // the actual view direction rather than use the straight-line eye→origin distance: under
-    // zoom-to-cursor the orbit target drifts off the origin, so the camera's forward stops pointing at
-    // the box center. Using the straight-line distance then overestimates the center's depth, pushing
-    // the near plane in front of the box and clipping its front — which read as the volume "inverting"
-    // when zoomed far out. A sphere-radius margin would also hugely over-bracket a thin/wide slab,
-    // forcing `near` to clamp to a tiny fraction of `far`, skewing the DVR ray reconstruction; the
-    // projected half-depth is orientation-aware and keeps the near/far ratio well-conditioned. See
-    // computeNearFar()/computeCameraBasis() for the full margin-growth rationale.
+    // origin), from its actual projected depth (not the bounding sphere). A sphere-radius margin would
+    // hugely over-bracket a thin/wide slab, forcing `near` to clamp to a tiny fraction of `far`, skewing
+    // the DVR ray reconstruction; the projected half-depth is orientation-aware and keeps the near/far
+    // ratio well-conditioned. See computeNearFar()/computeCameraBasis() for the full margin-growth
+    // rationale.
+    //
+    // `controls.distance` (the camera's real distance to its own orbit target) is passed as
+    // `targetDistance` so `centerDepth` is anchored to what's ACTUALLY being viewed, not to the world
+    // origin — the origin is only a valid stand-in for "depth of what's being viewed" when the orbit
+    // target is near it (true for ordinary whole-volume framing), which stops holding once the target
+    // has drifted (zoom-to-cursor panning, or a linked split-view pane deliberately orbiting around a
+    // small off-center crop region) — found live to clip/blank/corrupt the render exactly when a close-
+    // zoomed camera's target sits far from the origin. See `computeNearFar`'s own doc comment.
     const wm = camera.worldMatrix().elements;
     const basis = computeCameraBasis(wm);
-    const { near, far, extent, centerDepth, halfDepth } = computeNearFar(sizeSim, camera.position, basis.forward);
+    const { near, far, extent, centerDepth, halfDepth } = computeNearFar(
+      sizeSim,
+      camera.position,
+      basis.forward,
+      controls.distance,
+    );
     proj.perspective(
       (42 * Math.PI) / 180,
       canvas.width / Math.max(1, canvas.height),

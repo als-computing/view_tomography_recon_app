@@ -11,6 +11,7 @@ import { LIGHT_STRUCT_WGSL } from "./lights.js";
 import { PREINTEGRATION_SIGMA_MAX } from "../volume/preintegration-2d.js";
 import { VOLUME_LIGHTING_SHARED_WGSL } from "./volume-lighting-shared.js";
 import { MASK_BINDING_BASE } from "../volume/volume-bindings.js";
+import { MACROCELL_VOXELS } from "../accel/occupancy.js";
 
 /** Byte size of the volume frame uniform block (mat4 + 24 × vec4 + shadow mat4 + shadowCtl + camRight/
  * camUp + 4-slot brick arrays — item 9 stage 9a grew this from 560 by 96 bytes replacing the old
@@ -57,6 +58,8 @@ const PRE_INTEGRATE: u32 = ${PREINT}u;
 // sigma value the pre-integration table's top row represents, so v = sigma / SIGMA_MAX picks the
 // right row via hardware bilinear sampling.
 const SIGMA_MAX: f32 = ${PREINTEGRATION_SIGMA_MAX};
+// Must match occupancy.ts's own MACROCELL_VOXELS exactly - see uvwToCell's own comment for why.
+const MACROCELL_VOXELS_F: f32 = ${MACROCELL_VOXELS}.0;
 const VIS_SCALE: f32 = 128.0;
 const SHADE_ALPHA_EPS: f32 = 1e-4;
 const TARGET_SEGMENT_OPACITY: f32 = 0.25;
@@ -324,9 +327,23 @@ fn occIndex(c: vec3<i32>) -> u32 {
   return u32(cc.x + cc.y * g.x + cc.z * g.x * g.y);
 }
 
+// Must match occupancy.ts's REDUCE_WGSL construction exactly: a macrocell id there owns the VOXEL
+// range [id*MACROCELL_VOXELS, (id+1)*MACROCELL_VOXELS) (truncated at the volume's own edge, never
+// resized) - i.e. cells are uniform-width in VOXEL space, not in normalized [0,1] uvw space. Dividing
+// uvw uniformly by the cell-COUNT grid g (= ceil(voxelDims / MACROCELL_VOXELS)) only coincides with
+// that when voxelDims is an exact multiple of MACROCELL_VOXELS on every axis - otherwise the two
+// partitions drift apart, worse toward the far edge of any non-divisible axis, and a ray can look up a
+// DIFFERENT macrocell's occupancy data than the one it's actually sampling - wrongly reading "empty"
+// for a region that's actually material, and leaping straight past real, visible content. Found live:
+// "clipping" at certain camera angles even when zoomed out (so not the near-camera-corner degeneracy
+// already fixed elsewhere) - confirmed on a real dataset whose voxel dimensions aren't all multiples of
+// MACROCELL_VOXELS. Converting uvw to an actual voxel coordinate first and dividing by
+// MACROCELL_VOXELS_F (not by g) reproduces the construction side's own indexing exactly.
 fn uvwToCell(uvw: vec3<f32>) -> vec3<i32> {
   let g = max(frame.accelOcc.xyz, vec3<f32>(1.0));
-  return vec3<i32>(clamp(floor(uvw * g), vec3<f32>(0.0), g - vec3<f32>(1.0)));
+  let voxel = uvw * vec3<f32>(textureDimensions(volumeTex));
+  let cell = floor(voxel / MACROCELL_VOXELS_F);
+  return vec3<i32>(clamp(cell, vec3<f32>(0.0), g - vec3<f32>(1.0)));
 }
 
 fn majorantStep(cellMaxDensity: f32, densityScale: f32) -> f32 {
@@ -798,14 +815,36 @@ fn marchColor(
       // per-step marching (the branch below) always visits every uvw, so sampleMask0()/sampleMask1()
       // below never get skipped.
       if (rec.dist >= OCC_LEAP_MIN && frame.mask0Ctl.x < 0.5 && frame.mask1Ctl.x < 0.5) {
-        let g = max(frame.accelOcc.xyz, vec3<f32>(1.0));
-        let cs = 1.0 / g;
+        // Convert a cell-index radius back into uvw space using the SAME voxel-based cell width
+        // uvwToCell() itself uses (MACROCELL_VOXELS_F / voxel dims), not 1/g - g is a cell COUNT
+        // (ceil(voxelDims/MACROCELL_VOXELS)), uniform division by it only matches the construction
+        // side's actual (voxel-anchored, truncated-at-the-edge) cell boundaries when voxelDims is an
+        // exact multiple of MACROCELL_VOXELS on every axis. See uvwToCell's own comment for the full
+        // story - this is the other half of the same fix (the leap box's own bounds must stay
+        // consistent with the cell index they're built from).
+        let cs = MACROCELL_VOXELS_F / vec3<f32>(textureDimensions(volumeTex));
         let r = max(0.0, floor(rec.dist) - OCC_LEAP_MIN);
         let bmin = clamp((vec3<f32>(cell) - r) * cs, vec3<f32>(0.0), vec3<f32>(1.0));
         let bmax = clamp((vec3<f32>(cell) + r + 1.0) * cs, vec3<f32>(0.0), vec3<f32>(1.0));
         let skipHit = intersectAabb(uvw, rdUvw, bmin, bmax);
         // Nudge just past the exit face so the next sample lands in a fresh cell (no re-test).
-        let jump = max(skipHit.y + 1e-4, stepSize);
+        var jump = max(skipHit.y + 1e-4, stepSize);
+        // The leap box above is sized purely from the FULL volume's occupancy field - it has no idea
+        // where the crop box's own boundary is. If the crop box lies AHEAD of us (we're currently
+        // outside it, about to enter), an occupancy-empty span wider than the crop box's own footprint
+        // along this ray can carry t clean over the ENTIRE crop box in one hop, without the inCrop()
+        // check below ever evaluating true for this ray - a fully blank pixel, even though real, visible
+        // material sits inside that crop box (confirmed live: a split-view detail pane zoomed onto a
+        // small crop region rendered large disconnected blank/corrupted patches - exactly this leap
+        // overshooting the crop on some rays and not others, depending on the local empty-span size).
+        // Clamp the leap to stop at the crop box's own entry face when it's ahead, so the very next
+        // iteration's inCrop check picks up the crop content correctly instead of skipping past it.
+        // When cropping is off (crop box == the full [0,1] box) cropAhead.x is ~0 (already inside) for
+        // any uvw this loop ever visits, so this is a no-op there - existing unclamped behavior.
+        let cropAhead = intersectAabb(uvw, rdUvw, frame.cropMin.xyz, frame.cropMax.xyz);
+        if (cropAhead.x > 1e-4 && cropAhead.x < cropAhead.y) {
+          jump = min(jump, cropAhead.x);
+        }
         prevDensity = 0.0; // leaped empty space
         t += jump;
         i += 1;

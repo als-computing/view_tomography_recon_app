@@ -206,6 +206,19 @@ export class OrbitControls implements Controller {
     };
     this.onPointerUp = (e) => {
       this.dragging = null;
+      // Snap the damped pose to its final target immediately on release, rather than leaving the last
+      // drag delta to glide in over damping's exponential tail (`update()`'s `_offset.lerp(_desiredOffset,
+      // ...)`). During an active drag, `orbitTrackball`/`orbitTurntable` only ever update `_desiredOffset`
+      // — the rendered `_offset` (and therefore `camera.position`, and therefore the camera-attached
+      // flashlight's direction, which derives from the same position) trails behind it via damping, even
+      // mid-drag. Without a flush here, that trailing continues for a tail AFTER the pointer is released
+      // too - with `isAnimating`'s very tight convergence thresholds, several hundred ms of steadily
+      // shrinking motion that's imperceptible in the overall camera framing but stays clearly visible in
+      // a specular highlight (confirmed live: "the camera stops moving but the light keeps moving" - not
+      // an actual desync, since both derive from the same `_offset`, just a real lingering tail that's
+      // far more noticeable in specular response than in silhouette rotation). Flushing only on release
+      // (not during the drag itself) keeps the smooth, damped in-drag feel unchanged.
+      this.flush();
       try {
         this.element.releasePointerCapture(e.pointerId);
       } catch {

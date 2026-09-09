@@ -5,6 +5,7 @@ declare global {
   interface Window {
     runFixture: (name: string) => Promise<FixtureResult>;
     runMultiBrickFixture: () => Promise<FixtureResult>;
+    runAnisotropicOcclusionFixture: () => Promise<FixtureResult>;
   }
 }
 
@@ -115,5 +116,48 @@ test.describe("multi-brick residency (item 9 stage 9c)", () => {
       channelDiff(withBricks.center, withoutBricks.center),
       "center (outside both brick footprints) should be unaffected by either brick",
     ).toBeLessThanOrEqual(SAME_TOLERANCE);
+  });
+});
+
+test.describe("anisotropic occlusion (fast/quality occupancy + tile culling)", () => {
+  test("a marker at the far end of an elongated volume's long axis is not leaped/culled away in `fast` mode", async ({
+    page,
+  }) => {
+    await page.goto("/test/browser/harness.html");
+    const result = await page.evaluate(() => window.runAnisotropicOcclusionFixture());
+    if (!result.ok) throw new Error(`anisotropic occlusion fixture failed: ${result.error}`);
+
+    const background: readonly [number, number, number, number] = [
+      Math.round(0.02 * 255),
+      Math.round(0.03 * 255),
+      Math.round(0.05 * 255),
+      255,
+    ];
+
+    // Ground truth: `baseline` never uses occupancy or tiles at all, so it can't wrongly leap/cull -
+    // if its own center sample doesn't show the marker, the fixture itself is set up wrong (not a real
+    // bug), and every assertion below would be meaningless.
+    const baselineCenter = result.samplesBaseline!.center;
+    expect(
+      channelDiff(baselineCenter, background),
+      "sanity check: baseline should show the far-end marker at center, proving the fixture itself is set up correctly",
+    ).toBeGreaterThan(CHANGED_TOLERANCE);
+
+    // The actual regression check: `fast` (occupancy + tiles both on) must reach and composite the
+    // SAME marker - if the occupancy-grid leap wrongly overshoots it (the macrocell-alignment class of
+    // bug) or tile culling wrongly excludes the screen tile containing it (the aabbScreenBbox class of
+    // bug), this pixel reads as background instead.
+    const fastCenter = result.samples!.center;
+    expect(
+      channelDiff(fastCenter, background),
+      "fast mode should also show the far-end marker at center, not have leaped/culled past it to background",
+    ).toBeGreaterThan(CHANGED_TOLERANCE);
+
+    // The two configs should agree closely, not just both merely differ from background - a small
+    // rendering difference between pipelines is expected, a wildly different result is not.
+    expect(
+      channelDiff(fastCenter, baselineCenter),
+      "fast and baseline should render the far-end marker comparably, not wildly differently",
+    ).toBeLessThanOrEqual(SAME_TOLERANCE * 2);
   });
 });

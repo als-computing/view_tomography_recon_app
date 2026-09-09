@@ -94,15 +94,32 @@ export interface NearFar {
  * projected depth (not the bounding sphere) so the near/far ratio stays float32-stable at any
  * zoom/orientation. See the render loop's inline comments for the full rationale — this is the fix
  * for both thin-slab near-clipping and far-zoom-out precision collapse.
+ *
+ * `targetDistance`, when given, is the camera's actual distance to its own orbit target (e.g.
+ * `OrbitControls.distance`) and is used AS `centerDepth` directly, instead of re-deriving it by
+ * projecting the world ORIGIN onto the view axis. The origin-projection is only a valid proxy for
+ * "depth of what's being viewed" when the orbit target is near the origin — true for ordinary
+ * whole-volume framing, but false once the target has drifted (zoom-to-cursor panning, or a caller
+ * deliberately orbiting around some other point entirely, e.g. a small off-center crop region). Found
+ * live: a camera framed close to a target far from the origin (small crop-box zoom, target near a
+ * volume corner) could get a `centerDepth` wildly different from the camera's real distance to what it's
+ * looking at, pushing the whole visible region outside `[near, far]` — clipped/blank/corrupted
+ * rendering, "fixed" by zooming (which changes `distance` enough to stumble back into a working range,
+ * not because the underlying computation became correct). Omitted, this falls back to the original
+ * origin-projection — every existing caller/test keeps its exact prior behavior.
  */
 export function computeNearFar(
   sizeSim: { x: number; y: number; z: number },
   cameraPosition: { x: number; y: number; z: number },
   forward: readonly [number, number, number],
+  targetDistance?: number,
 ): NearFar {
   const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
   const [fx, fy, fz] = forward;
-  const centerDepth = -(cameraPosition.x * fx + cameraPosition.y * fy + cameraPosition.z * fz);
+  const centerDepth =
+    targetDistance !== undefined
+      ? targetDistance
+      : -(cameraPosition.x * fx + cameraPosition.y * fy + cameraPosition.z * fz);
   const halfDepth = 0.5 * (sizeSim.x * Math.abs(fx) + sizeSim.y * Math.abs(fy) + sizeSim.z * Math.abs(fz));
   const margin = Math.max(halfDepth * 1.25 + extent * 0.02, centerDepth * 0.05);
   const far = Math.max(centerDepth + margin, margin * 2);

@@ -124,6 +124,33 @@ describe("computeNearFar", () => {
     // Far-near range should scale up substantially at extreme zoom-out (margin floor at 5% of depth).
     expect(near2.far - near2.near).toBeGreaterThan((near1.far - near1.near) * 100);
   });
+
+  it("without targetDistance, mis-centers when the orbit target has drifted far from the origin (the bug)", () => {
+    // A camera close to a target near a volume CORNER (not the origin) - e.g. a linked split-view pane
+    // zoomed into a small off-center crop region. Camera sits 0.5 units from its target, looking back
+    // toward the origin along the way.
+    const sizeSim = { x: 10, y: 10, z: 10 };
+    const s = 1 / Math.sqrt(3);
+    const cameraPosition = { x: 4.289, y: 4.289, z: 4.289 }; // ~0.5 units beyond target (4,4,4)
+    const forward: [number, number, number] = [-s, -s, -s]; // looking back toward the origin
+    const trueTargetDistance = 0.5;
+    const { centerDepth } = computeNearFar(sizeSim, cameraPosition, forward);
+    // The origin-projection proxy is wildly wrong here - nowhere near the camera's real 0.5-unit
+    // distance to what it's actually centered on.
+    expect(Math.abs(centerDepth - trueTargetDistance)).toBeGreaterThan(1);
+  });
+
+  it("with targetDistance, centerDepth reflects the camera's real distance to its own target", () => {
+    const sizeSim = { x: 10, y: 10, z: 10 };
+    const s = 1 / Math.sqrt(3);
+    const cameraPosition = { x: 4.289, y: 4.289, z: 4.289 };
+    const forward: [number, number, number] = [-s, -s, -s];
+    const trueTargetDistance = 0.5;
+    const { centerDepth, near, far } = computeNearFar(sizeSim, cameraPosition, forward, trueTargetDistance);
+    expect(centerDepth).toBeCloseTo(trueTargetDistance);
+    expect(near).toBeLessThan(trueTargetDistance);
+    expect(far).toBeGreaterThan(trueTargetDistance);
+  });
 });
 
 describe("computeMeasurePlaneDepth", () => {

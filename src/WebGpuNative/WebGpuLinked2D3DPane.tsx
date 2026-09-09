@@ -24,15 +24,21 @@
  *
  * A 4th toolbar option, "🔗 3D angle", turns this into a detail + overview pair: imagine a small CUBE
  * sitting at the intersection of the x/y/z slice planes, which never itself rotates. The 2D (left) pane
- * becomes a zoomed-in view of exactly that cube's contents, rendered from the SAME direction the 3D
- * (right) pane's camera currently faces — copied onto the 2D pane's camera every tick, then re-centered
- * and zoomed onto the cube via `zoomToSliceIntersection` (the same pure framing function built for the
- * "⌖" button, just called continuously here instead of once). The 3D (right) pane stays the ZOOMED-OUT
- * full-volume context, uncropped. The cube's CENTER tracks the 3D pane's own slice position
- * (`sliceX/Y/Z`, moved via its slicing UI) — one-directional, 3D → 2D only, so this can't ping-pong the
- * way an earlier (now-corrected) bidirectional design did. No oblique slicing, no plane math, and no
- * `enOblique` changes are involved at all — the 2D pane is switched to plain `"volume"` on activation
- * (see this mode's own effect below for why) and cropped to a plain axis-aligned box the whole time.
+ * becomes a zoomed-in view of exactly that cube's contents, always rendered from the SAME direction the
+ * 3D (right) pane's camera faces, then re-centered and zoomed onto the cube via `zoomToSliceIntersection`
+ * (the same pure framing function built for the "⌖" button, just called continuously here instead of
+ * once). Rotation is BIDIRECTIONAL while this mode is active — orbit either pane and the other's angle
+ * follows (a "rotation-only" pose copy: only the viewing direction + gaze-up sync, each pane keeps its
+ * own target/distance, so the detail pane doesn't inherit the context pane's zoom level or vice versa) —
+ * guarded against ping-pong the same way `setCamera`'s own contract already prevents an applied pose from
+ * being echoed back out (plus a local re-entrancy flag as defense-in-depth; see `applyRotation`'s own
+ * comment). The 3D (right) pane stays the ZOOMED-OUT full-volume context, uncropped, and keeps its own
+ * target/distance regardless of which pane initiated the rotation. The cube's CENTER tracks the 3D pane's
+ * own slice position (`sliceX/Y/Z`, moved via its slicing UI) — this part stays one-directional (3D pane
+ * → 2D pane's crop box only), since the slicing UI itself only exists on the 3D pane's own HUD. No
+ * oblique slicing, no plane math, and no `enOblique` changes are involved at all — the 2D pane is
+ * switched to plain `"volume"` on activation (see this mode's own effect below for why) and cropped to a
+ * plain axis-aligned box the whole time.
  * The 3D (right) pane also gets a GREEN wireframe-box indicator (`setOverlayBox`) drawn at the exact
  * same extents as the 2D pane's crop box, so it's visually obvious what region is being shown zoomed-in
  * on the left — a dedicated one-directional write, deliberately NOT part of the `cropping` link group
@@ -253,32 +259,56 @@ export default function WebGpuLinked2D3DPane({
       instance3D.setOverlayBox(showOverlayCube, cropMin, cropMax);
     };
 
-    /** Copy the 3D pane's viewing DIRECTION (offset, normalized) + gazeUp onto the 2D pane, preserving
-     * the 2D pane's own distance for now — `zoomToSliceIntersection` (called right after) is what
-     * actually sets the real target/distance, this just seeds a same-direction starting point for it to
-     * preserve-angle-from. One-directional (3D → 2D only, never the reverse): the 2D pane is purely a
-     * zoomed-in follower here, matching the spec ("when I rotate the camera on the right view, on the
-     * left, i see..."), and one-directional sync can't ping-pong the way a bidirectional link could. */
-    const applyRotationAndZoom = (): void => {
-      const cam3D = instance3D.getCamera();
-      const dst = instance2D.getCamera();
-      const [ox, oy, oz] = cam3D.offset;
-      const len = Math.hypot(ox, oy, oz) || 1;
-      const dist = dst.distance;
-      instance2D.setCamera({
-        target: dst.target,
-        offset: [(ox / len) * dist, (oy / len) * dist, (oz / len) * dist],
-        gazeUp: cam3D.gazeUp,
-        distance: dist,
-      });
-      // Zoom distance scaled to the crop box's own size (not the full volume) so it actually fills the
-      // frame - zoomToSliceIntersection's zoomFraction is "camera distance as a fraction of the full
-      // volume extent," so a box spanning CROP_FRACTION needs roughly that same fraction (with a little
-      // headroom for the box's diagonal) rather than the default 0.15 sized for the whole volume.
-      instance2D.zoomToSliceIntersection(CROP_FRACTION * 1.8);
+    // Re-entrancy guard: `applyRotation`/`applyRotationAndZoom` below call `setCamera()`, which the
+    // public API contract guarantees never itself emits `cameraChange` (it rebases `lastCam` so the
+    // render loop's own poll doesn't echo the applied pose back out — see `setCamera`'s own doc comment
+    // in `WebGpuVolumeViewer.ts`). This guard is defense-in-depth on top of that guarantee, not a
+    // replacement for it - cheap, and matches the pattern `useLinkedWebGpuViewers`'s own `syncing` flag
+    // already uses for the same reason.
+    let syncingRotation = false;
+
+    /** Copy `from`'s viewing DIRECTION (offset, normalized) + gazeUp onto `to`, preserving `to`'s own
+     * target and distance — a "rotation-only" pose copy, not a full camera-state copy (which would also
+     * snap `to`'s zoom level to `from`'s, wrong for a detail+overview pair with very different zoom
+     * levels). */
+    const applyRotation = (from: WebGpuViewerInstance, to: WebGpuViewerInstance): void => {
+      if (syncingRotation) return;
+      syncingRotation = true;
+      try {
+        const src = from.getCamera();
+        const dst = to.getCamera();
+        const [ox, oy, oz] = src.offset;
+        const len = Math.hypot(ox, oy, oz) || 1;
+        const dist = dst.distance;
+        to.setCamera({
+          target: dst.target,
+          offset: [(ox / len) * dist, (oy / len) * dist, (oz / len) * dist],
+          gazeUp: src.gazeUp,
+          distance: dist,
+        });
+      } finally {
+        syncingRotation = false;
+      }
     };
 
+    // 3D → 2D: rotation-only copy, then re-zoom into the cube (zoomToSliceIntersection overrides
+    // whatever target/distance `applyRotation` just preserved with the cube-centered framing - the 2D
+    // pane's "own distance" from `applyRotation`'s point of view is only ever a transient stepping
+    // stone here, immediately replaced). Zoom distance scaled to the crop box's own size (not the full
+    // volume) so it actually fills the frame - zoomToSliceIntersection's zoomFraction is "camera
+    // distance as a fraction of the full volume extent," so a box spanning CROP_FRACTION needs roughly
+    // that same fraction (with a little headroom for the box's diagonal) rather than the default 0.15
+    // sized for the whole volume.
+    const applyRotationAndZoom = (): void => {
+      applyRotation(instance3D, instance2D);
+      instance2D.zoomToSliceIntersection(CROP_FRACTION * 1.8);
+    };
+    // 2D → 3D: rotation-only, no re-zoom - the 3D (context) pane keeps its own target/distance
+    // (whatever the user last framed it at); only its ANGLE follows the 2D pane's own rotation.
+    const applyRotationFrom2D = (): void => applyRotation(instance2D, instance3D);
+
     const handle3DCameraChange = (): void => applyRotationAndZoom();
+    const handle2DCameraChange = (): void => applyRotationFrom2D();
     const handle3DCroppingChange = (): void => {
       updateCropBox();
       applyRotationAndZoom();
@@ -287,9 +317,11 @@ export default function WebGpuLinked2D3DPane({
     updateCropBox();
     applyRotationAndZoom();
     instance3D.on('cameraChange', handle3DCameraChange);
+    instance2D.on('cameraChange', handle2DCameraChange);
     instance3D.on('croppingChange', handle3DCroppingChange);
     return () => {
       instance3D.off('cameraChange', handle3DCameraChange);
+      instance2D.off('cameraChange', handle2DCameraChange);
       instance3D.off('croppingChange', handle3DCroppingChange);
       // Restore the 2D pane's crop to full [0,1] on deactivation - a documented simplification, not
       // restoring whatever custom crop (if any) was active before this mode was turned on. No

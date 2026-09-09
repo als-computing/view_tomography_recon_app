@@ -33,6 +33,8 @@ import {
   multiRegionVolume,
   chunkedMultiLevelSource,
   downsample2x,
+  elongatedMarkerVolume,
+  uploadAnisotropicVolume,
   type SyntheticVolume,
 } from "./fixtures.js";
 
@@ -74,6 +76,10 @@ export interface FixtureResult {
    * with both brick slots disabled, so the spec can directly compare "with bricks" vs "without" instead
    * of reasoning about absolute pixel values. */
   samplesNoBrick?: Record<SampleName, [number, number, number, number]>;
+  /** The anisotropic-occlusion fixture only: a second sample set from the SAME scene/camera rendered
+   * with `shaderConfig: "baseline"` (no occupancy/tiles at all) instead of `"fast"` — the ground-truth
+   * comparison, since baseline can't wrongly cull/leap-skip real content by construction. */
+  samplesBaseline?: Record<SampleName, [number, number, number, number]>;
 }
 
 /** Copy `tex` (RGBA8, `WIDTH`x`HEIGHT`) into a mappable buffer and read back just the sample points. */
@@ -318,11 +324,125 @@ async function runMultiBrickFixture(): Promise<FixtureResult> {
   }
 }
 
+/**
+ * A genuinely anisotropic (non-cubic) elongated volume, viewed end-on down its own long axis from a
+ * zoomed-out camera — the exact scenario found live this session to trigger real occupancy-grid/tile-
+ * culling bugs (`fast`/`quality` only; `baseline` never uses either), and one no prior fixture in this
+ * file could reproduce at all (every other fixture is a cube). A single small, bright marker sits near
+ * the FAR end of the long axis (away from the camera), with empty space filling almost the entire rest
+ * of the volume in between — a ray straight down the view axis must correctly traverse that whole empty
+ * span (via the occupancy empty-space leap) and still composite the marker at the far end. Renders the
+ * SAME scene/camera twice: once with `shaderConfig: "fast"` (occupancy + tiles both on) and once with
+ * `"baseline"` (neither) as ground truth — if `fast` wrongly leaps past or culls the marker, its
+ * `center` sample will read as background while baseline's doesn't.
+ */
+async function runAnisotropicOcclusionFixture(): Promise<FixtureResult> {
+  try {
+    const canvas = document.getElementById("gpu-canvas") as HTMLCanvasElement;
+    const ctx = await createContext(canvas, { powerPreference: "high-performance" });
+    const gpuErrors: string[] = [];
+    ctx.device.addEventListener("uncapturederror", (e) => {
+      gpuErrors.push((e as GPUUncapturedErrorEvent).error.message);
+    });
+
+    // 32x32x133: the long (z) axis is deliberately NOT a multiple of MACROCELL_VOXELS (8) - 133/8 =
+    // 16.625 - so the occupancy grid's own construction (voxel-anchored, truncated-at-the-edge cells)
+    // and the raymarch shader's cell lookup have real room to drift apart if they ever disagree.
+    const dims: readonly [number, number, number] = [32, 32, 133];
+    // Marker near voxel z=4 (close to the volume's z=0 face) - since the shared camera looks down -z
+    // from the +z side, this is the FAR face from the camera's point of view, requiring the ray to
+    // traverse almost the entire long axis of (empty) space before reaching it.
+    const volume = elongatedMarkerVolume(dims, 0, [{ center: [16, 16, 4], halfSize: 3, value: 1 }]);
+    const texture = await uploadAnisotropicVolume(ctx.device, volume);
+
+    const renderer = new VolumeRenderer(ctx, {
+      colorFormat: OFFSCREEN_FORMAT,
+      blendMode: "composite",
+      densityScale: 3,
+      stepSize: 1 / 128,
+      exposure: 1.5,
+      ambient: 0.4,
+      shaderConfig: "fast",
+    });
+    renderer.setVolume(texture);
+    // Normalize world box half-extents to the volume's own aspect ratio (long axis half-extent 0.5,
+    // matching the shared camera's own framing distance/near-far) instead of the default unit cube -
+    // the whole point of this fixture is a genuinely elongated world box, not just elongated voxel
+    // counts inside a cubic box.
+    const maxDim = Math.max(dims[0], dims[1], dims[2]);
+    renderer.setBoxHalfSize((0.5 * dims[0]) / maxDim, (0.5 * dims[1]) / maxDim, (0.5 * dims[2]) / maxDim);
+    renderer.setTransferFunction(
+      new TransferFunction([
+        { position: 0, color: [1, 1, 1, 0] },
+        { position: 1, color: [1, 1, 1, 1] },
+      ]),
+    );
+
+    const { eye, viewProj, fovY, aspect } = makeCamera();
+    renderer.setCameraBasis([1, 0, 0], [0, 1, 0], [0, 0, -1], fovY, aspect);
+
+    const renderOnce = async (): Promise<Record<SampleName, [number, number, number, number]>> => {
+      const target = ctx.device.createTexture({
+        size: [WIDTH, HEIGHT, 1],
+        format: OFFSCREEN_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      });
+      const gbuffer = [VOLUME_DEPTH_FORMAT, GBUFFER_FORMAT, GBUFFER_FORMAT, GBUFFER_FORMAT, GBUFFER_FORMAT].map(
+        (format) =>
+          ctx.device.createTexture({
+            size: [WIDTH, HEIGHT, 1],
+            format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+          }),
+      );
+      const encoder = ctx.device.createCommandEncoder({ label: "aniso-occlusion-frame" });
+      // Occupancy rebuild + tile classify/compact - recordInto() itself never runs these (see this
+      // file's own comment on VolumeRenderer.recordInto not calling runPrePasses), matching exactly how
+      // the production render loop calls them as a separate step before the render pass.
+      renderer.recordPrePasses(encoder, viewProj, eye);
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: target.createView(),
+            clearValue: { r: 0.02, g: 0.03, b: 0.05, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+          ...gbuffer.map((tex) => ({
+            view: tex.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear" as const,
+            storeOp: "store" as const,
+          })),
+        ],
+      });
+      renderer.recordInto(pass, viewProj, eye);
+      pass.end();
+      ctx.device.queue.submit([encoder.finish()]);
+      for (const tex of gbuffer) tex.destroy();
+      const samples = await readbackSamples(ctx.device, target);
+      target.destroy();
+      return samples;
+    };
+
+    const samples = await renderOnce();
+    renderer.setShaderConfig("baseline");
+    const samplesBaseline = await renderOnce();
+
+    if (gpuErrors.length > 0) return { ok: false, error: gpuErrors.join(" | "), samples, samplesBaseline };
+    return { ok: true, samples, samplesBaseline };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? `${err.message}\n${err.stack}` : String(err) };
+  }
+}
+
 declare global {
   interface Window {
     runFixture: typeof runFixture;
     runMultiBrickFixture: typeof runMultiBrickFixture;
+    runAnisotropicOcclusionFixture: typeof runAnisotropicOcclusionFixture;
   }
 }
 window.runFixture = runFixture;
 window.runMultiBrickFixture = runMultiBrickFixture;
+window.runAnisotropicOcclusionFixture = runAnisotropicOcclusionFixture;

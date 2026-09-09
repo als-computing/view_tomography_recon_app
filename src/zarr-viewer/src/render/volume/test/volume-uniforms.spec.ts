@@ -21,6 +21,7 @@ const BASE_PARAMS: VolumeFrameParams = {
   clear: true,
   frameIndex: 42,
   boxHalf: [0.5, 0.5, 0.5],
+  viewDepth: 2 * Math.hypot(0.5, 0.5, 0.5),
   maxSteps: 4096,
   stepSize: 1 / 260,
   densityScale: 1.35,
@@ -117,11 +118,23 @@ describe("writeVolumeFrameUniform", () => {
 
   it("floors the step size so the ray always crosses the box within maxSteps", () => {
     // stepSize far finer than the box/maxSteps budget allows — should be clamped up, not honored.
-    const d = pack({ stepSize: 1e-9, boxHalf: [10, 10, 10], maxSteps: 100 });
+    // viewDepth here simulates looking exactly down the box's own diagonal (the worst case).
     const diagonal = 2 * Math.hypot(10, 10, 10);
+    const d = pack({ stepSize: 1e-9, boxHalf: [10, 10, 10], viewDepth: diagonal, maxSteps: 100 });
     const minStep = diagonal / (100 - 8);
     expect(d[20]).toBeCloseTo(minStep, 6);
     expect(d[22]).toBeLessThanOrEqual(100);
+  });
+
+  it("uses viewDepth (not the box's fixed diagonal) as the iteration budget's worst-case distance", () => {
+    // Same box, same maxSteps, but two different viewDepth values (as if two different camera
+    // orientations) - a smaller viewDepth (e.g. looking down a short axis of an anisotropic box)
+    // should floor the step to something finer than a larger viewDepth (looking down the long diagonal).
+    const dShort = pack({ stepSize: 1e-9, boxHalf: [10, 10, 10], viewDepth: 5, maxSteps: 100 });
+    const dLong = pack({ stepSize: 1e-9, boxHalf: [10, 10, 10], viewDepth: 40, maxSteps: 100 });
+    expect(dShort[20]).toBeCloseTo(5 / (100 - 8), 6);
+    expect(dLong[20]).toBeCloseTo(40 / (100 - 8), 6);
+    expect(dShort[20]).toBeLessThan(dLong[20]);
   });
 
   it("packs blend mode and view mode as their integer ids", () => {

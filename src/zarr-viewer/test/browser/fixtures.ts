@@ -51,6 +51,87 @@ export function sphereVolume(size = 32, radiusFraction = 0.22, edge = 0.08): Syn
   return { size, data };
 }
 
+/** A non-cubic (anisotropic) synthetic volume: independent per-axis voxel counts. Everything else in
+ * this file (`SyntheticVolume`, `multiRegionVolume`, etc.) is cubic-only, which is exactly why no
+ * existing browser fixture could ever catch an anisotropy-specific bug (occupancy-grid macrocell
+ * alignment, the tile-culling screen bbox's near-camera handling, direction-dependent ray-step sizing —
+ * three real bugs found live this session, none of which any prior fixture could reproduce). */
+export interface AnisotropicVolume {
+  dims: readonly [number, number, number];
+  /** Row-major (x fastest, then y, then z), length `dims[0]*dims[1]*dims[2]`. */
+  data: Float32Array;
+}
+
+/** An elongated volume: `baseline` density everywhere except small marker regions (reusing
+ * {@link HotspotRegion}, whose voxel-space `center`/`halfSize` already work fine for a non-cubic
+ * volume). Deliberately sized so at least one axis is NOT an exact multiple of the occupancy grid's
+ * own macrocell size (`MACROCELL_VOXELS = 8` — see `occupancy.ts`), so a real dataset-shaped alignment
+ * bug between the occupancy grid's construction and the raymarch shader's own cell lookup has somewhere
+ * to actually manifest, unlike every cubic/isotropic fixture in this file. */
+export function elongatedMarkerVolume(
+  dims: readonly [number, number, number],
+  baseline: number,
+  markers: readonly HotspotRegion[],
+): AnisotropicVolume {
+  const [sx, sy, sz] = dims;
+  const data = new Float32Array(sx * sy * sz).fill(baseline);
+  for (const r of markers) {
+    const [cx, cy, cz] = r.center;
+    const x0 = Math.max(0, cx - r.halfSize);
+    const x1 = Math.min(sx, cx + r.halfSize);
+    const y0 = Math.max(0, cy - r.halfSize);
+    const y1 = Math.min(sy, cy + r.halfSize);
+    const z0 = Math.max(0, cz - r.halfSize);
+    const z1 = Math.min(sz, cz + r.halfSize);
+    for (let z = z0; z < z1; z++) {
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          data[x + y * sx + z * sx * sy] = r.value;
+        }
+      }
+    }
+  }
+  return { dims, data };
+}
+
+/** Wraps an {@link AnisotropicVolume} as a single-level, single-chunk `VolumeSource` (same shape as
+ * {@link syntheticSource}, just with independent per-axis dimensions instead of a cube). */
+function anisotropicSource(volume: AnisotropicVolume): VolumeSource {
+  const { dims, data } = volume;
+  const spacing: readonly [number, number, number] = [1e-6, 1e-6, 1e-6];
+  return {
+    dimensions: dims,
+    spacing,
+    dtype: "float32",
+    valueRange: [0, 1],
+    levelCount: 1,
+    dimensionsAt: () => dims,
+    spacingAt: () => spacing,
+    readChunk(): Promise<VolumeChunk> {
+      throw new NotImplementedError("anisotropicSource.readChunk: not used by a whole-level upload");
+    },
+    async *chunks(level: number): AsyncIterable<VolumeChunk> {
+      if (level !== 0) throw new Error(`anisotropicSource: only level 0 exists, got ${level}`);
+      yield { origin: [0, 0, 0], shape: dims, data };
+    },
+    readRegion(): AsyncIterable<VolumeChunk> {
+      throw new NotImplementedError("anisotropicSource.readRegion: not used by a whole-level upload");
+    },
+    regionChunkCount(): number {
+      throw new NotImplementedError("anisotropicSource.regionChunkCount: not used by a whole-level upload");
+    },
+  };
+}
+
+/** Upload an {@link AnisotropicVolume} into a fresh GPU texture via the real production upload path. */
+export async function uploadAnisotropicVolume(
+  device: GPUDevice,
+  volume: AnisotropicVolume,
+): Promise<ManagedTexture> {
+  const { texture } = await uploadVolume(device, anisotropicSource(volume), { level: 0 });
+  return texture;
+}
+
 /** Wraps a {@link SyntheticVolume} as a single-level, single-chunk `VolumeSource` — enough for
  * `uploadVolume`'s whole-level path (`chunks()`), which is all this harness needs. The ROI-brick-only
  * methods (`readChunk`/`readRegion`/`regionChunkCount`) are never called on a whole-level upload;
