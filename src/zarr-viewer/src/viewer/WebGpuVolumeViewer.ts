@@ -1452,6 +1452,7 @@ export async function run(
     applyTf: () => applyTf(),
     applyRenderingState: (state) => applyRenderingState(state),
     renderUi: () => renderUi(),
+    requestRender: () => requestRender(),
     emitRendering: () => emitRendering(),
     emitCropping: () => emitCropping(),
     setViewModeAndEmit: (mode, opts) => setViewModeAndEmit(mode, opts),
@@ -1657,9 +1658,23 @@ export async function run(
       near,
       far,
     );
-    view.copy(camera.worldMatrix()).invert();
-    viewProj.multiplyMatrices(proj, view);
-    lastViewProj.copy(viewProj);
+    // `invert()`'s return value MUST be checked - it leaves `view` unchanged (still the camera-to-world
+    // matrix) on failure, and silently proceeding would multiply `proj` by the WRONG transform, feeding
+    // tile culling (`aabbScreenBbox`) a self-consistent but incorrect `viewProj` while the ray marcher's
+    // primary rays (built from a separate `camRight`/`camUp`/`forward` basis, not `invViewProj`) keep
+    // rendering the correct camera - exactly the "tile culling excludes real geometry" bug this was
+    // found to cause live. `Mat4.invert()`'s own singularity threshold was already fixed for the
+    // realistic case (a large camera-distance translation wrongly triggering it); this check is the
+    // remaining defense for a genuinely degenerate transform (e.g. a zero-scale camera basis), which
+    // should now be exceedingly rare - reuse last frame's `view`/`viewProj` rather than render with a
+    // known-wrong one.
+    if (view.copy(camera.worldMatrix()).invert()) {
+      viewProj.multiplyMatrices(proj, view);
+      lastViewProj.copy(viewProj);
+    } else {
+      console.error("[zarr-viewer] camera matrix is not invertible this frame - reusing last frame's view");
+      viewProj.copy(lastViewProj);
+    }
     // Rebuild the procedural light set from the camera basis so flashlight / stage lights track the
     // view. Global stays fixed-direction. Must run before recordInto (uploads the light buffer).
     // Feed the camera basis + FOV so the shader builds primary rays without invViewProj (which loses

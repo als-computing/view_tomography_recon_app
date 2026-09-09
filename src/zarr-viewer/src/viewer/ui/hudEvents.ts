@@ -67,6 +67,12 @@ export interface HudEventContext {
   applyTf(): void;
   applyRenderingState(state: Partial<WebGpuRenderingState>): void;
   renderUi(): void;
+  /** Schedule a repaint without a full HUD/sidebar rebuild - for handlers (measure-plane toggle/depth/
+   * color/alpha, etc.) that mutate `rendering`/`cropping` fields the render loop reads live but that
+   * `renderUi()` would be overkill for (its own doc comment: "any HUD interaction that rebuilds the
+   * panel also repaints the canvas" - but a live-updating field with no panel rebuild needs this
+   * directly, or render-on-demand keeps skipping frames until an unrelated interaction bumps it). */
+  requestRender(): void;
   emitRendering(): void;
   emitCropping(): void;
   setViewModeAndEmit(mode: VolumeViewMode, opts?: { openSlices?: boolean; skipRenderUi?: boolean }): void;
@@ -422,7 +428,14 @@ export function bindHudInput(ctx: HudEventContext): void {
         return;
       }
       if (t.dataset.chk === "measurePlaneOn") {
-        ctx.rendering.measurePlaneOn = on; // the render loop reads this live; just emit for links/share
+        ctx.rendering.measurePlaneOn = on; // the render loop reads this live
+        // Render-on-demand skips a frame unless something requests one - `renderUi()`'s own doc comment
+        // notes it double as a repaint trigger for handlers that rebuild the panel, but this handler
+        // deliberately doesn't call renderUi() (no panel rebuild needed for a checkbox toggle), so
+        // without this the change was invisible until an unrelated zoom/rotate happened to also request
+        // a frame - found live ("moving the plane... should update the rendering again, atm I have to
+        // zoom a little or rotate in order for the plane to reappear").
+        ctx.requestRender();
         ctx.emitRendering();
         return;
       }
@@ -734,8 +747,17 @@ export function bindHudInput(ctx: HudEventContext): void {
       default:
         break;
     }
-    if (RENDERING_SLIDERS.has(id)) ctx.emitRendering();
-    else if (CROPPING_SLIDERS.has(id)) ctx.emitCropping();
+    if (RENDERING_SLIDERS.has(id)) {
+      // Most of these sliders already trigger a repaint via applyRender()/applyTf() above; measureDepth/
+      // measureGray/measureAlpha (and equalizeClip when equalizeOn is off) don't call either - they just
+      // set a field the render loop reads live, relying on render-on-demand to notice, which it won't
+      // until an unrelated interaction (zoom/rotate) also requests a frame. requestRender() is a cheap,
+      // idempotent bump (Math.max(renderFrames, 3)), so calling it redundantly for sliders that already
+      // request one elsewhere costs nothing. Found live: adjusting the measure plane's depth/color/
+      // opacity didn't visibly update until zooming or rotating.
+      ctx.requestRender();
+      ctx.emitRendering();
+    } else if (CROPPING_SLIDERS.has(id)) ctx.emitCropping();
     else if (FX_SLIDERS.has(id)) ctx.emitRendering();
     else if (LIGHTING_SLIDERS.has(id)) ctx.emitRendering();
   });

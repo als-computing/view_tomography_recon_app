@@ -882,7 +882,16 @@ export class VolumeRenderer implements Disposable {
     options: { clear?: boolean } = {},
   ): void {
     this.invViewProj.copy(viewProj);
-    if (!this.invViewProj.invert()) return;
+    if (!this.invViewProj.invert()) {
+      // Skips the whole uniform upload, leaving the GPU-side frame uniform at whatever it was last
+      // frame - harmless on its own (the next frame retries), but was previously silent, and `Mat4.
+      // invert()`'s own singularity threshold used to false-reject ordinary large-camera-distance
+      // transforms (fixed - see that method's doc comment), so this should now be exceedingly rare.
+      // Logged so a genuine recurrence (rather than a one-off) is visible instead of a silently stale
+      // frame.
+      console.error("[zarr-viewer] viewProj is not invertible this frame - skipping uniform upload");
+      return;
+    }
 
     // The box's own projected depth along the CURRENT view direction (`measureForward`, kept fresh by
     // `setCameraBasis` every frame) — see `VolumeFrameParams.viewDepth`'s own doc comment for why this

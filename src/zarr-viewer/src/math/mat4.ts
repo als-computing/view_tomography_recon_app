@@ -275,15 +275,35 @@ export class Mat4 {
     const b11 = m22 * m33 - m23 * m32;
 
     const det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
-    // Magnitude-aware singularity test: a 4×4 determinant scales as (element magnitude)⁴, so use a
-    // relative threshold rather than the absolute Number.EPSILON.
-    let scale = 0;
-    for (let k = 0; k < 16; k++) {
-      const v = Math.abs(e[k]!);
-      if (v > scale) scale = v;
-    }
-    if (Math.abs(det) <= 1e-14 * scale * scale * scale * scale) return false;
+    // Singularity test: compare |det| against the scale of the additions that actually PRODUCE it
+    // (the six |bi*bj| terms summed above), not against the raw magnitude of the matrix's own elements.
+    // The previous check used `max(|e[k]|)^4` as the reference scale — correct for a matrix uniformly
+    // SCALED by a large factor (det does grow as scale^4 there), but wrong for an ordinary affine/camera
+    // matrix, whose translation column can be arbitrarily large with ZERO effect on the determinant (a
+    // rigid rotation+translation always has det=1, however far from the origin the camera sits). Found
+    // live: a camera positioned a few thousand+ world units out (routine at real dataset scale - e.g.
+    // this app's own microscopy datasets run camera distances in the thousands to tens of thousands of
+    // µm) pushed `scale` well past ~3162, at which point `1e-14 * scale^4` exceeds 1 and silently
+    // rejects a perfectly invertible det=1 rigid transform — with the matrix left UNCHANGED afterward
+    // (per this method's own no-mutation-on-failure contract), so a caller that ignores the `false`
+    // return (as `WebGpuVolumeViewer.ts`'s `view.copy(camera.worldMatrix()).invert()` did) silently
+    // proceeds with the camera-to-world matrix where a world-to-camera matrix was needed. This produced
+    // a `viewProj` that was internally self-consistent (and so passed every hand/unit-test check of its
+    // OWN arithmetic) while representing the wrong transform outright — exactly reproducing a live "tile
+    // culling excludes real geometry the ray marcher correctly renders" bug, since the ray marcher builds
+    // its primary rays from a separate camera-basis path (`setCameraBasis`, extracted directly from
+    // `camera.worldMatrix()`, no inversion needed) while tile culling depends entirely on this `viewProj`.
+    const detScale =
+      Math.abs(b00 * b11) +
+      Math.abs(b01 * b10) +
+      Math.abs(b02 * b09) +
+      Math.abs(b03 * b08) +
+      Math.abs(b04 * b07) +
+      Math.abs(b05 * b06);
+    if (!Number.isFinite(det) || !Number.isFinite(detScale) || detScale === 0) return false;
+    if (Math.abs(det) <= 32 * Number.EPSILON * detScale) return false;
     const invDet = 1 / det;
+    if (!Number.isFinite(invDet)) return false;
 
     e[0] = (m11 * b11 - m12 * b10 + m13 * b09) * invDet;
     e[1] = (m12 * b08 - m10 * b11 - m13 * b07) * invDet;

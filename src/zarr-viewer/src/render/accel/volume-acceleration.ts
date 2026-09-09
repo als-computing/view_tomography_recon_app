@@ -48,51 +48,6 @@ export interface VolumeAccelerationBuffers {
   tileBuf: GPUBuffer;
 }
 
-// TEMPORARY diagnostic state for logTilesDebugIfEnabled below - see its own doc comment. Module-level
-// (not per-instance) is fine for a debug tool meant to be enabled for one focused session at a time.
-let lastTilesDebugLogMs = 0;
-let lastTilesDebugWasNull: boolean | undefined;
-let lastTilesDebugBboxKey = "";
-
-/**
- * TEMPORARY diagnostic, opt-in only: `window.__debugTiles = true` from the browser console enables it;
- * otherwise this is one property read and an immediate return, effectively free. Logs the tile-culling
- * screen bbox (`null` = the safe "keep every tile" fallback, or its exact pixel edges) plus the inputs
- * that fed it, whenever the bbox's null/non-null STATE flips or its edges change meaningfully (a plain
- * per-frame log during a slow drag would flood the console with near-duplicate lines) - rotate until
- * the reported "clean line clips part of the volume" artifact appears, then copy whatever printed right
- * around that moment. Safe to leave in the codebase permanently; remove once the bug this was added for
- * is resolved and no longer needs live console diagnosis.
- */
-function logTilesDebugIfEnabled(
-  bbox: { minX: number; minY: number; maxX: number; maxY: number } | null,
-  ctx: VolumeAccelerationFrameCtx,
-): void {
-  if (typeof window === "undefined" || !(window as unknown as { __debugTiles?: boolean }).__debugTiles) return;
-  const isNull = bbox === null;
-  const bboxKey = bbox ? `${bbox.minX.toFixed(1)},${bbox.minY.toFixed(1)},${bbox.maxX.toFixed(1)},${bbox.maxY.toFixed(1)}` : "null";
-  const now = performance.now();
-  const stateChanged = isNull !== lastTilesDebugWasNull || bboxKey !== lastTilesDebugBboxKey;
-  // Log immediately on any real change; otherwise a slow once-per-second heartbeat so a long, unchanging
-  // hold still shows up in the log without flooding it.
-  if (!stateChanged && now - lastTilesDebugLogMs < 1000) return;
-  lastTilesDebugLogMs = now;
-  lastTilesDebugWasNull = isNull;
-  lastTilesDebugBboxKey = bboxKey;
-  console.log(
-    "[tiles-debug]",
-    JSON.stringify({
-      t: now.toFixed(0),
-      bbox,
-      internal: [ctx.internalWidth, ctx.internalHeight],
-      boxHalf: ctx.boxHalf,
-      cropMin: ctx.cropMin,
-      cropMax: ctx.cropMax,
-      viewProj: Array.from(ctx.viewProj.elements).map((v) => Number(v.toFixed(4))),
-    }),
-  );
-}
-
 export class VolumeAcceleration implements Disposable {
   private occupancy: OccupancyGrid | undefined;
   private readonly dummyOcc: ManagedBuffer;
@@ -334,28 +289,7 @@ export class VolumeAcceleration implements Disposable {
       }
     }
     if (spec.tiles && ctx.frameUniformGpu) {
-      // TEMPORARY diagnostic, opt-in only (same pattern/lifetime as `window.__debugTiles` above):
-      // `window.__forceKeepAllTiles = true` forces `bbox` to `null` (the safe "keep every tile"
-      // fallback) unconditionally, bypassing `aabbScreenBbox` entirely - a 10-second live test to
-      // confirm or rule out tile-culling as the cause of the live "clean line clips the volume" bug
-      // without needing another code change/deploy cycle. If the clipping still reproduces with this
-      // on, the bug is NOT in aabbScreenBbox/tile culling at all (rules out this whole subsystem at
-      // once); if it goes away, tile culling is confirmed as the culprit and the bbox math itself
-      // needs the next investigation pass. Zero cost when off (one property read).
-      const forceKeepAll = typeof window !== "undefined" && (window as { __forceKeepAllTiles?: boolean }).__forceKeepAllTiles === true;
-      const bbox = forceKeepAll
-        ? null
-        : aabbScreenBbox(ctx.viewProj, ctx.internalWidth, ctx.internalHeight, ctx.boxHalf, TILE_SIZE);
-      // TEMPORARY diagnostic, opt-in only (zero cost/no-op unless explicitly enabled from the browser
-      // console: `window.__debugTiles = true`) - added to help pin down a live "clean line cuts off
-      // part of the volume while rotating, fast/quality only" bug this session's static analysis and
-      // synthetic/live-data reproduction attempts haven't caught yet. Logs the tile-culling bbox
-      // (or `null` for the safe "keep every tile" fallback) plus the camera basis every time it
-      // MEANINGFULLY CHANGES (not every frame - would flood the console during a slow drag), so
-      // whatever the console shows right as the clipping visibly appears can be pasted back for
-      // analysis. Safe to leave in: the flag check is one property read when off, and this whole block
-      // is already gated behind `spec.tiles` (fast/quality only).
-      logTilesDebugIfEnabled(bbox, ctx);
+      const bbox = aabbScreenBbox(ctx.viewProj, ctx.internalWidth, ctx.internalHeight, ctx.boxHalf, TILE_SIZE);
       const rebuilt = this.tiles.record(
         encoder,
         ctx.frameUniformGpu,
