@@ -6,6 +6,7 @@ declare global {
     runFixture: (name: string) => Promise<FixtureResult>;
     runMultiBrickFixture: () => Promise<FixtureResult>;
     runAnisotropicOcclusionFixture: () => Promise<FixtureResult>;
+    runLargeAnisotropicFixture: () => Promise<FixtureResult>;
   }
 }
 
@@ -159,5 +160,37 @@ test.describe("anisotropic occlusion (fast/quality occupancy + tile culling)", (
       channelDiff(fastCenter, baselineCenter),
       "fast and baseline should render the far-end marker comparably, not wildly differently",
     ).toBeLessThanOrEqual(SAME_TOLERANCE * 2);
+  });
+
+  test("a large, nearly screen-filling solid volume shows material at every sample point, not a partial clean-line cutoff, from either end of the long axis", async ({
+    page,
+  }) => {
+    await page.goto("/test/browser/harness.html");
+    const result = await page.evaluate(() => window.runLargeAnisotropicFixture());
+    if (!result.ok) throw new Error(`large anisotropic fixture failed: ${result.error}`);
+
+    const background: readonly [number, number, number, number] = [
+      Math.round(0.02 * 255),
+      Math.round(0.03 * 255),
+      Math.round(0.05 * 255),
+      255,
+    ];
+    const points: SampleName[] = ["center", "nearLeft", "nearRight", "nearTop", "nearBottom"];
+
+    for (const [label, samples, baseline] of [
+      ["forward", result.samples!, result.samplesBaseline!],
+      ["reverse (-z toward +z, reported worst)", result.samplesReverse!, result.samplesReverseBaseline!],
+    ] as const) {
+      for (const name of points) {
+        // Ground truth first: if baseline itself doesn't show material at this point, the fixture's
+        // own geometry doesn't actually cover it at this camera direction - not a real assertion.
+        const baselineHit = channelDiff(baseline[name], background) > CHANGED_TOLERANCE;
+        if (!baselineHit) continue;
+        expect(
+          channelDiff(samples[name], background),
+          `${label}: ${name} should show material (baseline does), not have been cut off by a clean-line tile/occupancy artifact`,
+        ).toBeGreaterThan(CHANGED_TOLERANCE);
+      }
+    }
   });
 });

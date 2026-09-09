@@ -18,14 +18,17 @@
  * @packageDocumentation
  */
 
-import { Mat4 } from "@zarr-viewer/math";
+import { Mat4, Vec3 } from "@zarr-viewer/math";
 import {
   createContext,
   VolumeRenderer,
   TransferFunction,
   BrickAtlas,
   uploadRegionToAtlasSlot,
+  uploadVolume,
 } from "@zarr-viewer/render";
+import { openOmeZarr, httpStore, physicalSizeSim } from "@zarr-viewer/io";
+import { units } from "@zarr-viewer/core";
 import {
   constantVolume,
   sphereVolume,
@@ -76,10 +79,15 @@ export interface FixtureResult {
    * with both brick slots disabled, so the spec can directly compare "with bricks" vs "without" instead
    * of reasoning about absolute pixel values. */
   samplesNoBrick?: Record<SampleName, [number, number, number, number]>;
-  /** The anisotropic-occlusion fixture only: a second sample set from the SAME scene/camera rendered
+  /** The anisotropic-occlusion fixtures only: a second sample set from the SAME scene/camera rendered
    * with `shaderConfig: "baseline"` (no occupancy/tiles at all) instead of `"fast"` — the ground-truth
    * comparison, since baseline can't wrongly cull/leap-skip real content by construction. */
   samplesBaseline?: Record<SampleName, [number, number, number, number]>;
+  /** The large-anisotropic fixture only: `samples`/`samplesBaseline` above are the "forward" camera
+   * direction (matching every other fixture's shared convention); these two are the SAME scene/config
+   * pair from the opposite end of the long axis — the specific direction called out live as worst. */
+  samplesReverse?: Record<SampleName, [number, number, number, number]>;
+  samplesReverseBaseline?: Record<SampleName, [number, number, number, number]>;
 }
 
 /** Copy `tex` (RGBA8, `WIDTH`x`HEIGHT`) into a mappable buffer and read back just the sample points. */
@@ -436,13 +444,347 @@ async function runAnisotropicOcclusionFixture(): Promise<FixtureResult> {
   }
 }
 
+/**
+ * A LARGE, nearly screen-filling solid anisotropic volume (not a small point marker like
+ * {@link runAnisotropicOcclusionFixture}) — built specifically to catch a "clean axis-aligned line cuts
+ * off a large interior region, background elsewhere correct" symptom (reported live: "rotating causes
+ * either a vertical or horizontal line across the volume, clipping it... no rays march through large
+ * portions of the volume, but it clipped cleanly along some bounding lines"). A single small marker at
+ * one screen point can't reveal an asymmetric cutoff between screen regions; this fixture samples
+ * multiple points spread across a solid, symmetric shape — under correct rendering EVERY sample point
+ * inside the shape's silhouette should show material, so any sample reading as background while its
+ * mirror-symmetric counterpart doesn't is direct evidence of exactly this failure mode, not something
+ * that has to be reasoned about indirectly. Rendered from BOTH ends of the long axis (forward = ±z),
+ * since the live report specifically called out one direction ("-z toward +z") as worst.
+ */
+async function runLargeAnisotropicFixture(): Promise<FixtureResult> {
+  try {
+    const canvas = document.getElementById("gpu-canvas") as HTMLCanvasElement;
+    const ctx = await createContext(canvas, { powerPreference: "high-performance" });
+    const gpuErrors: string[] = [];
+    ctx.device.addEventListener("uncapturederror", (e) => {
+      gpuErrors.push((e as GPUUncapturedErrorEvent).error.message);
+    });
+
+    // Roughly matches the real ant12 dataset's own aspect ratio (315x304x407 - nearly square cross-
+    // section, ~1.3x longer along the third axis) at test-friendly scale; 84 is deliberately not a
+    // multiple of MACROCELL_VOXELS (8).
+    const dims: readonly [number, number, number] = [64, 64, 84];
+    const [sx, sy, sz] = dims;
+    const data = new Float32Array(sx * sy * sz).fill(0);
+    // A solid box filling ~80% of every axis (leaving a thin empty margin on all sides, so occupancy
+    // still classifies the outer shell as empty and the leap/tile-culling machinery still has real
+    // empty space to skip through) - large and symmetric enough that every SAMPLE_POINT should land
+    // inside its screen silhouette from either end-on viewing direction.
+    const mx0 = Math.floor(sx * 0.1);
+    const mx1 = Math.ceil(sx * 0.9);
+    const my0 = Math.floor(sy * 0.1);
+    const my1 = Math.ceil(sy * 0.9);
+    const mz0 = Math.floor(sz * 0.1);
+    const mz1 = Math.ceil(sz * 0.9);
+    for (let z = mz0; z < mz1; z++) {
+      for (let y = my0; y < my1; y++) {
+        for (let x = mx0; x < mx1; x++) {
+          data[x + y * sx + z * sx * sy] = 1;
+        }
+      }
+    }
+    // Carve a few small INTERNAL empty cavities out of the otherwise-solid block, spaced along the
+    // long (z) axis - real biological tissue isn't a uniform solid, and a ray traversing the object
+    // must correctly leap THROUGH each internal empty pocket via the occupancy leap and then resume
+    // baseline marching back in occupied territory afterward, possibly more than once per ray. The
+    // "solid box, empty only in the outer margin" version of this fixture never exercises that
+    // resume-after-an-INTERNAL-leap transition at all, only the outer entry.
+    const cavityRadius = 4;
+    for (const cz of [Math.round(sz * 0.35), Math.round(sz * 0.65)]) {
+      const cx = Math.round(sx * 0.5);
+      const cy = Math.round(sy * 0.5);
+      for (let z = cz - cavityRadius; z < cz + cavityRadius; z++) {
+        for (let y = cy - cavityRadius; y < cy + cavityRadius; y++) {
+          for (let x = cx - cavityRadius; x < cx + cavityRadius; x++) {
+            if (x < 0 || y < 0 || z < 0 || x >= sx || y >= sy || z >= sz) continue;
+            data[x + y * sx + z * sx * sy] = 0;
+          }
+        }
+      }
+    }
+    const texture = await uploadAnisotropicVolume(ctx.device, { dims, data });
+
+    const renderer = new VolumeRenderer(ctx, {
+      colorFormat: OFFSCREEN_FORMAT,
+      blendMode: "composite",
+      densityScale: 3,
+      stepSize: 1 / 128,
+      exposure: 1.5,
+      ambient: 0.4,
+      shaderConfig: "fast",
+    });
+    renderer.setVolume(texture);
+    const maxDim = Math.max(sx, sy, sz);
+    renderer.setBoxHalfSize((0.5 * sx) / maxDim, (0.5 * sy) / maxDim, (0.5 * sz) / maxDim);
+    renderer.setTransferFunction(
+      new TransferFunction([
+        { position: 0, color: [1, 1, 1, 0] },
+        { position: 1, color: [1, 1, 1, 1] },
+      ]),
+    );
+
+    const { fovY, aspect } = makeCamera();
+
+    const renderOnce = async (
+      eye: { x: number; y: number; z: number },
+      forward: [number, number, number],
+    ): Promise<Record<SampleName, [number, number, number, number]>> => {
+      const view = new Mat4().lookAt(eye, { x: eye.x + forward[0], y: eye.y + forward[1], z: eye.z + forward[2] }, { x: 0, y: 1, z: 0 });
+      const proj = new Mat4().perspective(fovY, aspect, 0.1, 10);
+      const viewProj = new Mat4().multiplyMatrices(proj, view);
+      renderer.setCameraBasis([1, 0, 0], [0, 1, 0], forward, fovY, aspect);
+
+      const target = ctx.device.createTexture({
+        size: [WIDTH, HEIGHT, 1],
+        format: OFFSCREEN_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      });
+      const gbuffer = [VOLUME_DEPTH_FORMAT, GBUFFER_FORMAT, GBUFFER_FORMAT, GBUFFER_FORMAT, GBUFFER_FORMAT].map(
+        (format) =>
+          ctx.device.createTexture({
+            size: [WIDTH, HEIGHT, 1],
+            format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+          }),
+      );
+      const encoder = ctx.device.createCommandEncoder({ label: "large-aniso-frame" });
+      renderer.recordPrePasses(encoder, viewProj, eye);
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: target.createView(),
+            clearValue: { r: 0.02, g: 0.03, b: 0.05, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+          ...gbuffer.map((tex) => ({
+            view: tex.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear" as const,
+            storeOp: "store" as const,
+          })),
+        ],
+      });
+      renderer.recordInto(pass, viewProj, eye);
+      pass.end();
+      ctx.device.queue.submit([encoder.finish()]);
+      for (const tex of gbuffer) tex.destroy();
+      const samples = await readbackSamples(ctx.device, target);
+      target.destroy();
+      return samples;
+    };
+
+    // "Forward" direction: eye on the +z side looking toward -z (matches every other fixture's shared
+    // camera convention).
+    const samples = await renderOnce({ x: 0, y: 0, z: 2.2 }, [0, 0, -1]);
+    // "Reverse" direction: eye on the -z side looking toward +z - the specific direction called out
+    // live as worst ("-z direction towards +z").
+    const samplesReverse = await renderOnce({ x: 0, y: 0, z: -2.2 }, [0, 0, 1]);
+    renderer.setShaderConfig("baseline");
+    const samplesBaseline = await renderOnce({ x: 0, y: 0, z: 2.2 }, [0, 0, -1]);
+    const samplesBaselineReverse = await renderOnce({ x: 0, y: 0, z: -2.2 }, [0, 0, 1]);
+
+    if (gpuErrors.length > 0) {
+      return { ok: false, error: gpuErrors.join(" | "), samples, samplesBaseline };
+    }
+    return {
+      ok: true,
+      samples,
+      samplesBaseline,
+      samplesReverse,
+      samplesReverseBaseline: samplesBaselineReverse,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? `${err.message}\n${err.stack}` : String(err) };
+  }
+}
+
+/** One grid-sample point's UV position + the per-channel diff between `fast` and `baseline` there. */
+export interface LiveDiffPoint {
+  u: number;
+  v: number;
+  diff: number;
+  fast: [number, number, number, number];
+  baseline: [number, number, number, number];
+}
+
+export interface LiveReproResult {
+  ok: boolean;
+  error?: string;
+  /** Every grid point where `fast` and `baseline` disagree beyond `CHANGED_TOLERANCE`-ish, for the
+   * caller to inspect directly (bounding box, shape) rather than reasoning about it blind. */
+  diffPoints?: LiveDiffPoint[];
+  gridSize?: number;
+  direction?: string;
+}
+
+/**
+ * MANUAL DIAGNOSTIC, not part of the permanent regression suite (see `render.spec.ts`'s own note on
+ * why this isn't wired into a real `test()` by default) — loads a REAL dataset from a locally-running
+ * Tiled server via the exact same production path the live app uses (`openOmeZarr`/`httpStore`/
+ * `uploadVolume`/`physicalSizeSim`), renders it with `shaderConfig: "fast"` and `"baseline"` from a
+ * given camera direction, and diffs a regular grid of sample points across the whole frame — directly
+ * revealing the SHAPE/LOCATION of any discrepancy (a "clean line" bug shows up as one contiguous half
+ * of the grid differing, not scattered points) instead of requiring a hand-picked sample point that
+ * might miss it. Network-dependent (only works with Tiled reachable at `zarrUrl`'s own host) - wrap calls
+ * to this in a try/catch at the call site and treat failure as "couldn't run," not "test failed."
+ */
+async function runLiveRepro(
+  zarrUrl: string,
+  level: number,
+  forward: [number, number, number],
+  direction: string,
+  gridSize = 12,
+): Promise<LiveReproResult> {
+  try {
+    const canvas = document.getElementById("gpu-canvas") as HTMLCanvasElement;
+    const ctx = await createContext(canvas, { powerPreference: "high-performance" });
+    const gpuErrors: string[] = [];
+    ctx.device.addEventListener("uncapturederror", (e) => {
+      gpuErrors.push((e as GPUUncapturedErrorEvent).error.message);
+    });
+
+    const store = httpStore(zarrUrl);
+    const source = await openOmeZarr(store);
+    const { texture } = await uploadVolume(ctx.device, source, { level });
+
+    const sim = units.UNIT_PRESETS.microscopy;
+    const sizeSim = physicalSizeSim(new Vec3(), source, sim, level);
+    const extent = Math.max(sizeSim.x, sizeSim.y, sizeSim.z) || 1;
+
+    const renderer = new VolumeRenderer(ctx, {
+      colorFormat: OFFSCREEN_FORMAT,
+      blendMode: "composite",
+      densityScale: 3,
+      stepSize: extent / 260,
+      exposure: 1.5,
+      ambient: 0.4,
+      shaderConfig: "fast",
+    });
+    renderer.setVolume(texture);
+    renderer.setBoxHalfSize(sizeSim.x * 0.5, sizeSim.y * 0.5, sizeSim.z * 0.5);
+    // Auto-window: real data isn't [0,1] density like the synthetic fixtures - a plain full-range ramp
+    // makes SOMETHING visible regardless of the dataset's own real intensity distribution.
+    renderer.setTransferFunction(
+      new TransferFunction([
+        { position: 0, color: [1, 1, 1, 0] },
+        { position: 1, color: [1, 1, 1, 1] },
+      ]),
+    );
+
+    const fovY = (42 * Math.PI) / 180;
+    const aspect = WIDTH / HEIGHT;
+    // Zoomed OUT, matching the live report - a comfortable multiple of the volume's own extent.
+    const dist = extent * 1.8;
+    const eye = { x: -forward[0] * dist, y: -forward[1] * dist, z: -forward[2] * dist };
+    const view = new Mat4().lookAt(eye, { x: 0, y: 0, z: 0 }, { x: 0, y: 1, z: 0 });
+    const proj = new Mat4().perspective(fovY, aspect, extent * 0.01, extent * 10);
+    const viewProj = new Mat4().multiplyMatrices(proj, view);
+    renderer.setCameraBasis([1, 0, 0], [0, 1, 0], forward, fovY, aspect);
+
+    const target = ctx.device.createTexture({
+      size: [WIDTH, HEIGHT, 1],
+      format: OFFSCREEN_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+    const gbuffer = [VOLUME_DEPTH_FORMAT, GBUFFER_FORMAT, GBUFFER_FORMAT, GBUFFER_FORMAT, GBUFFER_FORMAT].map(
+      (format) =>
+        ctx.device.createTexture({ size: [WIDTH, HEIGHT, 1], format, usage: GPUTextureUsage.RENDER_ATTACHMENT }),
+    );
+
+    const renderAndReadGrid = async (): Promise<Record<string, [number, number, number, number]>> => {
+      const encoder = ctx.device.createCommandEncoder({ label: "live-repro-frame" });
+      renderer.recordPrePasses(encoder, viewProj, eye);
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          { view: target.createView(), clearValue: { r: 0.02, g: 0.03, b: 0.05, a: 1 }, loadOp: "clear", storeOp: "store" },
+          ...gbuffer.map((tex) => ({
+            view: tex.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear" as const,
+            storeOp: "store" as const,
+          })),
+        ],
+      });
+      renderer.recordInto(pass, viewProj, eye);
+      pass.end();
+      ctx.device.queue.submit([encoder.finish()]);
+
+      const bytesPerRow = Math.ceil((WIDTH * 4) / 256) * 256;
+      const buffer = ctx.device.createBuffer({
+        size: bytesPerRow * HEIGHT,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      const readEncoder = ctx.device.createCommandEncoder();
+      readEncoder.copyTextureToBuffer(
+        { texture: target },
+        { buffer, bytesPerRow, rowsPerImage: HEIGHT },
+        { width: WIDTH, height: HEIGHT, depthOrArrayLayers: 1 },
+      );
+      ctx.device.queue.submit([readEncoder.finish()]);
+      await buffer.mapAsync(GPUMapMode.READ);
+      const bytes = new Uint8Array(buffer.getMappedRange().slice(0));
+      buffer.unmap();
+      buffer.destroy();
+
+      const out: Record<string, [number, number, number, number]> = {};
+      for (let gy = 0; gy < gridSize; gy++) {
+        for (let gx = 0; gx < gridSize; gx++) {
+          const u = (gx + 0.5) / gridSize;
+          const v = (gy + 0.5) / gridSize;
+          const x = Math.min(WIDTH - 1, Math.max(0, Math.round(u * WIDTH)));
+          const y = Math.min(HEIGHT - 1, Math.max(0, Math.round(v * HEIGHT)));
+          const off = y * bytesPerRow + x * 4;
+          out[`${gx},${gy}`] = [bytes[off]!, bytes[off + 1]!, bytes[off + 2]!, bytes[off + 3]!];
+        }
+      }
+      return out;
+    };
+
+    const fastGrid = await renderAndReadGrid();
+    renderer.setShaderConfig("baseline");
+    const baselineGrid = await renderAndReadGrid();
+
+    for (const tex of gbuffer) tex.destroy();
+    target.destroy();
+
+    const diffPoints: LiveDiffPoint[] = [];
+    for (let gy = 0; gy < gridSize; gy++) {
+      for (let gx = 0; gx < gridSize; gx++) {
+        const key = `${gx},${gy}`;
+        const f = fastGrid[key]!;
+        const b = baselineGrid[key]!;
+        const diff = Math.max(Math.abs(f[0] - b[0]), Math.abs(f[1] - b[1]), Math.abs(f[2] - b[2]));
+        if (diff > 10) {
+          diffPoints.push({ u: (gx + 0.5) / gridSize, v: (gy + 0.5) / gridSize, diff, fast: f, baseline: b });
+        }
+      }
+    }
+
+    if (gpuErrors.length > 0) return { ok: false, error: gpuErrors.join(" | "), diffPoints, gridSize, direction };
+    return { ok: true, diffPoints, gridSize, direction };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? `${err.message}\n${err.stack}` : String(err) };
+  }
+}
+
 declare global {
   interface Window {
     runFixture: typeof runFixture;
     runMultiBrickFixture: typeof runMultiBrickFixture;
     runAnisotropicOcclusionFixture: typeof runAnisotropicOcclusionFixture;
+    runLargeAnisotropicFixture: typeof runLargeAnisotropicFixture;
+    runLiveRepro: typeof runLiveRepro;
   }
 }
 window.runFixture = runFixture;
 window.runMultiBrickFixture = runMultiBrickFixture;
 window.runAnisotropicOcclusionFixture = runAnisotropicOcclusionFixture;
+window.runLargeAnisotropicFixture = runLargeAnisotropicFixture;
+window.runLiveRepro = runLiveRepro;

@@ -192,6 +192,10 @@ export interface WebGpuViewerInstance {
    * displayed volume texture, mask textures, shadow map, occupancy grid, and TAAU history buffers are
    * real GPU allocations not yet counted here; extend to more categories later if this proves useful). */
   getMemoryStats: () => GpuMemoryStats;
+  /** The resolved per-dataset value domain this viewer normalizes raw voxel values against (see the
+   * `valueRange` estimation in `run()`) — `[min, max]` in the source's own physical/intensity units,
+   * not the `[0,1]` rendering domain. */
+  getValueRange: () => readonly [number, number];
   dispose: () => void;
 }
 
@@ -350,6 +354,7 @@ export async function run(
       renderTargetBytes: 0,
       totalEstimatedGpuBytes: 0,
     }),
+    getValueRange: () => [0, 1],
     dispose: () => handle.dispose(),
   });
 
@@ -1961,6 +1966,7 @@ export async function run(
         totalEstimatedGpuBytes: gpuBrickBytes + densityPyramidBytes + renderTargetBytes,
       };
     },
+    getValueRange: () => valueRange,
     dispose: () => handle.dispose(),
   };
   return instance;
