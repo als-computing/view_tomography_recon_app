@@ -61,9 +61,12 @@ const VIS_SCALE: f32 = 128.0;
 const SHADE_ALPHA_EPS: f32 = 1e-4;
 const TARGET_SEGMENT_OPACITY: f32 = 0.25;
 // Green solid-fill box indicator: fixed extinction coefficient (NOT derived from density/TF at all —
-// see inOverlayBox's own doc comment for why) and fill color.
-const OVERLAY_BOX_SIGMA: f32 = 1.2;
-const OVERLAY_BOX_COLOR = vec3<f32>(0.15, 0.95, 0.25);
+// see inOverlayBox's own doc comment for why) and fill color. Sigma is kept low so the box stays
+// translucent even after a long path through it (a "glowing haze," not a solid block); the color's
+// green channel is well above 1.0 so the HDR contribution reads as an emissive glow once ACES tonemap
+// (and bloom, if enabled) get to it, rather than a flat, TF-plausible green tint.
+const OVERLAY_BOX_SIGMA: f32 = 0.35;
+const OVERLAY_BOX_COLOR = vec3<f32>(0.2, 1.8, 0.35);
 
 struct Frame {
   invViewProj: mat4x4<f32>,

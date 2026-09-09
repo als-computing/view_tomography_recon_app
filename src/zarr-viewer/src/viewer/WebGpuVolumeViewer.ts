@@ -1645,7 +1645,12 @@ export async function run(
     // then refine once settled. `residency.idle` is seconds since the camera last moved.
     // Coarsen instantly for responsiveness; ease back to the configured `sampleDist` over ~0.4 s so the
     // sharpening isn't a visible pop. max(NAV_SAMPLE_DIST, sampleDist) keeps a coarse slider still coarse.
-    const navTarget = residency.idle < NAV_SETTLE ? Math.max(NAV_SAMPLE_DIST, rendering.sampleDist) : rendering.sampleDist;
+    // `fullQualityNav` opts out of this coarsening entirely - the step size stays at the configured
+    // `sampleDist` even while moving, relying on TAAU accumulation once settled for a clean image.
+    const navTarget =
+      !rendering.fullQualityNav && residency.idle < NAV_SETTLE
+        ? Math.max(NAV_SAMPLE_DIST, rendering.sampleDist)
+        : rendering.sampleDist;
     if (navTarget > navSampleDist) navSampleDist = navTarget;
     else navSampleDist += (navTarget - navSampleDist) * Math.min(1, dt * 8);
     volumeRenderer.setParams({ stepSize: Math.min(brickStep ?? baseStep, baseStep) * navSampleDist });
@@ -1843,6 +1848,12 @@ export async function run(
       controls.setState(state);
       // Re-baseline so the loop's poll doesn't echo this peer-applied pose back out.
       lastCam = controls.getState();
+      // Wake the render loop immediately rather than relying on its next-frame `camsEqual` poll to
+      // notice the change and call this itself (it does, one frame later - see `requestRender` at the
+      // `!camsEqual(camNow, lastRenderCam)` check) - removes even that one-frame latency window for a
+      // peer-driven camera update (e.g. the linked-split-view's continuous rotation-follow), which is
+      // otherwise the only `set*` method here that doesn't already request a render on its own.
+      requestRender();
     },
     getRendering: readRendering,
     setRendering: applyRenderingState,

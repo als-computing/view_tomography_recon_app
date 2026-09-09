@@ -92,6 +92,10 @@ export default function WebGpuLinked2D3DPane({
   // Continuous "2D slice follows the 3D camera's own angle" mode (true oblique slicing) — local,
   // transient UI state, not persisted to the tab store (unlike `axis`, which is a real preference).
   const [linkToCameraAngle, setLinkToCameraAngle] = useState(false);
+  // Whether the green wireframe-box indicator (on the 3D/right pane) is shown while `linkToCameraAngle`
+  // is active — a separate toggle from the mode itself, so the rotation-follow/crop-zoom behavior can
+  // stay on while the visual indicator is hidden. Default on (matches the feature's own default look).
+  const [showOverlayCube, setShowOverlayCube] = useState(true);
 
   const handle3DReady = useCallback(
     (instance: WebGpuViewerInstance | null) => {
@@ -125,10 +129,11 @@ export default function WebGpuLinked2D3DPane({
         // (`enterViewMode`'s existing, shared behavior for every pane), so it must be explicitly turned
         // back off here, right after. Pinned per-pane via `pinShowPlanes` below.
         instance.setCropping({ ...instance.getCropping(), showPlanes: false });
-        // The 2D (detail) pane defaults to half-res-while-navigating OFF — it's meant to be the
-        // "higher-quality zoomed-in view" of the pair (see handle3DReady's own comment for the 3D
-        // pane's opposite default), pinned per-pane via `pinHalfRes` below.
-        instance.setRendering({ ...instance.getRendering(), halfRes: false });
+        // The 2D (detail) pane defaults to half-res-while-navigating OFF and full-quality-while-
+        // navigating ON (no ray-step coarsening either) — it's meant to be the "higher-quality
+        // zoomed-in view" of the pair (see handle3DReady's own comment for the 3D pane's opposite
+        // defaults), both pinned per-pane via `pinHalfRes`/`pinFullQualityNav` below.
+        instance.setRendering({ ...instance.getRendering(), halfRes: false, fullQualityNav: true });
         // Collapse the 2D (left) pane's own HUD sidebar by default — its controls are redundant with
         // the 3D (right) pane's, since rendering/cropping are linked between them; showing two nearly
         // identical control sidebars wastes horizontal space better spent on the two canvases.
@@ -245,7 +250,7 @@ export default function WebGpuLinked2D3DPane({
       // construction. Deliberately `setOverlayBox`, not the standard `cropping` link group: the 3D pane
       // must stay uncropped itself (its own cropMin/cropMax stay [0,1]) while still drawing this
       // indicator, which is exactly what `setOverlayBox` is for (see its own doc comment).
-      instance3D.setOverlayBox(true, cropMin, cropMax);
+      instance3D.setOverlayBox(showOverlayCube, cropMin, cropMax);
     };
 
     /** Copy the 3D pane's viewing DIRECTION (offset, normalized) + gazeUp onto the 2D pane, preserving
@@ -293,7 +298,10 @@ export default function WebGpuLinked2D3DPane({
       instance2D.setCropping({ ...instance2D.getCropping(), cropMin: [0, 0, 0], cropMax: [1, 1, 1] });
       instance3D.setOverlayBox(false, [0, 0, 0], [1, 1, 1]);
     };
-  }, [linkToCameraAngle, instance2D, instance3D]);
+    // showOverlayCube is a dep so toggling it re-runs this effect (cleanup then setup) immediately -
+    // the setup call above re-reads it into a fresh setOverlayBox call, so the indicator's visibility
+    // updates right away rather than waiting for the next camera/crop change tick.
+  }, [linkToCameraAngle, instance2D, instance3D, showOverlayCube]);
 
   // 2D is passed as the link's "a" (seed source), 3D as "b": the hook's initial seed alignment always
   // copies the FIRST argument's current state into the second, once, when both instances become ready.
@@ -314,6 +322,7 @@ export default function WebGpuLinked2D3DPane({
     pinViewMode: true,
     pinShowPlanes: true,
     pinHalfRes: true,
+    pinFullQualityNav: true,
   });
 
   return (
@@ -351,6 +360,21 @@ export default function WebGpuLinked2D3DPane({
         >
           🔗 3D angle
         </button>
+        {linkToCameraAngle && (
+          <button
+            type="button"
+            className={[
+              'split2d3d__axis-btn',
+              showOverlayCube ? 'split2d3d__axis-btn--active' : '',
+            ]
+              .filter(Boolean)
+              .join(' ')}
+            title={showOverlayCube ? 'Hide the green cube indicator' : 'Show the green cube indicator'}
+            onClick={() => setShowOverlayCube((v) => !v)}
+          >
+            {showOverlayCube ? '◈ cube' : '◇ cube'}
+          </button>
+        )}
         <button type="button" className="split2d3d__exit" onClick={onExit}>
           ✕ 3D only
         </button>

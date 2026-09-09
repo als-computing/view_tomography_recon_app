@@ -55,6 +55,14 @@ interface LinkOptions {
    * normally. Default `false` (today's dataset-compare split behavior, unchanged).
    */
   pinHalfRes?: boolean;
+  /**
+   * When linking `rendering`, keep each side's OWN `fullQualityNav` (skip the render loop's adaptive
+   * ray-step coarsening while the camera moves) instead of copying the other's — for the same reason as
+   * `pinHalfRes`: the 2D (detail) pane can afford to always render at full step quality, the 3D
+   * (context) pane can keep the default adaptive behavior. Default `false` (today's dataset-compare
+   * split behavior, unchanged).
+   */
+  pinFullQualityNav?: boolean;
 }
 
 export function useLinkedWebGpuViewers(
@@ -67,6 +75,7 @@ export function useLinkedWebGpuViewers(
     pinViewMode = false,
     pinShowPlanes = false,
     pinHalfRes = false,
+    pinFullQualityNav = false,
   }: LinkOptions,
 ): void {
   useEffect(() => {
@@ -116,6 +125,7 @@ export function useLinkedWebGpuViewers(
         const state = from.getRendering();
         if (pinViewMode) state.viewMode = to.getRendering().viewMode;
         if (pinHalfRes) state.halfRes = to.getRendering().halfRes;
+        if (pinFullQualityNav) state.fullQualityNav = to.getRendering().fullQualityNav;
         to.setRendering(state);
       });
     }
@@ -136,5 +146,5 @@ export function useLinkedWebGpuViewers(
         }
       }
     };
-  }, [a, b, camera, rendering, cropping, pinViewMode, pinShowPlanes, pinHalfRes]);
+  }, [a, b, camera, rendering, cropping, pinViewMode, pinShowPlanes, pinHalfRes, pinFullQualityNav]);
 }

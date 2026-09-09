@@ -97,6 +97,14 @@ export interface WebGpuRenderingState {
    * opt-in fix for users who find the default direction backwards. */
   invertOrbitX: boolean;
   invertOrbitY: boolean;
+  /** Opt-in "always full quality" mode: skip the adaptive ray-step coarsening the render loop otherwise
+   * applies while the camera is moving (`NAV_SAMPLE_DIST`, `WebGpuVolumeViewer.ts`) — the step size stays
+   * at the configured `sampleDist` even mid-drag, relying entirely on TAAU accumulation once the camera
+   * settles for a clean image, rather than on this separate step-size adaptation. Independent of
+   * `halfRes`/`gbufferLighting` (which coarsen render RESOLUTION/lighting, not the ray step) — a pane can
+   * combine any of the three. Default off (unchanged existing adaptive behavior); meant for a "detail"
+   * pane in a linked split view where responsiveness matters less than always-sharp geometry. */
+  fullQualityNav: boolean;
 }
 
 /** The ROI crop box plus the slice planes (positions, per-axis enables, overlay visibility). */
@@ -193,6 +201,7 @@ export function defaultRenderingState(): WebGpuRenderingState {
     measurePlaneAlpha: 0.35, // plane opacity [0,1]
     invertOrbitX: false,
     invertOrbitY: false,
+    fullQualityNav: false,
   };
 }
 
