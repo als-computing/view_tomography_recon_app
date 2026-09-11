@@ -31,3 +31,6 @@ dist-ssr
 *.sw?
 
 graphify-out/
+
+# mkdocs build output (built via `mkdocs build`, not committed)
+site/

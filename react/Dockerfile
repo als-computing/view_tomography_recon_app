@@ -16,6 +16,18 @@ FROM base AS dev
 EXPOSE 5174
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5174"]
 
+# ---------- docs: static mkdocs build, embedded into prod under ${BASE_PATH}docs/ ----------
+# Built here (not as a separate published artifact) so the Docs button (src/config.ts's DOCS_URL)
+# can stay a same-origin relative path — no docs FQDN/host is ever baked into the app bundle,
+# regardless of which domain actually fronts a given deployment (:local, :als-prod, :als-dev).
+FROM python:3.12-slim AS docs
+WORKDIR /docs
+COPY requirements-docs.txt ./
+RUN pip install --no-cache-dir -r requirements-docs.txt
+COPY mkdocs.yml ./
+COPY docs ./docs
+RUN mkdocs build --strict -d /docs-site
+
 # ---------- build: production vite build, base path + optional Tiled-server lock baked in ----------
 FROM base AS build
 ARG BASE_PATH=/tomo_viewer/
@@ -33,6 +45,9 @@ RUN npm run build
 FROM nginx:alpine AS prod
 ARG BASE_PATH=/tomo_viewer/
 COPY --from=build /app/dist /usr/share/nginx/html${BASE_PATH}
+# Same-origin docs, served alongside the app at ${BASE_PATH}docs/ — matches src/config.ts's DOCS_URL
+# default exactly, so the Docs button works out of the box with no per-deployment override needed.
+COPY --from=docs /docs-site /usr/share/nginx/html${BASE_PATH}docs/
 # Generate the nginx server config at BUILD time (not container start) so the served location can
 # never drift from the BASE_PATH the assets were actually built with (no envsubst/runtime templating).
 # nginx always listens on 80 internally in all three published images - external port choice is

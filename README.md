@@ -4,6 +4,28 @@
 
 This web application allows users to load their reconstructed volumes using `Bluesky Tiled Browser` into the `itk-vtk-viewer` widget, all within the same `React` web application.
 
+📖 **Full documentation (getting started + every feature) is available as an mkdocs site**, and is also
+built into the app itself — a **📖 Docs** button in the header opens it in an in-app iframe.
+
+- **Via `docker compose up`**: a `docs` service serves it automatically, proxied through the app at
+  `/tomo_viewer/docs/` — the Docs button just works, no setup needed.
+- **Via a published/deployed image** (`:local`/`:als-prod`/`:als-dev`): the docs are built into the
+  same image and served same-origin, at `<base path>docs/` (e.g. `/bl832/tomo_viewer/docs/`) — the Docs
+  button resolves this as a relative path, so it works regardless of which domain fronts the
+  deployment, with no docs URL/FQDN ever hardcoded into the app.
+- **Standalone**, outside the app (e.g. while writing docs):
+  ```bash
+  pip install -r requirements-docs.txt
+  mkdocs serve
+  ```
+  Then open http://127.0.0.1:8000/.
+
+To point the Docs button at a genuinely separate, externally-hosted docs site instead (or to hide it
+entirely), set `VITE_DOCS_URL` when building from source (`VITE_DOCS_URL=https://docs.example.com npm
+run build`, or `VITE_DOCS_URL= npm run build` to hide it) — see `src/config.ts`. This isn't exposed as
+a `react/Dockerfile` build arg, since the built-in same-origin docs already work correctly for every
+published image without needing a per-deployment override.
+
 ---
 
 # Installation via Docker (Recommended)

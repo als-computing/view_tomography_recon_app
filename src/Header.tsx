@@ -35,6 +35,10 @@ export interface HeaderProps {
   serverId?: TiledServerId;
   /** Switch the active Tiled server. */
   onSelectServer?: (id: TiledServerId) => void;
+  /** URL of the user documentation site. When unset, the Docs button is hidden entirely. */
+  docsUrl?: string;
+  /** Open the documentation site in an in-app iframe modal. */
+  onOpenDocs?: () => void;
 }
 
 export const Header = ({
@@ -47,6 +51,8 @@ export const Header = ({
   onToggleRenderer,
   serverId,
   onSelectServer,
+  docsUrl,
+  onOpenDocs,
 }: HeaderProps) => {
   const [selectedFolder, setSelectedFolder] = useState<string>('');
   const [copied, setCopied] = useState(false);
@@ -187,6 +193,16 @@ export const Header = ({
               }
             >
               Renderer: {renderer === 'webgpu' ? 'WebGPU' : 'ITK'} ⇄
+            </button>
+          )}
+          {docsUrl && onOpenDocs && (
+            <button
+              type="button"
+              className="header-docs-button"
+              onClick={onOpenDocs}
+              title="Open documentation"
+            >
+              📖 Docs
             </button>
           )}
         </div>

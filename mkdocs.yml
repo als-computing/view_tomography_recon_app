@@ -1,0 +1,73 @@
+site_name: Tomography Reconstruction Visualizer
+site_description: Documentation for the ALS beamline 8.3.2 tomography reconstruction viewer.
+docs_dir: docs
+
+theme:
+  name: material
+  logo: assets/logo.png
+  favicon: assets/favicon.png
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation (Docker): getting-started/installation.md
+      - Loading Your First Dataset: getting-started/first-dataset.md
+      - Installation From Source: getting-started/from-source.md
+  - Features:
+      - Tabs & Split Views: features/tabs-and-splits.md
+      - Choosing a Tiled Server: features/tiled-servers.md
+      - WebGPU Viewer — Navigation: features/webgpu-navigation.md
+      - WebGPU Viewer — Data & Loading: features/webgpu-data-panel.md
+      - WebGPU Viewer — Transfer Function: features/webgpu-transfer-function.md
+      - WebGPU Viewer — Rendering & Lighting: features/webgpu-rendering-lighting.md
+      - WebGPU Viewer — Post-Processing: features/webgpu-postfx.md
+      - WebGPU Viewer — Cropping & Slicing: features/webgpu-slicing.md
+      - WebGPU Viewer — Measurements: features/webgpu-measure.md
+      - WebGPU Viewer — Annotations & Masks: features/webgpu-masks.md
+      - WebGPU Viewer — Presets: features/webgpu-presets.md
+      - Linked 2D/3D Split View: features/linked-2d-3d.md
+      - Legacy ITK/VTK Viewer: features/itk-vtk-viewer.md
+      - Sharing a View (Share Links): features/share-links.md
+      - Live Notifications: features/notifications.md
+  - For Administrators:
+      - Deployment Overview: admin/deployment.md
+      - Configuring Tiled Servers: admin/configuring-tiled-servers.md
+  - Troubleshooting: troubleshooting.md

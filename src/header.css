@@ -57,9 +57,10 @@
   gap: 6px;
 }
 
-/* "Share" and "Renderer" buttons — quiet pills beside the folder picker and Tiled browse button. */
+/* "Share", "Renderer", and "Docs" buttons — quiet pills beside the folder picker and Tiled browse button. */
 .header-share-button,
-.header-renderer-toggle {
+.header-renderer-toggle,
+.header-docs-button {
   cursor: pointer;
   border: 0;
   border-radius: 3em;
@@ -74,12 +75,14 @@
 }
 
 .header-share-button:hover:not(:disabled),
-.header-renderer-toggle:hover:not(:disabled) {
+.header-renderer-toggle:hover:not(:disabled),
+.header-docs-button:hover:not(:disabled) {
   background-color: rgba(30, 167, 253, 0.1);
 }
 
 .header-share-button:disabled,
-.header-renderer-toggle:disabled {
+.header-renderer-toggle:disabled,
+.header-docs-button:disabled {
   opacity: 0.5;
   cursor: default;
 }

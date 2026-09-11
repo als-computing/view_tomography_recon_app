@@ -37,6 +37,14 @@ export default defineConfig({
         target: 'http://tiled:8000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/tiled/, '')
+      },
+      // Local-dev-only: proxies the Docs button (src/config.ts's DOCS_URL, relative to `base` — see
+      // there for why it's never a hardcoded host) to the `docs` compose service (`mkdocs serve`).
+      // Hardcoded to the default base path since the `dev` Docker stage never sets BASE_PATH.
+      '/tomo_viewer/docs': {
+        target: 'http://docs:8000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/tomo_viewer\/docs/, '')
       }
     }
   },

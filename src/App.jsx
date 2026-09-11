@@ -14,6 +14,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Header } from './Header';
+import IframeModal from './components/IframeModal';
+import { DOCS_URL } from './config';
 import './App.css';
 
 import { getDefaultZarrFileUrl, getTiledBaseUrl, getProcessedPath } from './utils';
@@ -76,6 +78,8 @@ function App() {
   // pane instances passed to useLinkedViewers.
   const instancesRef = useRef(new Map());
   const [instanceVersion, setInstanceVersion] = useState(0);
+  // Docs site opens in an in-app iframe modal rather than a new tab (see IframeModal).
+  const [docsOpen, setDocsOpen] = useState(false);
   // View state from a shared link, waiting to be replayed onto its viewer once it loads. Keyed by
   // the tab's zarr url (the tab id isn't known when the deep-link opens the tab).
   const pendingStateRef = useRef(new Map());
@@ -255,7 +259,12 @@ function App() {
         onToggleRenderer={toggleRenderer}
         serverId={serverId}
         onSelectServer={FIXED_SERVER_ID ? undefined : setServerId}
+        docsUrl={DOCS_URL}
+        onOpenDocs={DOCS_URL ? () => setDocsOpen(true) : undefined}
       />
+      {docsOpen && (
+        <IframeModal title="Documentation" url={DOCS_URL} onClose={() => setDocsOpen(false)} />
+      )}
       <TabBar
         tabs={tabs}
         activeLeftId={activeLeftId}
