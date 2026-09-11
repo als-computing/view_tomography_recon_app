@@ -41,6 +41,7 @@ services:
     build:
       context: .
       dockerfile: react/Dockerfile
+      target: dev
     expose:
       - "5174"
     restart: unless-stopped

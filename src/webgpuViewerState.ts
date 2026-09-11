@@ -42,14 +42,14 @@ export function captureWebGpuViewState(v: WebGpuViewerInstance): WebGpuCapturedS
 export function applyWebGpuViewState(v: WebGpuViewerInstance, state: WebGpuCapturedState): void {
   if (state.rendering) {
     try {
-      v.setRendering(state.rendering as Parameters<WebGpuViewerInstance['setRendering']>[0]);
+      v.setRendering(state.rendering as unknown as Parameters<WebGpuViewerInstance['setRendering']>[0]);
     } catch (error) {
       console.warn('applyWebGpuViewState: rendering apply failed:', error);
     }
   }
   if (state.cropping) {
     try {
-      v.setCropping(state.cropping as Parameters<WebGpuViewerInstance['setCropping']>[0]);
+      v.setCropping(state.cropping as unknown as Parameters<WebGpuViewerInstance['setCropping']>[0]);
     } catch (error) {
       console.warn('applyWebGpuViewState: cropping apply failed:', error);
     }

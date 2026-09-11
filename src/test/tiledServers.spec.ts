@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   TILED_SERVERS,
   DEFAULT_SERVER_ID,
@@ -50,5 +50,49 @@ describe("tiledServers", () => {
       expect(server.apiUrl.length).toBeGreaterThan(0);
       expect(server.oidcRedirectUrl.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("FIXED_SERVER_ID (locked builds)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("is undefined when VITE_FIXED_TILED_SERVER is unset (today's :local behavior)", async () => {
+    vi.stubEnv("VITE_FIXED_TILED_SERVER", "");
+    const mod = await import("../tiledServers");
+    expect(mod.FIXED_SERVER_ID).toBeUndefined();
+  });
+
+  it("locks to a valid server id when set", async () => {
+    vi.stubEnv("VITE_FIXED_TILED_SERVER", "production");
+    const mod = await import("../tiledServers");
+    expect(mod.FIXED_SERVER_ID).toBe("production");
+    expect(mod.getActiveServerId()).toBe("production");
+  });
+
+  it("ignores an invalid/unrecognized value (treated as unset)", async () => {
+    vi.stubEnv("VITE_FIXED_TILED_SERVER", "not-a-real-server");
+    const mod = await import("../tiledServers");
+    expect(mod.FIXED_SERVER_ID).toBeUndefined();
+  });
+
+  it("getActiveServerId ignores localStorage entirely once locked", async () => {
+    vi.stubEnv("VITE_FIXED_TILED_SERVER", "staging");
+    localStorage.setItem("tiledServerId", "production"); // an attempted override
+    const mod = await import("../tiledServers");
+    expect(mod.getActiveServerId()).toBe("staging");
+  });
+
+  it("setActiveServerId is a no-op once locked", async () => {
+    vi.stubEnv("VITE_FIXED_TILED_SERVER", "production");
+    const mod = await import("../tiledServers");
+    mod.setActiveServerId("staging");
+    expect(localStorage.getItem("tiledServerId")).toBeNull();
   });
 });

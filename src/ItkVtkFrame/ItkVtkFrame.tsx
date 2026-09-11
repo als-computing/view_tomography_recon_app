@@ -7,7 +7,7 @@ type ItkVtkViewerProps = {
 };
 
 export default function ItkVtkFrame({ dataUrl }: ItkVtkViewerProps) {
-  const [size, setSize] = useState({ width: 400, height: 401 });
+  const [, setSize] = useState({ width: 400, height: 401 });
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
   useEffect(() => {

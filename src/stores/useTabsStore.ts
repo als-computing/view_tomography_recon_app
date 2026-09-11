@@ -19,6 +19,7 @@ import { create } from 'zustand';
 import {
   getActiveServerId,
   setActiveServerId,
+  FIXED_SERVER_ID,
   type TiledServerId,
 } from '../tiledServers';
 
@@ -295,6 +296,11 @@ export const useTabsStore = create<TabsState>()((set, get) => {
     toggleRenderer: () => set((s) => ({ renderer: s.renderer === 'itk' ? 'webgpu' : 'itk' })),
     setServerId: (id) => {
       if (id === get().serverId) return;
+      if (FIXED_SERVER_ID) return; // locked build - no-op, same defense-in-depth reasoning as
+      // setActiveServerId's own guard in tiledServers.ts (don't rely solely on the dropdown being
+      // hidden); every real consumer bypasses this store field and reads getActiveServer() directly
+      // regardless, so this specifically guards against a future code path calling setServerId some
+      // other way (not a currently-reachable bug).
       setActiveServerId(id);
       // A Tiled access/refresh token is only valid for the server that issued it, but
       // @blueskyproject/tiled stores it under one flat, non-server-scoped localStorage key

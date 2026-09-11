@@ -17,7 +17,7 @@ import { Header } from './Header';
 import './App.css';
 
 import { getDefaultZarrFileUrl, getTiledBaseUrl, getProcessedPath } from './utils';
-import { getActiveServer } from './tiledServers';
+import { getActiveServer, FIXED_SERVER_ID } from './tiledServers';
 import { installTiledTokenBridge } from './tiledTokenBridge';
 import { installTiledFetchInterceptor } from './ItkVtkNative/tiledAuth';
 import ItkVktNative from './ItkVtkNative/ItkVtkNative';
@@ -254,7 +254,7 @@ function App() {
         renderer={renderer}
         onToggleRenderer={toggleRenderer}
         serverId={serverId}
-        onSelectServer={setServerId}
+        onSelectServer={FIXED_SERVER_ID ? undefined : setServerId}
       />
       <TabBar
         tabs={tabs}

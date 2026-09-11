@@ -40,11 +40,43 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
-      - name: Build and push Docker image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
+
+      - name: Build and push local image
         uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
         with:
           context: .
           file: react/Dockerfile
+          target: prod
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            BASE_PATH=/tomo_viewer/
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:local
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Build and push ALS production image
+        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        with:
+          context: .
+          file: react/Dockerfile
+          target: prod
+          push: true
+          build-args: |
+            BASE_PATH=/bl832/tomo_viewer/
+            FIXED_TILED_SERVER=production
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:als-prod
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Build and push ALS dev/staging image
+        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        with:
+          context: .
+          file: react/Dockerfile
+          target: prod
+          push: true
+          build-args: |
+            BASE_PATH=/bl832/tomo_viewer_dev/
+            FIXED_TILED_SERVER=staging
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:als-dev
           labels: ${{ steps.meta.outputs.labels }}

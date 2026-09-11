@@ -8,8 +8,10 @@ import react from '@vitejs/plugin-react';
 const zarrViewerSrc = resolve(import.meta.dirname, 'src/zarr-viewer/src');
 
 export default defineConfig({
-  // This should match how your Vite server is running
-  base: '/tomo_viewer/',
+  // BASE_PATH is a build-time-only Node env var (read via process.env, not import.meta.env — it's
+  // consumed here in Vite's own Node config context, not by client code). Falls back to today's
+  // value so local `npm run dev`/`vite build` behavior is unchanged when unset.
+  base: process.env.BASE_PATH || '/tomo_viewer/',
   resolve: {
     alias: {
       '@zarr-viewer/core': resolve(zarrViewerSrc, 'core/index.ts'),

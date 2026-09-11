@@ -1,14 +1,15 @@
 /**
  * tiledServers.ts
  *
- * Single source of truth for the selectable Tiled servers (Local vs Remote). All server-specific
- * addresses live here — nothing is hard-coded in components or read from build-time `VITE_*` env
- * (which is inlined at build and can't be switched at runtime). The active choice is persisted in
- * `localStorage` so non-React helpers (utils.ts) can read it synchronously; the header dropdown writes
- * it and re-renders the app (remounting the Tiled widget and re-installing the auth interceptor).
+ * Single source of truth for the selectable Tiled servers (Local vs Remote vs Production). All
+ * server-specific addresses live here — nothing is hard-coded in components or read from build-time
+ * `VITE_*` env (which is inlined at build and can't be switched at runtime). The active choice is
+ * persisted in `localStorage` so non-React helpers (utils.ts) can read it synchronously; the header
+ * dropdown writes it and re-renders the app (remounting the Tiled widget and re-installing the auth
+ * interceptor).
  */
 
-export type TiledServerId = 'local' | 'staging';
+export type TiledServerId = 'local' | 'staging' | 'production';
 
 export interface TiledServer {
   id: TiledServerId;
@@ -48,17 +49,40 @@ export const TILED_SERVERS: readonly TiledServer[] = [
     oidcRedirectUrl: 'http://tiled-test:5174/tomo_viewer/',
     supportsStream: true,
   },
+  {
+    id: 'production',
+    label: 'Production',
+    apiUrl: 'https://tiled.als.lbl.gov/api/v1',
+    processedPath: 'beamlines/bl832/processed',
+    defaultFileId: '',
+    oidcRedirectUrl: 'https://hub.als.lbl.gov/bl832/tomo_viewer/',
+    supportsStream: true,
+  },
 ];
 
 export const DEFAULT_SERVER_ID: TiledServerId = 'local';
 
 const STORAGE_KEY = 'tiledServerId';
 
+/**
+ * Build-time-only (Vite auto-inlines VITE_-prefixed vars into import.meta.env at build time - see
+ * react/Dockerfile's `build` stage `ARG FIXED_TILED_SERVER`). When set to a valid TiledServerId, the
+ * app is locked to that one server: getActiveServerId() always returns it (ignoring localStorage/the
+ * default), and setActiveServerId() becomes a no-op. Unset (the :local image's default) preserves
+ * today's exact behavior - full switcher, last choice persisted in localStorage.
+ */
+const rawFixedServer = import.meta.env.VITE_FIXED_TILED_SERVER as string | undefined;
+export const FIXED_SERVER_ID: TiledServerId | undefined =
+  rawFixedServer === 'local' || rawFixedServer === 'staging' || rawFixedServer === 'production'
+    ? rawFixedServer
+    : undefined;
+
 /** The persisted active server id (falls back to the default if unset/invalid). */
 export const getActiveServerId = (): TiledServerId => {
+  if (FIXED_SERVER_ID) return FIXED_SERVER_ID;
   try {
     const v = localStorage.getItem(STORAGE_KEY);
-    if (v === 'local' || v === 'staging') return v;
+    if (v === 'local' || v === 'staging' || v === 'production') return v;
   } catch {
     /* localStorage unavailable — use default */
   }
@@ -71,6 +95,8 @@ export const getActiveServer = (): TiledServer =>
 
 /** Persist the active server id. Callers should then re-render (remount widget, re-install interceptor). */
 export const setActiveServerId = (id: TiledServerId): void => {
+  if (FIXED_SERVER_ID) return; // locked build - the dropdown is hidden (see App.jsx), but stay a
+  // no-op here too rather than relying solely on the UI being absent.
   try {
     localStorage.setItem(STORAGE_KEY, id);
   } catch {

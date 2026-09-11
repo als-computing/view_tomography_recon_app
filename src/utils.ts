@@ -319,7 +319,11 @@ export const fetchTiledContainerChildren = async (
             );
         }
         const json = await response.json();
-        const data: any[] = Array.isArray(json?.data) ? json.data : [];
+        const data: Array<{ id?: string; attributes?: { structure_family?: string } }> = Array.isArray(
+            json?.data,
+        )
+            ? json.data
+            : [];
         for (const entry of data) {
             const family = entry?.attributes?.structure_family;
             // Keep containers (folders). Some tiled servers omit structure_family from search

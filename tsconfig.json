@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["@webgpu/types", "node"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      // WebGpuNative.tsx (root app) imports zarr-viewer via these aliases, which only exist at Vite
+      // build time (see vite.config.js's `resolve.alias`). TypeScript always follows real, resolvable
+      // relative imports regardless of `exclude`, so WebGpuNative.tsx transitively pulls the whole
+      // zarr-viewer source tree into this project's typecheck too — mirror its own tsconfig's `paths`
+      // (src/zarr-viewer/tsconfig.json) so that reachable subgraph resolves and checks the same way it
+      // already does under zarr-viewer's own, separately-run typecheck (which passes).
+      "@zarr-viewer/core": ["src/zarr-viewer/src/core/index.ts"],
+      "@zarr-viewer/math": ["src/zarr-viewer/src/math/index.ts"],
+      "@zarr-viewer/scene": ["src/zarr-viewer/src/scene/index.ts"],
+      "@zarr-viewer/controls": ["src/zarr-viewer/src/controls/index.ts"],
+      "@zarr-viewer/io": ["src/zarr-viewer/src/io/index.ts"],
+      "@zarr-viewer/render": ["src/zarr-viewer/src/render/index.ts"],
+      "@zarr-viewer/fx": ["src/zarr-viewer/src/fx/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.js"],
+  // src/zarr-viewer is excluded from this project's own root file scan (it has its own separate
+  // tsconfig.json/typecheck script/CI step) — but `exclude` only trims the root scan, not transitive
+  // module resolution, so files actually reached via WebGpuNative.tsx's real imports (through the
+  // `paths` mapping above) are still resolved and checked; only zarr-viewer's OWN unreached files
+  // (tests, fixtures, etc.) are skipped by this.
+  "exclude": ["node_modules", "dist", "src/zarr-viewer"]
+}
