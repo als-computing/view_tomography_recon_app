@@ -1,6 +1,7 @@
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { yamlPlugin } from './vite-yaml-plugin.js';
 
 // The WebGPU renderer under src/zarr-viewer/ is a self-contained app that imports its own source
 // through these path aliases. Mirror them here (pointing at the same source) so the main app can
@@ -48,7 +49,7 @@ export default defineConfig({
       }
     }
   },
-  plugins: [react()]
+  plugins: [react(), yamlPlugin()]
 });
 
 

@@ -1,13 +1,18 @@
 /**
  * tiledServers.ts
  *
- * Single source of truth for the selectable Tiled servers (Local vs Remote vs Production). All
- * server-specific addresses live here — nothing is hard-coded in components or read from build-time
- * `VITE_*` env (which is inlined at build and can't be switched at runtime). The active choice is
- * persisted in `localStorage` so non-React helpers (utils.ts) can read it synchronously; the header
- * dropdown writes it and re-renders the app (remounting the Tiled widget and re-installing the auth
- * interceptor).
+ * Single source of truth for the selectable Tiled servers (Local vs Remote vs Production). The
+ * actual server data (URLs, labels, OIDC redirects) lives in the repo root's `config.yml`, not here —
+ * this file only owns the type/validation/lookup logic, so a deployer can edit server addresses
+ * without touching TypeScript. `config.yml` is read at build time (via vite-yaml-plugin.js, shared by
+ * vite.config.js/vitest.config.ts) and inlined into the bundle, same timing/cost as a hand-written
+ * data file — nothing about this is fetched or re-parsed at runtime.
+ *
+ * The active choice is persisted in `localStorage` so non-React helpers (utils.ts) can read it
+ * synchronously; the header dropdown writes it and re-renders the app (remounting the Tiled widget
+ * and re-installing the auth interceptor).
  */
+import rawConfig from '../config.yml';
 
 export type TiledServerId = 'local' | 'staging' | 'production';
 
@@ -30,37 +35,62 @@ export interface TiledServer {
   supportsStream: boolean;
 }
 
-export const TILED_SERVERS: readonly TiledServer[] = [
-  {
-    id: 'local',
-    label: 'Local',
-    apiUrl: 'http://localhost:8001/api/v1',
-    processedPath: '',
-    defaultFileId: 'scans/petiole22',
-    oidcRedirectUrl: 'http://tiled-test:5174/tomo_viewer/',
-    supportsStream: false,
-  },
-  {
-    id: 'staging',
-    label: 'Remote',
-    apiUrl: 'https://tiled-staging.als.lbl.gov/api/v1',
-    processedPath: 'beamlines/bl832/processed',
-    defaultFileId: '',
-    oidcRedirectUrl: 'http://tiled-test:5174/tomo_viewer/',
-    supportsStream: true,
-  },
-  {
-    id: 'production',
-    label: 'Production',
-    apiUrl: 'https://tiled.als.lbl.gov/api/v1',
-    processedPath: 'beamlines/bl832/processed',
-    defaultFileId: '',
-    oidcRedirectUrl: 'https://hub.als.lbl.gov/bl832/tomo_viewer/',
-    supportsStream: true,
-  },
-];
+interface ConfigYamlServerEntry {
+  label: string;
+  apiUrl: string;
+  processedPath: string;
+  defaultFileId: string;
+  oidcRedirectUrl: string;
+  supportsStream: boolean;
+}
 
-export const DEFAULT_SERVER_ID: TiledServerId = 'local';
+interface ConfigYamlShape {
+  tiledServers: Record<string, ConfigYamlServerEntry>;
+  defaultServerId: string;
+}
+
+const ALL_SERVER_IDS: readonly TiledServerId[] = ['local', 'staging', 'production'];
+
+const isTiledServerId = (v: unknown): v is TiledServerId =>
+  v === 'local' || v === 'staging' || v === 'production';
+
+/** Fail loudly and specifically at import time rather than surfacing a confusing runtime error later. */
+const buildTiledServers = (): readonly TiledServer[] => {
+  const config = rawConfig as ConfigYamlShape;
+  if (!config || typeof config !== 'object' || typeof config.tiledServers !== 'object') {
+    throw new Error('config.yml is missing its top-level "tiledServers" map.');
+  }
+  return ALL_SERVER_IDS.map((id) => {
+    const entry = config.tiledServers[id];
+    if (!entry) {
+      throw new Error(`config.yml's "tiledServers" is missing a required "${id}" entry.`);
+    }
+    for (const field of ['label', 'apiUrl', 'processedPath', 'defaultFileId', 'oidcRedirectUrl'] as const) {
+      if (typeof entry[field] !== 'string') {
+        throw new Error(`config.yml's tiledServers.${id}.${field} must be a string.`);
+      }
+    }
+    if (typeof entry.supportsStream !== 'boolean') {
+      throw new Error(`config.yml's tiledServers.${id}.supportsStream must be a boolean.`);
+    }
+    return { id, ...entry };
+  });
+};
+
+const buildDefaultServerId = (): TiledServerId => {
+  const config = rawConfig as ConfigYamlShape;
+  const v = config?.defaultServerId;
+  if (!isTiledServerId(v)) {
+    throw new Error(
+      `config.yml's "defaultServerId" ("${String(v)}") must be one of: ${ALL_SERVER_IDS.join(', ')}.`,
+    );
+  }
+  return v;
+};
+
+export const TILED_SERVERS: readonly TiledServer[] = buildTiledServers();
+
+export const DEFAULT_SERVER_ID: TiledServerId = buildDefaultServerId();
 
 const STORAGE_KEY = 'tiledServerId';
 
@@ -72,17 +102,16 @@ const STORAGE_KEY = 'tiledServerId';
  * today's exact behavior - full switcher, last choice persisted in localStorage.
  */
 const rawFixedServer = import.meta.env.VITE_FIXED_TILED_SERVER as string | undefined;
-export const FIXED_SERVER_ID: TiledServerId | undefined =
-  rawFixedServer === 'local' || rawFixedServer === 'staging' || rawFixedServer === 'production'
-    ? rawFixedServer
-    : undefined;
+export const FIXED_SERVER_ID: TiledServerId | undefined = isTiledServerId(rawFixedServer)
+  ? rawFixedServer
+  : undefined;
 
 /** The persisted active server id (falls back to the default if unset/invalid). */
 export const getActiveServerId = (): TiledServerId => {
   if (FIXED_SERVER_ID) return FIXED_SERVER_ID;
   try {
     const v = localStorage.getItem(STORAGE_KEY);
-    if (v === 'local' || v === 'staging' || v === 'production') return v;
+    if (isTiledServerId(v)) return v;
   } catch {
     /* localStorage unavailable — use default */
   }
