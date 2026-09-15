@@ -11,7 +11,7 @@
  *
  * Deliberately **relative to the app's own base path** by default — `${BASE_URL}docs/` (e.g.
  * `/bl832/tomo_viewer/docs/`) — never a hardcoded host/FQDN. The docs site is built and served
- * alongside the app itself (react/Dockerfile's `docs` stage, copied into `prod` under that same
+ * alongside the app itself (Dockerfile's `docs` stage, copied into `prod` under that same
  * path; the Vite dev server proxies it to the `docs` container — see vite.config.js), so this one
  * relative path resolves correctly on every deployment (`:local`, `:als-prod`, `:als-staging`) and in
  * local dev, with no per-environment override needed.

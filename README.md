@@ -23,7 +23,7 @@ built into the app itself — a **📖 Docs** button in the header opens it in a
 To point the Docs button at a genuinely separate, externally-hosted docs site instead (or to hide it
 entirely), set `VITE_DOCS_URL` when building from source (`VITE_DOCS_URL=https://docs.example.com npm
 run build`, or `VITE_DOCS_URL= npm run build` to hide it) — see `src/config.ts`. This isn't exposed as
-a `react/Dockerfile` build arg, since the built-in same-origin docs already work correctly for every
+a `Dockerfile` build arg, since the built-in same-origin docs already work correctly for every
 published image without needing a per-deployment override.
 
 ---
@@ -54,7 +54,7 @@ Create a new file `.env` in `view_tomography_recon_app/` (or rename `.env.exampl
 DATA_PATH=/absolute/path/to/your/reconstructions/wherever/they/are
 ```
 
-`docker-compose.yml`'s `tiled` service serves that directory directly (`tiled serve directory ... --public`) - no registration step, no API key, no separate Tiled checkout. Subfolders show up as datasets by name. Tiled server URL/paths/default-dataset are configured in `src/tiledServers.ts` (`TILED_SERVERS`), not via env vars - edit that file if you need to point at a different local port or Tiled server.
+`docker-compose.yml`'s `tiled` service serves that directory directly (`tiled serve directory ... --public`) - no registration step, no API key, no separate Tiled checkout. Subfolders show up as datasets by name. Tiled server URL/paths/default-dataset are configured in the repo root's `config.yml` (`tiledServers`), not via env vars - edit that file if you need to point at a different local port or Tiled server.
 
 If your reconstructions have awkward on-disk names and you want friendlier dataset names in the catalog without renaming/copying the actual files, create a `docker-compose.override.yml` (gitignored, machine-specific - Docker Compose merges it automatically) that adds per-dataset bind mounts to the `tiled` service, e.g.:
 
@@ -109,15 +109,15 @@ If you update the `.env` file, you can restart the whole application by running 
 
 The docker-compose flow above runs the Vite **dev server** — good for local development, not for
 deployment. For deployment, the app instead builds three separate, purpose-built production images
-from the same `react/Dockerfile` (`target: prod`), differing only in build args. See
+from the same root-level `Dockerfile` (`target: prod`), differing only in build args. See
 [`docs/admin/deployment.md`](docs/admin/deployment.md) for the full picture (why three images, HTTPS
 requirements, the server-locking mechanism, etc.) — this section is just the commands.
 
 | Tag | Build command |
 |---|---|
-| `:local` | `docker build --target prod --build-arg BASE_PATH=/tomo_viewer/ -f react/Dockerfile -t view_tomography_recon_app:local .` |
-| `:als-prod` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=tiled.als.lbl.gov -f react/Dockerfile -t view_tomography_recon_app:als-prod .` |
-| `:als-staging` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=tiled-staging.als.lbl.gov -f react/Dockerfile -t view_tomography_recon_app:als-staging .` |
+| `:local` | `docker build --target prod --build-arg BASE_PATH=/tomo_viewer/ -t view_tomography_recon_app:local .` |
+| `:als-prod` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=tiled.als.lbl.gov -t view_tomography_recon_app:als-prod .` |
+| `:als-staging` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=tiled-staging.als.lbl.gov -t view_tomography_recon_app:als-staging .` |
 
 - `:local` shows the full Local/Remote/Production server dropdown (same as the dev-server flow above) —
   useful for testing against any of the three Tiled servers from one image.

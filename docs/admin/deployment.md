@@ -7,13 +7,13 @@ for end users viewing their own data locally. For local use, see
 ## Published images
 
 Every push to `main` (or a `v*` tag) builds and publishes **three** images to `ghcr.io`, all from the
-same multi-stage `react/Dockerfile`, differing only in build-time configuration:
+same multi-stage root-level `Dockerfile`, differing only in build-time configuration:
 
 | Tag | Base path | Tiled server | Server dropdown |
 |---|---|---|---|
 | `:local` | `/tomo_viewer/` | Configurable at runtime (persisted in the browser) | Shown — full Local/Remote/Production switcher |
 | `:als-prod` | `/bl832/tomo_viewer/` | Locked to production (`tiled.als.lbl.gov`) | Hidden |
-| `:als-staging` | `/bl832/tomo_viewer_staging/` | Locked to staging (`tiled-staging.als.lbl.gov`) | Hidden |
+| `:als-staging` | `/bl832/tomo_viewer/` | Locked to staging (`tiled-staging.als.lbl.gov`) | Hidden |
 
 All three serve static, production-built assets via nginx (gzip compression, immutable long-lived
 caching on hashed asset filenames, `index.html` never cached) — none of them run the Vite dev server.
@@ -52,7 +52,7 @@ docker build \
   --build-arg BASE_PATH=/your/custom/path/ \
   --build-arg FIXED_TILED_SERVER=tiled.als.lbl.gov \
   -t my-custom-image \
-  -f react/Dockerfile .
+  .
 ```
 
 - `BASE_PATH` — must include both a leading and trailing slash. This is baked into the built JS/CSS
@@ -74,5 +74,5 @@ stage (used by the published images above) is never built by `docker compose` un
 explicitly:
 
 ```bash
-docker build --target prod --build-arg BASE_PATH=/tomo_viewer/ -f react/Dockerfile . -t test-prod
+docker build --target prod --build-arg BASE_PATH=/tomo_viewer/ . -t test-prod
 ```

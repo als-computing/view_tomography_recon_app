@@ -2,7 +2,7 @@
 /**
  * validate-fixed-tiled-server.mjs
  *
- * Real build-time gate for FIXED_TILED_SERVER (see react/Dockerfile's `build` stage). A bad hostname
+ * Real build-time gate for FIXED_TILED_SERVER (see Dockerfile's `build` stage). A bad hostname
  * here can't be caught by src/tiledServers.ts's own runtime check alone — `vite build` only bundles
  * JS, it never executes the app's module graph, so a `throw` at module scope in a browser-only module
  * doesn't fail the build; it would only surface later, as a crashed page, once someone actually opens

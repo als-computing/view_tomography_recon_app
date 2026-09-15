@@ -40,7 +40,6 @@ services:
   react:
     build:
       context: .
-      dockerfile: react/Dockerfile
       target: dev
     expose:
       - "5174"
@@ -51,14 +50,13 @@ services:
       - docs
 
   # Serves the mkdocs user documentation, proxied through the react dev server at
-  # /tomo_viewer/docs/ (see vite.config.js's proxy). Reuses react/Dockerfile's own `docs` build stage
-  # (mkdocs + its deps already installed there, cached like any other image layer - no per-startup
-  # `pip install`), just overriding its command to serve instead of build. Built images instead bake
-  # a static copy of that same stage's output into the prod nginx stage.
+  # /tomo_viewer/docs/ (see vite.config.js's proxy). Reuses the root Dockerfile's own `docs` build
+  # stage (mkdocs + its deps already installed there, cached like any other image layer - no
+  # per-startup `pip install`), just overriding its command to serve instead of build. Built images
+  # instead bake a static copy of that same stage's output into the prod nginx stage.
   docs:
     build:
       context: .
-      dockerfile: react/Dockerfile
       target: docs
     command: mkdocs serve -a 0.0.0.0:8000
     expose:

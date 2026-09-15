@@ -37,5 +37,5 @@ tiledServers:
     supportsStream: true
 
 # Which server is active when nothing is persisted in localStorage and the build isn't locked via
-# FIXED_TILED_SERVER (see src/tiledServers.ts / react/Dockerfile).
+# FIXED_TILED_SERVER (see src/tiledServers.ts / Dockerfile).
 defaultServerId: local

@@ -105,7 +105,7 @@ const hostOf = (apiUrl: string): string => {
 
 /**
  * Build-time-only (Vite auto-inlines VITE_-prefixed vars into import.meta.env at build time - see
- * react/Dockerfile's `build` stage `ARG FIXED_TILED_SERVER`). Set to a Tiled server's hostname (e.g.
+ * Dockerfile's `build` stage `ARG FIXED_TILED_SERVER`). Set to a Tiled server's hostname (e.g.
  * `tiled.als.lbl.gov`), matched against TILED_SERVERS' own `apiUrl` hosts, to lock the app to that one
  * server: getActiveServerId() always returns it (ignoring localStorage/the default), and
  * setActiveServerId() becomes a no-op. Unset (the :local image's default) preserves today's exact
