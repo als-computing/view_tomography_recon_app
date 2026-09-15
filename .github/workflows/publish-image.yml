@@ -64,7 +64,7 @@ jobs:
           push: true
           build-args: |
             BASE_PATH=/bl832/tomo_viewer/
-            FIXED_TILED_SERVER=production
+            FIXED_TILED_SERVER=tiled.als.lbl.gov
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:als-prod
           labels: ${{ steps.meta.outputs.labels }}
 
@@ -76,7 +76,7 @@ jobs:
           target: prod
           push: true
           build-args: |
-            BASE_PATH=/bl832/tomo_viewer_staging/
-            FIXED_TILED_SERVER=staging
+            BASE_PATH=/bl832/tomo_viewer/
+            FIXED_TILED_SERVER=tiled-staging.als.lbl.gov
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:als-staging
           labels: ${{ steps.meta.outputs.labels }}
