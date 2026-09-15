@@ -13,7 +13,7 @@ same multi-stage `react/Dockerfile`, differing only in build-time configuration:
 |---|---|---|---|
 | `:local` | `/tomo_viewer/` | Configurable at runtime (persisted in the browser) | Shown — full Local/Remote/Production switcher |
 | `:als-prod` | `/bl832/tomo_viewer/` | Locked to production (`tiled.als.lbl.gov`) | Hidden |
-| `:als-dev` | `/bl832/tomo_viewer_dev/` | Locked to staging (`tiled-staging.als.lbl.gov`) | Hidden |
+| `:als-staging` | `/bl832/tomo_viewer_staging/` | Locked to staging (`tiled-staging.als.lbl.gov`) | Hidden |
 
 All three serve static, production-built assets via nginx (gzip compression, immutable long-lived
 caching on hashed asset filenames, `index.html` never cached) — none of them run the Vite dev server.
@@ -29,7 +29,7 @@ upstream (e.g. at ALS's own reverse proxy/ingress) before traffic reaches the co
 
 !!! warning "HTTPS is required for the WebGPU renderer"
     The WebGPU renderer needs a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts)
-    (HTTPS, or `localhost`). Serve `:als-prod`/`:als-dev` behind HTTPS, or the app will silently fall
+    (HTTPS, or `localhost`). Serve `:als-prod`/`:als-staging` behind HTTPS, or the app will silently fall
     back to the [ITK/VTK renderer](../features/itk-vtk-viewer.md) for every user.
 
 ## Why three images instead of one configurable image
@@ -37,7 +37,7 @@ upstream (e.g. at ALS's own reverse proxy/ingress) before traffic reaches the co
 - **`:local`** matches today's local-dev experience exactly — anyone can point it at any Tiled server
   via the dropdown, and it defaults to `/tomo_viewer/` so it drops into the existing `docker-compose.yml`
   setup unchanged.
-- **`:als-prod`** and **`:als-dev`** are locked, single-purpose deployments: no dropdown means no risk of
+- **`:als-prod`** and **`:als-staging`** are locked, single-purpose deployments: no dropdown means no risk of
   someone accidentally pointing a "production" deployment at staging data (or vice versa), and each has
   its own base path so both can run side-by-side on the same host without colliding.
 

@@ -19,7 +19,7 @@ CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5174"]
 # ---------- docs: static mkdocs build, embedded into prod under ${BASE_PATH}docs/ ----------
 # Built here (not as a separate published artifact) so the Docs button (src/config.ts's DOCS_URL)
 # can stay a same-origin relative path — no docs FQDN/host is ever baked into the app bundle,
-# regardless of which domain actually fronts a given deployment (:local, :als-prod, :als-dev).
+# regardless of which domain actually fronts a given deployment (:local, :als-prod, :als-staging).
 FROM python:3.12-slim AS docs
 WORKDIR /docs
 COPY requirements-docs.txt ./
@@ -34,7 +34,7 @@ ARG BASE_PATH=/tomo_viewer/
 ENV BASE_PATH=${BASE_PATH}
 # Empty (default) = the local/staging/production dropdown is shown, exactly like today (:local).
 # Set to 'production' or 'staging' to hide the dropdown and lock the app to that one server (:als-prod/
-# :als-dev) — see src/tiledServers.ts's FIXED_SERVER_ID. Vite auto-inlines any VITE_-prefixed
+# :als-staging) — see src/tiledServers.ts's FIXED_SERVER_ID. Vite auto-inlines any VITE_-prefixed
 # process.env var into import.meta.env at build time, no vite.config.js change needed for this one
 # (unlike BASE_PATH, which vite.config.js itself consumes).
 ARG FIXED_TILED_SERVER=""

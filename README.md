@@ -9,7 +9,7 @@ built into the app itself — a **📖 Docs** button in the header opens it in a
 
 - **Via `docker compose up`**: a `docs` service serves it automatically, proxied through the app at
   `/tomo_viewer/docs/` — the Docs button just works, no setup needed.
-- **Via a published/deployed image** (`:local`/`:als-prod`/`:als-dev`): the docs are built into the
+- **Via a published/deployed image** (`:local`/`:als-prod`/`:als-staging`): the docs are built into the
   same image and served same-origin, at `<base path>docs/` (e.g. `/bl832/tomo_viewer/docs/`) — the Docs
   button resolves this as a relative path, so it works regardless of which domain fronts the
   deployment, with no docs URL/FQDN ever hardcoded into the app.
@@ -31,9 +31,11 @@ published image without needing a per-deployment override.
 # Installation via Docker (Recommended)
 
 ## Install Docker
-Before you begin, make sure you have Docker installed on your machine.
+Before you begin, make sure you have Docker (the `docker` CLI + a running daemon, plus the `docker compose` plugin) installed on your machine. Any of the following work — this repo doesn't depend on Docker Desktop specifically:
 
-- [Download Docker Desktop](https://www.docker.com/)
+- [Docker Desktop](https://www.docker.com/) — official, free for personal/small-business use, available for macOS/Windows/Linux.
+- [Colima](https://github.com/abiosoft/colima) — open-source, macOS/Linux, a lightweight Docker Desktop alternative (`brew install docker docker-compose colima`, then `colima start`).
+- [Podman Desktop](https://podman-desktop.io/) or [OrbStack](https://orbstack.dev/) — other common alternatives; either works as long as `docker`/`docker compose` resolve on your `PATH`.
 
 ## Clone repository
 Next, clone this repository.
@@ -100,6 +102,55 @@ Since there are a few connected services, you may run into issues. To get a sens
 If you update the `.env` file, you can restart the whole application by running `docker compose up -d --force-recreate` to pick up your changes.
   
 
+
+---
+
+# Building the deployment images
+
+The docker-compose flow above runs the Vite **dev server** — good for local development, not for
+deployment. For deployment, the app instead builds three separate, purpose-built production images
+from the same `react/Dockerfile` (`target: prod`), differing only in build args. See
+[`docs/admin/deployment.md`](docs/admin/deployment.md) for the full picture (why three images, HTTPS
+requirements, the server-locking mechanism, etc.) — this section is just the commands.
+
+| Tag | Build command |
+|---|---|
+| `:local` | `docker build --target prod --build-arg BASE_PATH=/tomo_viewer/ -f react/Dockerfile -t view_tomography_recon_app:local .` |
+| `:als-prod` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=production -f react/Dockerfile -t view_tomography_recon_app:als-prod .` |
+| `:als-staging` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer_staging/ --build-arg FIXED_TILED_SERVER=staging -f react/Dockerfile -t view_tomography_recon_app:als-staging .` |
+
+- `:local` shows the full Local/Remote/Production server dropdown (same as the dev-server flow above) —
+  useful for testing against any of the three Tiled servers from one image.
+- `:als-prod`/`:als-staging` are each locked to one Tiled server (dropdown hidden) — these are exactly
+  what gets published to `ghcr.io` on merge (see below).
+
+Run any of them the same way:
+
+```bash
+docker run -d -p 5174:80 view_tomography_recon_app:local
+```
+
+Then open `http://localhost:5174/tomo_viewer/` (adjust the path to match whichever `BASE_PATH` you built with).
+
+## Pulling the published images
+
+Once `remote-tiled` merges to `main`, [`.github/workflows/publish-image.yml`](.github/workflows/publish-image.yml)
+automatically builds and pushes all three images to `ghcr.io` on every push to `main` (and any `v*` tag)
+— no manual build needed after that point:
+
+```bash
+docker pull ghcr.io/als-computing/view_tomography_recon_app:local
+docker pull ghcr.io/als-computing/view_tomography_recon_app:als-prod
+docker pull ghcr.io/als-computing/view_tomography_recon_app:als-staging
+```
+
+```bash
+docker run -d -p 8080:80 ghcr.io/als-computing/view_tomography_recon_app:als-prod
+```
+
+Note: depending on the GHCR package's visibility setting (public vs. private, configured separately in
+GitHub's package settings after the first push), pulling may require `docker login ghcr.io` first even
+though pushing always does.
 
 ---
 

@@ -68,7 +68,7 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:als-prod
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Build and push ALS dev/staging image
+      - name: Build and push ALS staging image
         uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
         with:
           context: .
@@ -76,7 +76,7 @@ jobs:
           target: prod
           push: true
           build-args: |
-            BASE_PATH=/bl832/tomo_viewer_dev/
+            BASE_PATH=/bl832/tomo_viewer_staging/
             FIXED_TILED_SERVER=staging
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:als-dev
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:als-staging
           labels: ${{ steps.meta.outputs.labels }}
