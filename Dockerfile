@@ -15,10 +15,11 @@ COPY . .
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 
-# ---------- dev: exact current behavior, used by docker-compose local dev ----------
+# ---------- dev: shared dependency layer, used by docker-compose local dev ----------
+# No EXPOSE/CMD here on purpose - running the Vite dev server is only appropriate on a development
+# machine, not baked into an image that could otherwise be mistaken for something deployable.
+# docker-compose.yml's `react` service supplies both (command: + expose:) itself at the compose layer.
 FROM base AS dev
-EXPOSE 5174
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5174"]
 
 # ---------- docs: static mkdocs build, embedded into prod under ${BASE_PATH}docs/ ----------
 # Built here (not as a separate published artifact) so the Docs button (src/config.ts's DOCS_URL)

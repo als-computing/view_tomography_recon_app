@@ -40,20 +40,21 @@ services:
   react:
     build:
       context: .
-      target: dev
+      target: prod
+      args:
+        BASE_PATH: /tomo_viewer/
+    # Real production build (minified, gzip'd, served by react's own nginx on port 80) - not the Vite
+    # dev server. No hot-reload: a code change needs `docker compose build react` + restart to show up.
     expose:
-      - "5174"
+      - "80"
     restart: unless-stopped
     networks:
       - webnet
-    depends_on:
-      - docs
 
-  # Serves the mkdocs user documentation, proxied through the react dev server at
-  # /tomo_viewer/docs/ (see vite.config.js's proxy). Reuses the root Dockerfile's own `docs` build
-  # stage (mkdocs + its deps already installed there, cached like any other image layer - no
-  # per-startup `pip install`), just overriding its command to serve instead of build. Built images
-  # instead bake a static copy of that same stage's output into the prod nginx stage.
+  # Serves the mkdocs user documentation live (mkdocs serve). Not currently reachable by anything -
+  # react's own prod build already bakes a static copy of the docs in at build time (see the Dockerfile's
+  # `prod` stage), so nginx.conf's proxy has no route pointed at this service. Left running/defined
+  # rather than removed.
   docs:
     build:
       context: .
