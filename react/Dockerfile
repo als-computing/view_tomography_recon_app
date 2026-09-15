@@ -1,7 +1,11 @@
 # syntax=docker/dockerfile:1
 
 # ---------- base: shared dependency-install layer (today's exact steps) ----------
-FROM node:20-alpine AS base
+# node:22-alpine over node:20-alpine: verified via `trivy image` - roughly half the HIGH-severity
+# vulnerability count (12 vs 23; both carry 1 CRITICAL, from npm's own bundled deps, unaffected by
+# this bump). Node 22 is Active LTS, same support tier as 20 - no known compatibility risk for this
+# Vite/React app.
+FROM node:22-alpine AS base
 RUN apk add --no-cache git python3 make g++
 WORKDIR /app
 COPY package*.json ./
@@ -20,7 +24,10 @@ CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5174"]
 # Built here (not as a separate published artifact) so the Docs button (src/config.ts's DOCS_URL)
 # can stay a same-origin relative path — no docs FQDN/host is ever baked into the app bundle,
 # regardless of which domain actually fronts a given deployment (:local, :als-prod, :als-staging).
-FROM python:3.12-slim AS docs
+# python:3.12-alpine over python:3.12-slim (Debian-based): verified via `trivy image` - a large drop
+# (7 HIGH/0 CRITICAL vs 53 HIGH/3 CRITICAL). Confirmed requirements-docs.txt installs cleanly here
+# (all deps resolve as pure-Python or musllinux wheels, no missing build toolchain needed).
+FROM python:3.12-alpine AS docs
 WORKDIR /docs
 COPY requirements-docs.txt ./
 RUN pip install --no-cache-dir -r requirements-docs.txt
@@ -42,6 +49,10 @@ ENV VITE_FIXED_TILED_SERVER=${FIXED_TILED_SERVER}
 RUN npm run build
 
 # ---------- prod: minimal static server for the built assets ----------
+# Tried nginx:1.29-alpine-slim here - one scanner (Trivy) showed fewer vulnerabilities, but two
+# others (Grype, Docker's own IDE scanner) showed it as meaningfully WORSE (0 critical -> several
+# critical). Reverted to plain nginx:alpine, which scored best or tied-best across all three tools -
+# not worth a regression on 2/3 scanners for an improvement only 1/3 agreed with.
 FROM nginx:alpine AS prod
 ARG BASE_PATH=/tomo_viewer/
 COPY --from=build /app/dist /usr/share/nginx/html${BASE_PATH}
