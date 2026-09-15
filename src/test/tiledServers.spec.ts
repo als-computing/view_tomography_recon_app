@@ -69,28 +69,27 @@ describe("FIXED_SERVER_ID (locked builds)", () => {
     expect(mod.FIXED_SERVER_ID).toBeUndefined();
   });
 
-  it("locks to a valid server id when set", async () => {
-    vi.stubEnv("VITE_FIXED_TILED_SERVER", "production");
+  it("locks to a server by matching its apiUrl host", async () => {
+    vi.stubEnv("VITE_FIXED_TILED_SERVER", "tiled.als.lbl.gov");
     const mod = await import("../tiledServers");
     expect(mod.FIXED_SERVER_ID).toBe("production");
     expect(mod.getActiveServerId()).toBe("production");
   });
 
-  it("ignores an invalid/unrecognized value (treated as unset)", async () => {
-    vi.stubEnv("VITE_FIXED_TILED_SERVER", "not-a-real-server");
-    const mod = await import("../tiledServers");
-    expect(mod.FIXED_SERVER_ID).toBeUndefined();
+  it("throws at import time for a hostname that matches no configured server", async () => {
+    vi.stubEnv("VITE_FIXED_TILED_SERVER", "not-a-real-host.example.com");
+    await expect(import("../tiledServers")).rejects.toThrow(/doesn't match any configured server/);
   });
 
   it("getActiveServerId ignores localStorage entirely once locked", async () => {
-    vi.stubEnv("VITE_FIXED_TILED_SERVER", "staging");
+    vi.stubEnv("VITE_FIXED_TILED_SERVER", "tiled-staging.als.lbl.gov");
     localStorage.setItem("tiledServerId", "production"); // an attempted override
     const mod = await import("../tiledServers");
     expect(mod.getActiveServerId()).toBe("staging");
   });
 
   it("setActiveServerId is a no-op once locked", async () => {
-    vi.stubEnv("VITE_FIXED_TILED_SERVER", "production");
+    vi.stubEnv("VITE_FIXED_TILED_SERVER", "tiled.als.lbl.gov");
     const mod = await import("../tiledServers");
     mod.setActiveServerId("staging");
     expect(localStorage.getItem("tiledServerId")).toBeNull();

@@ -50,16 +50,18 @@ If you need a deployment this table doesn't cover, build directly with `docker b
 docker build \
   --target prod \
   --build-arg BASE_PATH=/your/custom/path/ \
-  --build-arg FIXED_TILED_SERVER=production \
+  --build-arg FIXED_TILED_SERVER=tiled.als.lbl.gov \
   -t my-custom-image \
   -f react/Dockerfile .
 ```
 
 - `BASE_PATH` — must include both a leading and trailing slash. This is baked into the built JS/CSS
   asset paths and nginx's serving location — it can't be changed after the image is built.
-- `FIXED_TILED_SERVER` — one of `local`, `staging`, or `production` (matching the `id`s in
-  [`src/tiledServers.ts`](https://github.com/als-computing/view_tomography_recon_app/blob/main/src/tiledServers.ts)).
-  Leave unset for a fully configurable dropdown, like `:local`.
+- `FIXED_TILED_SERVER` — a configured Tiled server's hostname (matched against the `apiUrl` host of an
+  entry in [`config.yml`](https://github.com/als-computing/view_tomography_recon_app/blob/main/config.yml)
+  — e.g. `tiled.als.lbl.gov` or `tiled-staging.als.lbl.gov`). Leave unset for a fully configurable
+  dropdown, like `:local`. A hostname that doesn't match any configured server fails the build
+  outright, rather than silently producing an unlocked image.
 
 See [Configuring Tiled Servers](configuring-tiled-servers.md) to add a new server option before locking
 an image to it.

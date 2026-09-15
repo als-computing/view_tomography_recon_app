@@ -94,17 +94,38 @@ export const DEFAULT_SERVER_ID: TiledServerId = buildDefaultServerId();
 
 const STORAGE_KEY = 'tiledServerId';
 
+/** Host portion (hostname[:port]) of a TiledServer's apiUrl — used to match FIXED_TILED_SERVER by FQDN. */
+const hostOf = (apiUrl: string): string => {
+  try {
+    return new URL(apiUrl).host;
+  } catch {
+    return '';
+  }
+};
+
 /**
  * Build-time-only (Vite auto-inlines VITE_-prefixed vars into import.meta.env at build time - see
- * react/Dockerfile's `build` stage `ARG FIXED_TILED_SERVER`). When set to a valid TiledServerId, the
- * app is locked to that one server: getActiveServerId() always returns it (ignoring localStorage/the
- * default), and setActiveServerId() becomes a no-op. Unset (the :local image's default) preserves
- * today's exact behavior - full switcher, last choice persisted in localStorage.
+ * react/Dockerfile's `build` stage `ARG FIXED_TILED_SERVER`). Set to a Tiled server's hostname (e.g.
+ * `tiled.als.lbl.gov`), matched against TILED_SERVERS' own `apiUrl` hosts, to lock the app to that one
+ * server: getActiveServerId() always returns it (ignoring localStorage/the default), and
+ * setActiveServerId() becomes a no-op. Unset (the :local image's default) preserves today's exact
+ * behavior - full switcher, last choice persisted in localStorage.
+ *
+ * A non-empty value that doesn't match any configured server's host is a build-time error - a
+ * deployment silently losing its intended lock (e.g. from a typo'd hostname) is a far worse failure
+ * mode than the build simply failing outright.
  */
-const rawFixedServer = import.meta.env.VITE_FIXED_TILED_SERVER as string | undefined;
-export const FIXED_SERVER_ID: TiledServerId | undefined = isTiledServerId(rawFixedServer)
-  ? rawFixedServer
+const rawFixedServer = (import.meta.env.VITE_FIXED_TILED_SERVER as string | undefined)?.trim();
+const FIXED_SERVER: TiledServer | undefined = rawFixedServer
+  ? TILED_SERVERS.find((s) => hostOf(s.apiUrl) === rawFixedServer)
   : undefined;
+if (rawFixedServer && !FIXED_SERVER) {
+  throw new Error(
+    `VITE_FIXED_TILED_SERVER ("${rawFixedServer}") doesn't match any configured server's host. ` +
+      `Configured hosts: ${TILED_SERVERS.map((s) => hostOf(s.apiUrl)).join(', ')}.`,
+  );
+}
+export const FIXED_SERVER_ID: TiledServerId | undefined = FIXED_SERVER?.id;
 
 /** The persisted active server id (falls back to the default if unset/invalid). */
 export const getActiveServerId = (): TiledServerId => {

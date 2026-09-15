@@ -40,12 +40,18 @@ FROM base AS build
 ARG BASE_PATH=/tomo_viewer/
 ENV BASE_PATH=${BASE_PATH}
 # Empty (default) = the local/staging/production dropdown is shown, exactly like today (:local).
-# Set to 'production' or 'staging' to hide the dropdown and lock the app to that one server (:als-prod/
-# :als-staging) — see src/tiledServers.ts's FIXED_SERVER_ID. Vite auto-inlines any VITE_-prefixed
-# process.env var into import.meta.env at build time, no vite.config.js change needed for this one
-# (unlike BASE_PATH, which vite.config.js itself consumes).
+# Set to a configured Tiled server's hostname (e.g. tiled.als.lbl.gov, tiled-staging.als.lbl.gov —
+# matched against config.yml's own tiledServers.*.apiUrl hosts) to hide the dropdown and lock the app
+# to that one server (:als-prod/:als-staging) — see src/tiledServers.ts's FIXED_SERVER_ID. A hostname
+# that doesn't match any configured server is a build-time error, not a silent fallback. Vite
+# auto-inlines any VITE_-prefixed process.env var into import.meta.env at build time, no
+# vite.config.js change needed for this one (unlike BASE_PATH, which vite.config.js itself consumes).
 ARG FIXED_TILED_SERVER=""
 ENV VITE_FIXED_TILED_SERVER=${FIXED_TILED_SERVER}
+# Real build-time gate: `vite build` only bundles JS, it never executes the app's module graph, so a
+# bad hostname couldn't otherwise fail the build itself (only crash later, in a real browser, once the
+# image is deployed and opened) — see the script's own header comment.
+RUN node scripts/validate-fixed-tiled-server.mjs
 RUN npm run build
 
 # ---------- prod: minimal static server for the built assets ----------

@@ -116,8 +116,8 @@ requirements, the server-locking mechanism, etc.) — this section is just the c
 | Tag | Build command |
 |---|---|
 | `:local` | `docker build --target prod --build-arg BASE_PATH=/tomo_viewer/ -f react/Dockerfile -t view_tomography_recon_app:local .` |
-| `:als-prod` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=production -f react/Dockerfile -t view_tomography_recon_app:als-prod .` |
-| `:als-staging` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer_staging/ --build-arg FIXED_TILED_SERVER=staging -f react/Dockerfile -t view_tomography_recon_app:als-staging .` |
+| `:als-prod` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=tiled.als.lbl.gov -f react/Dockerfile -t view_tomography_recon_app:als-prod .` |
+| `:als-staging` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=tiled-staging.als.lbl.gov -f react/Dockerfile -t view_tomography_recon_app:als-staging .` |
 
 - `:local` shows the full Local/Remote/Production server dropdown (same as the dev-server flow above) —
   useful for testing against any of the three Tiled servers from one image.
