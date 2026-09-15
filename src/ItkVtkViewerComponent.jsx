@@ -10,7 +10,7 @@
  * @return {JSX.Element} A rendered <div> containing an optional label and an auto-resizing iframe.
  */
 
-import React, { useRef } from 'react';
+import { useRef } from 'react';
 
 export default function ItkVtkViewerComponent({ src }) {
   const iframeRef = useRef(null);

@@ -4,3 +4,156 @@
   height: 100vh;
   margin: 0;
 }
+
+/* Viewer area under the tab strip. Live tabs are absolutely-positioned panes stacked here; only
+   the active one is displayed. */
+.viewer-stack {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+/* A single live viewer. Left/right + width are set inline (single pane fills the stack; in split
+   view the active pane takes the left half and the split pane the right half). */
+.viewer-pane {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.viewer-empty {
+  text-align: center;
+  margin-top: 3rem;
+}
+
+/* Vertical seam between the two split panes. */
+.viewer-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-1px);
+  background: rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Compact "linked" chip while in split view: what's synced + exit. Anchored top-left over the left
+   pane's canvas so it clears both panes' right-docked HUD sidebars (which the WebGPU renderer adds). */
+.viewer-link-controls {
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 999px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  font-family: 'Nunito Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 12px;
+  color: #1f2933;
+  user-select: none;
+}
+
+.viewer-link-controls__label {
+  font-weight: 700;
+  color: #52606d;
+}
+
+.viewer-link-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.viewer-link-controls input {
+  cursor: pointer;
+  margin: 0;
+}
+
+.viewer-link-controls__exit {
+  margin-left: 2px;
+  padding: 3px 10px;
+  background: transparent;
+  border: 1px solid rgba(185, 28, 28, 0.35);
+  border-radius: 999px;
+  font: inherit;
+  font-weight: 600;
+  color: #b91c1c;
+  cursor: pointer;
+}
+
+.viewer-link-controls__exit:hover {
+  background: rgba(185, 28, 28, 0.08);
+  border-color: rgba(185, 28, 28, 0.6);
+}
+
+/* Toolbar strip above a tab's linked 3D + 2D-orthoslice split (WebGpuLinked2D3DPane): axis picker +
+   exit-to-3D-only. Docked at the top of the pane (not floating over the canvas like
+   .viewer-link-controls) since this split has its own two-canvas row directly underneath it. */
+.split2d3d__toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: #1a1d24;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  font-family: 'Nunito Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 12px;
+  color: #c4cad4;
+  user-select: none;
+}
+
+.split2d3d__label {
+  font-weight: 700;
+  color: #8a94a6;
+  margin-right: 2px;
+}
+
+.split2d3d__axis-btn {
+  min-width: 22px;
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+  font: inherit;
+  font-weight: 600;
+  color: #c4cad4;
+  cursor: pointer;
+}
+
+.split2d3d__axis-btn:hover {
+  border-color: rgba(30, 167, 253, 0.6);
+  color: #6ec8ff;
+}
+
+.split2d3d__axis-btn--active {
+  background: rgba(30, 167, 253, 0.22);
+  border-color: #1ea7fd;
+  color: #6ec8ff;
+}
+
+.split2d3d__exit {
+  margin-left: auto;
+  padding: 3px 10px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  font: inherit;
+  font-weight: 600;
+  color: #c4cad4;
+  cursor: pointer;
+}
+
+.split2d3d__exit:hover {
+  background: rgba(185, 28, 28, 0.12);
+  border-color: rgba(185, 28, 28, 0.6);
+  color: #f2a3a3;
+}

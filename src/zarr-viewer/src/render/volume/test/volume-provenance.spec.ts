@@ -1,0 +1,35 @@
+import { describe, expect, it } from "vitest";
+import { computeProvenance } from "../volume-provenance.js";
+
+describe("computeProvenance", () => {
+  it("reports the real shadow representation and taau frame count for baseline", () => {
+    const p = computeProvenance("baseline", "tf-hash", 1, 42, true);
+    expect(p.shaderConfig).toBe("baseline");
+    expect(p.multiScatterOctaves).toBe(0);
+    expect(p.taauFrames).toBe(42);
+    expect(p.shadowMode).toBe("light-axis-sweep");
+    expect(p.transferFunction).toBe("tf-hash");
+    expect(p.renderScale).toBe(1);
+  });
+
+  it("reports shadowMode 'none' when shadows are disabled", () => {
+    const p = computeProvenance("quality", "tf-hash", 1, 0, false);
+    expect(p.shadowMode).toBe("none");
+  });
+
+  it("reports multiScatterOctaves from the quality specialization", () => {
+    const p = computeProvenance("quality", "tf-hash", 0.5, 10, false);
+    expect(p.multiScatterOctaves).toBe(2);
+  });
+
+  it("lets extras override computed fields", () => {
+    const p = computeProvenance("baseline", "tf-hash", 1, 0, false, { renderScale: 0.75 });
+    expect(p.renderScale).toBe(0.75);
+  });
+
+  it("reports extendedPreIntegration only for the quality config (Milestone 3.2)", () => {
+    expect(computeProvenance("baseline", "tf-hash", 1, 0, false).extendedPreIntegration).toBe(false);
+    expect(computeProvenance("fast", "tf-hash", 1, 0, false).extendedPreIntegration).toBe(false);
+    expect(computeProvenance("quality", "tf-hash", 1, 0, false).extendedPreIntegration).toBe(true);
+  });
+});

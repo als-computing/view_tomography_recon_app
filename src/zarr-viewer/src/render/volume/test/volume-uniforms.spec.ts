@@ -1,0 +1,301 @@
+import { describe, expect, it } from "vitest";
+import { Mat4 } from "@zarr-viewer/math";
+import {
+  writeVolumeFrameUniform,
+  type VolumeAccelerationLike,
+  type VolumeFrameParams,
+} from "../volume-uniforms.js";
+
+const FAKE_ACCEL: VolumeAccelerationLike = {
+  keyLightDirection: [0, 1, 0],
+  keyLightRadiance: [1, 1, 1],
+  lightCount: 2,
+  occupancyGrid: [4, 5, 6],
+  visGrid: [7, 8, 9],
+  worldToLight: new Float32Array(16).map((_, i) => i),
+  shadowActive: true,
+};
+
+const BASE_PARAMS: VolumeFrameParams = {
+  eye: { x: 1, y: 2, z: 3 },
+  clear: true,
+  frameIndex: 42,
+  boxHalf: [0.5, 0.5, 0.5],
+  viewDepth: 2 * Math.hypot(0.5, 0.5, 0.5),
+  maxSteps: 4096,
+  stepSize: 1 / 260,
+  densityScale: 1.35,
+  exposure: 1.15,
+  masterAmbient: 0.22,
+  specularPower: 48,
+  blendMode: "composite",
+  gradientOpacity: 0,
+  gradientOpacityScale: 0.15,
+  lightingStrength: 1,
+  liquidEnabled: false,
+  liquidIor: 1.333,
+  liquidRoughness: 0.04,
+  liquidEnvIntensity: 1.2,
+  liquidAbsorptionScale: 2.5,
+  cropMin: [0, 0, 0],
+  cropMax: [1, 1, 1],
+  sliceX: 0.5,
+  sliceY: 0.5,
+  sliceZ: 0.5,
+  sliceEnableX: false,
+  sliceEnableY: false,
+  sliceEnableZ: false,
+  sliceEnableOblique: false,
+  obliqueNormal: [0, 0, 1],
+  obliqueOffset: 0,
+  overlayBoxEnabled: false,
+  overlayBoxMin: [0, 0, 0],
+  overlayBoxMax: [1, 1, 1],
+  showSlicePlanes: false,
+  viewMode: "volume",
+  linearOutput: false,
+  earlyRayTermination: 0.995,
+  deferLighting: false,
+  specStrength: 0.4,
+  roughnessL: 0.6,
+  shadowEnable: false,
+  shadowSteps: 24,
+  shadowStrength: 0.85,
+  shadowSoftness: 0,
+  aoEnable: false,
+  aoRadius: 0.08,
+  aoIntensity: 0.7,
+  aoSamples: 6,
+  measurePlaneEnabled: false,
+  measurePlaneDepth: 0,
+  measurePlaneGray: 0.5,
+  measurePlaneAlpha: 0.35,
+  measureForward: [0, 0, 1],
+  bricks: [
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+  ],
+  brickSlotSize: 256,
+  visEnabled: false,
+  internalWidth: 800,
+  internalHeight: 600,
+  reprojectFar: 1,
+  camRight: [1, 0, 0],
+  camUp: [0, 1, 0],
+  camAspect: 800 / 600,
+  tanHalfFovY: Math.tan((42 * Math.PI) / 180 / 2),
+  masks: [
+    { enabled: false, dims: [1, 1, 1] },
+    { enabled: false, dims: [1, 1, 1] },
+  ],
+  lowDensitySkipThreshold: 0.01,
+};
+
+function pack(overrides: Partial<VolumeFrameParams> = {}): Float32Array {
+  const d = new Float32Array(196);
+  writeVolumeFrameUniform(d, new Mat4(), FAKE_ACCEL, { ...BASE_PARAMS, ...overrides });
+  return d;
+}
+
+describe("writeVolumeFrameUniform", () => {
+  it("writes the inverted view-projection into floats 0-15", () => {
+    const d = pack();
+    // Mat4() defaults to identity; toArray writes column-major straight through.
+    expect(Array.from(d.slice(0, 16))).toEqual([
+      1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
+    ]);
+  });
+
+  it("writes eye position and frame index", () => {
+    const d = pack();
+    expect(d[16]).toBe(1);
+    expect(d[17]).toBe(2);
+    expect(d[18]).toBe(3);
+    expect(d[19]).toBe(42);
+  });
+
+  it("floors the step size so the ray always crosses the box within maxSteps", () => {
+    // stepSize far finer than the box/maxSteps budget allows — should be clamped up, not honored.
+    // viewDepth here simulates looking exactly down the box's own diagonal (the worst case).
+    const diagonal = 2 * Math.hypot(10, 10, 10);
+    const d = pack({ stepSize: 1e-9, boxHalf: [10, 10, 10], viewDepth: diagonal, maxSteps: 100 });
+    const minStep = diagonal / (100 - 8);
+    expect(d[20]).toBeCloseTo(minStep, 6);
+    expect(d[22]).toBeLessThanOrEqual(100);
+  });
+
+  it("uses viewDepth (not the box's fixed diagonal) as the iteration budget's worst-case distance", () => {
+    // Same box, same maxSteps, but two different viewDepth values (as if two different camera
+    // orientations) - a smaller viewDepth (e.g. looking down a short axis of an anisotropic box)
+    // should floor the step to something finer than a larger viewDepth (looking down the long diagonal).
+    const dShort = pack({ stepSize: 1e-9, boxHalf: [10, 10, 10], viewDepth: 5, maxSteps: 100 });
+    const dLong = pack({ stepSize: 1e-9, boxHalf: [10, 10, 10], viewDepth: 40, maxSteps: 100 });
+    expect(dShort[20]).toBeCloseTo(5 / (100 - 8), 6);
+    expect(dLong[20]).toBeCloseTo(40 / (100 - 8), 6);
+    expect(dShort[20]).toBeLessThan(dLong[20]);
+  });
+
+  it("packs blend mode and view mode as their integer ids", () => {
+    expect(pack({ blendMode: "composite" })[35]).toBe(0);
+    expect(pack({ blendMode: "mip" })[35]).toBe(1);
+    expect(pack({ blendMode: "minip" })[35]).toBe(2);
+    expect(pack({ blendMode: "average" })[35]).toBe(3);
+  });
+
+  it("packs slice-enable/show-planes/view-mode into the flags bitfield", () => {
+    const none = pack();
+    expect(none[51]).toBe(0); // volume mode, id 0, no flags set
+
+    const allSlices = pack({
+      sliceEnableX: true,
+      sliceEnableY: true,
+      sliceEnableZ: true,
+      showSlicePlanes: true,
+      viewMode: "xPlane",
+    });
+    // bits 0-3 set (1+2+4+8=15), view mode id 1 shifted into bits 4-6 (1<<4=16) → 31
+    expect(allSlices[51]).toBe(31);
+  });
+
+  it("packs oblique view mode (id 4, 3 bits) and sliceEnableOblique (bit 7) into the flags bitfield", () => {
+    // id 4 shifted into bits 4-6 (4<<4=64) - would have silently overflowed/aliased into bit 7 with
+    // the old 2-bit (mask 3) packing, which is exactly the regression this test guards.
+    expect(pack({ viewMode: "oblique" })[51]).toBe(64);
+    expect(pack({ sliceEnableOblique: true })[51]).toBe(128);
+    expect(pack({ viewMode: "oblique", sliceEnableOblique: true })[51]).toBe(192);
+  });
+
+  it("packs obliqueNormal/obliqueOffset at floats 184..187", () => {
+    const d = pack({ obliqueNormal: [0.6, -0.8, 0], obliqueOffset: 1.25 });
+    expect(d[184]).toBeCloseTo(0.6);
+    expect(d[185]).toBeCloseTo(-0.8);
+    expect(d[186]).toBeCloseTo(0);
+    expect(d[187]).toBeCloseTo(1.25);
+  });
+
+  it("packs overlayBoxEnabled into flags bit 8 (256)", () => {
+    expect(pack()[51]).toBe(0);
+    expect(pack({ overlayBoxEnabled: true })[51]).toBe(256);
+    expect(pack({ overlayBoxEnabled: true, sliceEnableOblique: true })[51]).toBe(384);
+  });
+
+  it("packs overlayBoxMin/overlayBoxMax at floats 188..195", () => {
+    const d = pack({ overlayBoxMin: [0.2, 0.3, 0.4], overlayBoxMax: [0.6, 0.7, 0.8] });
+    expect(d[188]).toBeCloseTo(0.2);
+    expect(d[189]).toBeCloseTo(0.3);
+    expect(d[190]).toBeCloseTo(0.4);
+    expect(d[192]).toBeCloseTo(0.6);
+    expect(d[193]).toBeCloseTo(0.7);
+    expect(d[194]).toBeCloseTo(0.8);
+  });
+
+  it("reads light data through the acceleration accessor", () => {
+    const d = pack();
+    expect(d[24]).toBeCloseTo(0); // keyDir normalized x (dir is [0,1,0])
+    expect(d[25]).toBeCloseTo(1); // keyDir normalized y
+    expect(d[28]).toBe(1); // keyRad
+    expect(d[60]).toBe(2); // lightCount
+    const occ = FAKE_ACCEL.occupancyGrid;
+    expect([d[112], d[113], d[114]]).toEqual(occ);
+    const vis = FAKE_ACCEL.visGrid;
+    expect([d[116], d[117], d[118]]).toEqual(vis);
+    for (let k = 0; k < 16; k++) expect(d[124 + k]).toBe(k);
+    expect(d[140]).toBe(1); // shadowActive
+  });
+
+  it("packs the alpha-composite flag from `clear`", () => {
+    expect(pack({ clear: true })[56]).toBe(0);
+    expect(pack({ clear: false })[56]).toBe(1);
+  });
+
+  it("packs deferLighting into composite.w", () => {
+    expect(pack({ deferLighting: false })[59]).toBe(0);
+    expect(pack({ deferLighting: true })[59]).toBe(1);
+  });
+
+  it("packs camera basis with fov half-extents in the w components", () => {
+    const d = pack({ camAspect: 2, tanHalfFovY: 0.5 });
+    expect(d[147]).toBeCloseTo(1); // tanHalfFovY * aspect
+    expect(d[151]).toBeCloseTo(0.5);
+  });
+
+  it("packs mask0Ctl/mask1Ctl (enable + mask voxel dims) independently per slot", () => {
+    const off = pack();
+    expect(off[152]).toBe(0); // mask0 disabled
+    expect(off[156]).toBe(0); // mask1 disabled
+
+    const slot0On = pack({
+      masks: [
+        { enabled: true, dims: [64, 32, 16] },
+        { enabled: false, dims: [1, 1, 1] },
+      ],
+    });
+    expect(slot0On[152]).toBe(1);
+    expect([slot0On[153], slot0On[154], slot0On[155]]).toEqual([64, 32, 16]);
+    expect(slot0On[156]).toBe(0); // slot 1 untouched
+
+    const bothOn = pack({
+      masks: [
+        { enabled: true, dims: [64, 32, 16] },
+        { enabled: true, dims: [8, 8, 8] },
+      ],
+    });
+    expect(bothOn[152]).toBe(1);
+    expect(bothOn[156]).toBe(1);
+    expect([bothOn[157], bothOn[158], bothOn[159]]).toEqual([8, 8, 8]);
+  });
+
+  it("packs lowDensitySkipThreshold into skipCtl.x", () => {
+    expect(pack({ lowDensitySkipThreshold: 0.01 })[160]).toBeCloseTo(0.01);
+    expect(pack({ lowDensitySkipThreshold: 0.003 })[160]).toBeCloseTo(0.003);
+  });
+
+  it("packs bricks[0..3] world min/max (w = enabled/blend) at floats 80..111, one slot at a time", () => {
+    const allOff = pack();
+    for (let i = 0; i < 4; i++) {
+      expect(allOff[80 + i * 4 + 3]).toBe(0); // enabled
+    }
+
+    const withSlot2 = pack({
+      bricks: [
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+        {
+          enabled: true,
+          worldMin: [-0.1, -0.2, -0.3],
+          worldMax: [0.1, 0.2, 0.3],
+          blend: 0.5,
+          atlasOrigin: [256, 0, 0],
+        },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+      ],
+    });
+    [withSlot2[88], withSlot2[89], withSlot2[90]].forEach((v, i) => expect(v).toBeCloseTo([-0.1, -0.2, -0.3][i]!));
+    expect(withSlot2[91]).toBe(1);
+    [withSlot2[104], withSlot2[105], withSlot2[106]].forEach((v, i) => expect(v).toBeCloseTo([0.1, 0.2, 0.3][i]!));
+    expect(withSlot2[107]).toBe(0.5);
+    // Other slots untouched (still disabled).
+    expect(withSlot2[83]).toBe(0);
+    expect(withSlot2[95]).toBe(0);
+    expect(withSlot2[92 + 3]).toBe(0);
+  });
+
+  it("packs brickAtlasOrigin[0..3] at floats 164..179 and brickSlotSize at 180 (item 9 stage 9b)", () => {
+    const d = pack({
+      bricks: [
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [256, 0, 0] },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 256, 0] },
+        { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [256, 256, 0] },
+      ],
+      brickSlotSize: 256,
+    });
+    expect([d[164], d[165], d[166]]).toEqual([0, 0, 0]);
+    expect([d[168], d[169], d[170]]).toEqual([256, 0, 0]);
+    expect([d[172], d[173], d[174]]).toEqual([0, 256, 0]);
+    expect([d[176], d[177], d[178]]).toEqual([256, 256, 0]);
+    expect(d[180]).toBe(256);
+  });
+});

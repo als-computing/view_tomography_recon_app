@@ -1,0 +1,1031 @@
+/**
+ * High-level direct volume renderer: ray-marches a 3D density texture with a transfer function into
+ * the canvas. Supports itk-vtk-viewer–style blend modes, crop, axis slices, gradient opacity, and
+ * dielectric liquid shading (Fresnel / env / Beer) for CGI-style fluids.
+ *
+ * @packageDocumentation
+ */
+
+import type { Disposable } from "@zarr-viewer/core";
+import { Mat4, asColor3, type Color3, type Color3Like, type Color4Like } from "@zarr-viewer/math";
+import type { GpuContext } from "../device/context.js";
+import { ManagedTexture } from "../resources/texture.js";
+import { toGpuColor } from "../color.js";
+import { TransferFunction } from "./transfer-function.js";
+import { VOLUME_FRAME_UNIFORM_SIZE } from "../shaders/volume-raymarch.js";
+import type { GpuLight } from "../lighting/index.js";
+import { type ShaderConfigName, specializationFor } from "../accel/shader-config.js";
+import { hashTransferFunction, type RenderProvenance } from "../accel/provenance.js";
+import type { VisibilityFeedback } from "../accel/visibility.js";
+import { VolumeAcceleration } from "../accel/volume-acceleration.js";
+import { LightingPass, type LightingPassGbuffer } from "../accel/lighting-pass.js";
+import type { RenderGraph, ResourceHandle } from "../graph/render-graph.js";
+import { computeProvenance } from "./volume-provenance.js";
+import {
+  applyLiquidShading,
+  applyMeasurePlane,
+  applyLegacyLight,
+  type LiquidShadingParams,
+  type MeasurePlaneParams,
+} from "./volume-shading-params.js";
+import { applyVolumeLighting, type VolumeLightingParams } from "./volume-lighting.js";
+import {
+  writeVolumeFrameUniform,
+  type VolumeBlendMode,
+  type VolumeViewMode,
+  type BrickSlotParams,
+} from "./volume-uniforms.js";
+import { VolumePipeline, VOLUME_DEPTH_FORMAT } from "./volume-pipeline.js";
+import { VolumeBindings } from "./volume-bindings.js";
+import { buildGaussianPreintegrationTable, defaultSigmaBuckets } from "./preintegration-2d.js";
+import { floatToHalf } from "./volume-texture.js";
+
+/** One mask/annotation slot's GPU-side state (item 7 Phase B). */
+interface MaskSlot {
+  tex: ManagedTexture | undefined;
+  paletteTex: ManagedTexture | undefined;
+  enabled: boolean;
+}
+
+export type { VolumeBlendMode, VolumeViewMode } from "./volume-uniforms.js";
+export { VOLUME_DEPTH_FORMAT } from "./volume-pipeline.js";
+
+/** Options for {@link VolumeRenderer}. */
+export interface VolumeRendererOptions {
+  clearColor?: Color4Like;
+  /** Ray step size in world units. Smaller = sharper, more expensive. */
+  stepSize?: number;
+  densityScale?: number;
+  maxSteps?: number;
+  exposure?: number;
+  lightDirection?: readonly [number, number, number];
+  lightColor?: Color3Like;
+  ambient?: number;
+  specularPower?: number;
+  blendMode?: VolumeBlendMode;
+  /** Gradient opacity amount in `[0, 1]` (0 = off). */
+  gradientOpacity?: number;
+  /** Gradient magnitude scale for opacity. */
+  gradientOpacityScale?: number;
+  /** 0 = flat TF color, 1 = full gradient shading. */
+  lightingStrength?: number;
+  /** Optional dielectric liquid shading (can also call {@link setLiquidShading}). */
+  liquidShading?: LiquidShadingParams;
+  /**
+   * Color attachment format the ray-march pipeline targets. Defaults to the swapchain format.
+   * Set to an HDR format when driving the volume renderer through the {@link RenderGraph}.
+   */
+  colorFormat?: GPUTextureFormat;
+  /**
+   * Output linear HDR (skip the in-shader ACES tonemap/gamma) so a downstream post stack tonemaps
+   * once. Default `false`. Set `true` alongside an HDR `colorFormat` for the render-graph path.
+   */
+  linearOutput?: boolean;
+  /** Named shader config (default `"baseline"`). Occupancy/tiles compile in `"fast"` / `"quality"`. */
+  shaderConfig?: ShaderConfigName;
+  /** Early-ray-termination alpha threshold (default `0.995`). */
+  earlyRayTermination?: number;
+}
+
+/**
+ * Ray-marches a volume each frame from an explicit view/projection.
+ */
+export class VolumeRenderer implements Disposable {
+  private readonly pipelineMgr: VolumePipeline;
+  private readonly bindings: VolumeBindings;
+  private readonly clearColor: GPUColor;
+  /** Color format the ray-march pipeline renders into (swapchain format by default). */
+  public readonly colorFormat: GPUTextureFormat;
+  /** When true, emit linear HDR (no inline tonemap) for a post stack. */
+  private readonly linearOutput: boolean;
+  private stepSize: number;
+  private densityScale: number;
+  private maxSteps: number;
+  private exposure: number;
+  private lightDirection: [number, number, number];
+  private lightColor: Color3;
+  private ambient: number;
+  private specularPower: number;
+  private boxHalf: [number, number, number] = [0.5, 0.5, 0.5];
+  private blendMode: VolumeBlendMode = "composite";
+  private gradientOpacity = 0;
+  private gradientOpacityScale = 0.15;
+  private lightingStrength = 1;
+  private liquidEnabled = false;
+  private liquidIor = 1.333;
+  private liquidRoughness = 0.04;
+  private liquidEnvIntensity = 1.2;
+  private liquidAbsorptionScale = 2.5;
+  private cropMin: [number, number, number] = [0, 0, 0];
+  private cropMax: [number, number, number] = [1, 1, 1];
+  private sliceX = 0.5;
+  private sliceY = 0.5;
+  private sliceZ = 0.5;
+  private sliceEnableX = false;
+  private sliceEnableY = false;
+  private sliceEnableZ = false;
+  private sliceEnableOblique = false;
+  private obliqueNormal: [number, number, number] = [0, 0, 1];
+  private obliqueOffset = 0;
+  private overlayBoxEnabled = false;
+  private overlayBoxMin: [number, number, number] = [0, 0, 0];
+  private overlayBoxMax: [number, number, number] = [1, 1, 1];
+  private showSlicePlanes = false;
+  private viewMode: VolumeViewMode = "volume";
+  private frameIndex = 0;
+  private shaderConfig: ShaderConfigName = "baseline";
+  private earlyRayTermination = 0.995;
+  // Phase 1a hardening: true while a separate half-res LightingPass is going to compute AO/shadow/
+  // multi-scatter for this frame - forces the main ray march's own `heavy` gate off (see
+  // setDeferLighting()'s doc comment), so those expensive per-sample terms are computed exactly once
+  // per frame (at half-res), not twice (once inline at full-res and thrown away, once at half-res).
+  private deferLighting = false;
+  private visEnabled = false;
+  private internalWidth = 1;
+  private internalHeight = 1;
+  private lastLut: Uint8Array | undefined;
+  private lastLutSize = 512;
+  private tfHash = "lut:00000000";
+  // Phase 1e hardening: see setTransferFunction()'s computation of this and skipCtl's WGSL doc.
+  private lowDensitySkipThreshold = 0.01;
+  // Occupancy grid, tile compactor, visibility feedback, opacity shadow map, and the multi-light
+  // storage buffer, plus their rebuild bookkeeping — see render/accel/volume-acceleration.ts.
+  private readonly acceleration: VolumeAcceleration;
+  // Milestone 3.1/3.2 pre-integration: cumulative-extinction LUT texture (rebuilt with the TF);
+  // dummy when unused. `r32float`, width = LUT size, height = sigma-bucket count (1 for now).
+  private tPreintTex: ManagedTexture | undefined;
+  private readonly dummyPreint: ManagedTexture;
+  // Far-plane distance used to normalize the depth-centroid output (Milestone 5.1 TAAU reprojection).
+  private reprojectFar = 1;
+
+  private disposed = false;
+  // Multi-light shading (prism lighting library) formula params: the light list itself lives on
+  // `acceleration`; these scalars drive the shader's shadow-ray and ambient-occlusion marching.
+  private masterAmbient = 0.22;
+  private specStrength = 0.4;
+  private roughnessL = 0.6;
+  private shadowEnable = false;
+  private shadowSteps = 24;
+  private shadowStrength = 0.85;
+  private shadowSoftness = 0;
+  private aoEnable = false;
+  private aoRadius = 0.08;
+  private aoIntensity = 0.7;
+  private aoSamples = 6;
+  // Measure plane: a camera-linked fronto-parallel grey sheet composited in depth with the volume.
+  private measurePlaneEnabled = false;
+  private measurePlaneDepth = 0; // world units along the view axis (from the eye)
+  private measurePlaneGray = 0.5;
+  private measurePlaneAlpha = 0.35;
+  private measureForward: [number, number, number] = [0, 0, 1];
+  // Camera basis + FOV for the primary ray direction (see marchColor). Passed explicitly so the shader
+  // never reconstructs the ray via invViewProj, which loses precision at large zoom-out and makes the
+  // volume vanish / invert. Defaults frame a unit camera looking down -Z until setCameraBasis runs.
+  private camRight: [number, number, number] = [1, 0, 0];
+  private camUp: [number, number, number] = [0, 1, 0];
+  private tanHalfFovY = Math.tan((42 * Math.PI) / 180 / 2);
+  private camAspect = 1;
+
+  private volumeTex: ManagedTexture | undefined;
+  private tfTex: ManagedTexture | undefined;
+  // Up to 4 simultaneously-resident high-res ROI bricks, composited over the coarse volume (item 9
+  // stage 9b: brickAtlasTex is one shared BrickAtlas texture partitioned into slots, replacing stage
+  // 9a's single dedicated per-brick texture; undefined = no atlas set yet, coarse tex bound as a dummy).
+  private brickAtlasTex: ManagedTexture | undefined;
+  private brickSlotSizeValue = 0;
+  private readonly brickSlots: [BrickSlotParams, BrickSlotParams, BrickSlotParams, BrickSlotParams] = [
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+    { enabled: false, worldMin: [0, 0, 0], worldMax: [0, 0, 0], blend: 1, atlasOrigin: [0, 0, 0] },
+  ];
+
+  // Mask/annotation layers (item 7 Phase B): two independent, fixed slots (not generalized to N — see
+  // the task this was extended for), each a same-grid r8uint class-id volume + its rgba8unorm palette
+  // (class id → color+opacity). Dummies are genuinely valid r8uint/rgba8unorm textures (unlike
+  // brickTex, nothing else bound has a compatible format to reuse as a fallback — see
+  // volume-bindings.ts) and are shared across both slots (an empty stand-in needs no per-slot identity).
+  private readonly masks: [MaskSlot, MaskSlot] = [
+    { tex: undefined, paletteTex: undefined, enabled: false },
+    { tex: undefined, paletteTex: undefined, enabled: false },
+  ];
+  private readonly dummyMaskTex: ManagedTexture;
+  private readonly dummyMaskPalette: ManagedTexture;
+
+  private readonly frameData = new Float32Array(VOLUME_FRAME_UNIFORM_SIZE / 4);
+  private readonly invViewProj = new Mat4();
+  private readonly lightingPass: LightingPass;
+
+  public constructor(
+    public readonly ctx: GpuContext,
+    options: VolumeRendererOptions = {},
+  ) {
+    this.pipelineMgr = new VolumePipeline(ctx);
+    this.bindings = new VolumeBindings(ctx.device);
+    this.clearColor = toGpuColor(options.clearColor ?? [0.02, 0.03, 0.05, 1]);
+    this.colorFormat = options.colorFormat ?? ctx.format;
+    this.linearOutput = options.linearOutput ?? false;
+    this.shaderConfig = options.shaderConfig ?? "baseline";
+    this.earlyRayTermination = options.earlyRayTermination ?? 0.995;
+    this.stepSize = options.stepSize ?? 1 / 260;
+    this.densityScale = options.densityScale ?? 1.35;
+    // Hard safety cap on ray-march iterations. The per-frame step count is derived from the box
+    // diagonal / step size (see writeFrame) so a ray always reaches the far face; this only bounds the
+    // pathological case (very fine sampling of a large box).
+    this.maxSteps = options.maxSteps ?? 4096;
+    this.exposure = options.exposure ?? 1.15;
+    this.lightDirection = [...(options.lightDirection ?? [0.45, 0.85, 0.35])] as [
+      number,
+      number,
+      number,
+    ];
+    this.lightColor = asColor3(options.lightColor ?? [1.0, 0.96, 0.9]);
+    this.ambient = options.ambient ?? 0.22;
+    this.specularPower = options.specularPower ?? 48;
+    this.blendMode = options.blendMode ?? "composite";
+    this.gradientOpacity = options.gradientOpacity ?? 0;
+    this.gradientOpacityScale = options.gradientOpacityScale ?? 0.15;
+    this.lightingStrength = options.lightingStrength ?? 1;
+    this.masterAmbient = this.ambient;
+    this.acceleration = new VolumeAcceleration(ctx.device);
+    this.lightingPass = new LightingPass(ctx.device);
+    if (options.liquidShading) this.setLiquidShading(options.liquidShading);
+    this.dummyPreint = new ManagedTexture(ctx.device, {
+      size: [1, 1, 1],
+      format: "r16float",
+      dimension: "2d",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.dummyMaskTex = new ManagedTexture(ctx.device, {
+      size: [1, 1, 1],
+      format: "r8uint",
+      dimension: "3d",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.dummyMaskPalette = new ManagedTexture(ctx.device, {
+      size: [1, 1, 1],
+      format: "rgba8unorm",
+      dimension: "2d",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+  }
+
+  public setVolume(texture: ManagedTexture): void {
+    this.volumeTex = texture;
+    this.bindings.invalidate();
+    this.acceleration.notifyVolumeChanged(texture.desc.size);
+  }
+
+  /**
+   * Enable/point the opacity shadow map (Milestone 7.1). `lightDir` is a unit vector toward the primary
+   * shadow-casting light. A meaningful change of direction (or the enable) marks the map dirty so it
+   * rebuilds on the next pre-pass; unchanged inputs cost nothing.
+   */
+  public setShadowMap(enabled: boolean, lightDir: readonly [number, number, number]): void {
+    this.acceleration.setShadowMap(enabled, lightDir);
+  }
+
+  /**
+   * Set (or clear with `null`) the shared `BrickAtlas` texture backing all 4 brick slots (item 9 stage
+   * 9b — replaces stage 9a's per-brick dedicated texture). `slotSize` is the atlas's fixed voxels/axis
+   * per slot (shared by all 4). Rarely changes (once per atlas construction, e.g. on dataset load) —
+   * unlike per-slot updates, this rebuilds the bind group.
+   */
+  public setBrickAtlas(texture: ManagedTexture | null, slotSize: number): void {
+    this.brickAtlasTex = texture ?? undefined;
+    this.brickSlotSizeValue = slotSize;
+    this.bindings.invalidate(); // texture binding changed
+  }
+
+  /**
+   * Set (or clear with `null`) one resident brick slot's placement within the atlas. `worldMin`/
+   * `worldMax` are the world (sim-unit) box this slot's placed region maps onto; `atlasOrigin` is its
+   * voxel origin within the shared atlas texture (`BrickAtlas.slotVoxelOrigin`). No bind-group rebuild
+   * (only the atlas texture binding itself, set via `setBrickAtlas`, requires that).
+   */
+  public setBrickSlot(
+    slot: 0 | 1 | 2 | 3,
+    params: {
+      worldMin: readonly [number, number, number];
+      worldMax: readonly [number, number, number];
+      atlasOrigin: readonly [number, number, number];
+    } | null,
+  ): void {
+    const s = this.brickSlots[slot];
+    s.enabled = params !== null;
+    if (params) {
+      s.worldMin = [params.worldMin[0], params.worldMin[1], params.worldMin[2]];
+      s.worldMax = [params.worldMax[0], params.worldMax[1], params.worldMax[2]];
+      s.atlasOrigin = [params.atlasOrigin[0], params.atlasOrigin[1], params.atlasOrigin[2]];
+    }
+  }
+
+  /** Fade weight [0,1] for brick slot `slot` (drives smooth zoom-out/eviction); no bind-group rebuild. */
+  public setBrickSlotBlend(slot: 0 | 1 | 2 | 3, weight: number): void {
+    this.brickSlots[slot].blend = Math.min(1, Math.max(0, weight));
+  }
+
+  /**
+   * Set (or clear with `null`) mask/annotation slot `slot`'s density texture (`r8uint`, item 7 Phase
+   * B — exactly two independent slots, fixed). Assumed to share the primary volume's own world box (no
+   * separate world-AABB/translation handling) — see the plan's Phase B design note for why that's a
+   * safe assumption for an annotation of this scan.
+   */
+  public setMask(slot: 0 | 1, texture: ManagedTexture | null): void {
+    const s = this.masks[slot];
+    s.tex = texture ?? undefined;
+    s.enabled = texture !== null;
+    this.bindings.invalidate();
+  }
+
+  /** Set (or clear with `null`) mask slot `slot`'s palette (class id → color+opacity, `rgba8unorm`,
+   * one row) — mirrors {@link setMask}'s null-clears-the-slot shape. Without a `null` case, a caller
+   * that disposes the palette texture (e.g. removing the mask) would leave this renderer holding a
+   * stale reference to a disposed `ManagedTexture`, which throws on the next `createView()` call in
+   * `VolumeBindings.ensure()` and poisons the whole frame. */
+  public setMaskPalette(slot: 0 | 1, paletteTexture: ManagedTexture | null): void {
+    this.masks[slot].paletteTex = paletteTexture ?? undefined;
+    this.bindings.invalidate();
+  }
+
+  public setBoxHalfSize(x: number, y: number, z: number): void {
+    this.boxHalf = [Math.max(1e-9, x), Math.max(1e-9, y), Math.max(1e-9, z)];
+  }
+
+  public setTransferFunction(tf: TransferFunction, lutSize = 512): void {
+    const lut = tf.toLut(lutSize);
+    this.tfTex?.dispose();
+    this.tfTex = new ManagedTexture(this.ctx.device, {
+      size: [lutSize, 1, 1],
+      format: "rgba8unorm",
+      dimension: "2d",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    // Tight (unpadded) row - the 256-byte bytesPerRow alignment is a copyBufferToTexture()/
+    // copyTextureToBuffer() requirement, not a writeTexture() one (confirmed against the current
+    // WebGPU spec; see volume-texture.ts's uploadVolume for the same finding/fix).
+    const bytesPerRow = lutSize * 4;
+    const padded = new Uint8Array(bytesPerRow);
+    padded.set(lut.subarray(0, lutSize * 4));
+    this.ctx.device.queue.writeTexture(
+      { texture: this.tfTex.gpu },
+      padded,
+      { bytesPerRow, rowsPerImage: 1 },
+      { width: lutSize, height: 1, depthOrArrayLayers: 1 },
+    );
+    this.lastLut = lut;
+    this.lastLutSize = lutSize;
+    this.tfHash = hashTransferFunction(lut);
+    this.acceleration.markOccupancyTfDirty();
+    this.acceleration.markShadowDirty();
+    // Milestone 3.1/3.2: cumulative extinction LUT T(d, sigma) = the TF alpha curve blurred by `sigma`
+    // then integrated 0..d (Gaussian-extended pre-integration). `r16float` is plenty of precision for
+    // this monotonic [0,1]-ish curve (unlike the density-pyramid mean/meanSq moments, this isn't a
+    // near-equal-value subtraction) and is filterable in core WebGPU, letting the shader use hardware
+    // bilinear sampling on both axes instead of a manual lerp. Rebuilt with the TF; `sigma` (the row
+    // axis) is a fixed, uniformly-spaced set of buckets — `preintAvgAlpha` in the shader picks the
+    // per-sample row from the density pyramid's local variance at the current LOD.
+    const alphaCurve = new Float32Array(lutSize);
+    for (let i = 0; i < lutSize; i++) alphaCurve[i] = (lut[i * 4 + 3] ?? 0) / 255;
+    // Phase 1e hardening: the raymarch's empty-space skip discards any sample below this threshold
+    // without ever consulting the TF (a fixed cutoff would silently drop a TF feature narrower than
+    // it). Tighten the cutoff to just below wherever this TF actually starts being non-transparent, so
+    // a TF with nothing meaningful under 0.01 behaves exactly as before (same 0.01 cutoff) while a TF
+    // with an opaque feature closer to 0 isn't skipped past.
+    let lowDensitySkipThreshold = 0.01;
+    for (let i = 0; i < lutSize; i++) {
+      if (alphaCurve[i]! > 1e-3) {
+        lowDensitySkipThreshold = Math.min(0.01, i / Math.max(1, lutSize - 1));
+        break;
+      }
+    }
+    this.lowDensitySkipThreshold = lowDensitySkipThreshold;
+    const sigmaBuckets = defaultSigmaBuckets();
+    const tTable = buildGaussianPreintegrationTable(alphaCurve, sigmaBuckets);
+    this.tPreintTex?.dispose();
+    this.tPreintTex = new ManagedTexture(this.ctx.device, {
+      size: [lutSize, sigmaBuckets.length, 1],
+      format: "r16float",
+      dimension: "2d",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    // Tight (unpadded) row - see setTransferFunction's own comment above for why writeTexture() doesn't
+    // need the 256-byte alignment.
+    const preintBytesPerRow = lutSize * 2;
+    const preintPadded = new Uint8Array(preintBytesPerRow * sigmaBuckets.length);
+    const preintView = new DataView(preintPadded.buffer);
+    for (let row = 0; row < sigmaBuckets.length; row++) {
+      const rowOffset = row * preintBytesPerRow;
+      for (let i = 0; i < lutSize; i++) {
+        preintView.setUint16(rowOffset + i * 2, floatToHalf(tTable[row * lutSize + i] ?? 0), true);
+      }
+    }
+    this.ctx.device.queue.writeTexture(
+      { texture: this.tPreintTex.gpu },
+      preintPadded,
+      { bytesPerRow: preintBytesPerRow, rowsPerImage: sigmaBuckets.length },
+      { width: lutSize, height: sigmaBuckets.length, depthOrArrayLayers: 1 },
+    );
+    this.bindings.invalidate();
+  }
+
+  /**
+   * Enable CGI-style dielectric liquid shading (Fresnel free-surface, procedural env reflection,
+   * Beer–Lambert absorption). When disabled, uses the legacy TF Blinn-Phong path.
+   */
+  public setLiquidShading(params: LiquidShadingParams): void {
+    const next = applyLiquidShading(
+      {
+        enabled: this.liquidEnabled,
+        ior: this.liquidIor,
+        roughness: this.liquidRoughness,
+        envIntensity: this.liquidEnvIntensity,
+        absorptionScale: this.liquidAbsorptionScale,
+      },
+      params,
+    );
+    this.liquidEnabled = next.enabled;
+    this.liquidIor = next.ior;
+    this.liquidRoughness = next.roughness;
+    this.liquidEnvIntensity = next.envIntensity;
+    this.liquidAbsorptionScale = next.absorptionScale;
+  }
+
+  /**
+   * Replace the light list (uploaded to the GPU storage buffer). Rebuilt each frame by the viewer
+   * from the enabled lighting modes + camera basis. The first directional light also drives the
+   * procedural studio environment (`envRadiance`/`background`).
+   */
+  public setLights(lights: readonly GpuLight[]): void {
+    this.acceleration.setLights(lights);
+  }
+
+  /**
+   * Camera-linked measure plane: a fronto-parallel grey sheet composited in depth with the volume.
+   * `depth` is world distance from the eye along `forward` (a unit view-axis vector); `gray`/`alpha` in
+   * [0,1]. Call each frame with the current camera forward so the plane tracks the view.
+   */
+  public setMeasurePlane(params: MeasurePlaneParams): void {
+    const next = applyMeasurePlane(params);
+    this.measurePlaneEnabled = next.enabled;
+    this.measurePlaneDepth = next.depth;
+    this.measurePlaneGray = next.gray;
+    this.measurePlaneAlpha = next.alpha;
+    this.measureForward = next.forward;
+  }
+
+  /** Shadow / AO / master-ambient / specular controls for the multi-light path. */
+  public setLightingParams(params: VolumeLightingParams): void {
+    const next = applyVolumeLighting(
+      {
+        masterAmbient: this.masterAmbient,
+        specStrength: this.specStrength,
+        roughnessL: this.roughnessL,
+        shadowEnable: this.shadowEnable,
+        shadowSteps: this.shadowSteps,
+        shadowStrength: this.shadowStrength,
+        shadowSoftness: this.shadowSoftness,
+        aoEnable: this.aoEnable,
+        aoRadius: this.aoRadius,
+        aoIntensity: this.aoIntensity,
+        aoSamples: this.aoSamples,
+      },
+      params,
+    );
+    this.masterAmbient = next.masterAmbient;
+    this.specStrength = next.specStrength;
+    this.roughnessL = next.roughnessL;
+    this.shadowEnable = next.shadowEnable;
+    this.shadowSteps = next.shadowSteps;
+    this.shadowStrength = next.shadowStrength;
+    this.shadowSoftness = next.shadowSoftness;
+    this.aoEnable = next.aoEnable;
+    this.aoRadius = next.aoRadius;
+    this.aoIntensity = next.aoIntensity;
+    this.aoSamples = next.aoSamples;
+  }
+
+  public setBlendMode(mode: VolumeBlendMode): void {
+    this.blendMode = mode;
+  }
+
+  /** Named shader config. `"baseline"` (default) has occupancy/tiles compiled out. */
+  public setShaderConfig(name: ShaderConfigName): void {
+    if (this.shaderConfig === name) return;
+    this.shaderConfig = name;
+    this.pipelineMgr.invalidatePipeline();
+    this.bindings.invalidate();
+  }
+
+  public getShaderConfig(): ShaderConfigName {
+    return this.shaderConfig;
+  }
+
+  /** Enable ray-guided vis-bin accumulation (default off). */
+  public setVisibilityFeedback(enabled: boolean): void {
+    this.visEnabled = enabled;
+    this.acceleration.setVisibilityEnabled(enabled);
+  }
+
+  /** Latest decoded vis-bin weights, or `undefined` before the first readback. */
+  public get visibility(): VisibilityFeedback {
+    return this.acceleration.visibilityFeedback;
+  }
+
+  /** Estimated GPU bytes held by the density pre-integration pyramid, or 0 when none is allocated
+   * (lazy, "quality"-config-only — see `VolumeAcceleration`'s own doc). Phase 4c hardening. */
+  public get densityPyramidBytes(): number {
+    return this.acceleration.densityPyramidBytes;
+  }
+
+  /** Early-ray-termination alpha threshold in `(0, 1]` (default `0.995`). */
+  public setEarlyRayTermination(threshold: number): void {
+    this.earlyRayTermination = Math.min(1, Math.max(0.5, threshold));
+  }
+
+  /**
+   * Phase 1a hardening: call with `true` exactly when a separate half-res `LightingPass` is going to
+   * run this frame (the caller already computes this to decide whether to invoke that pass — pass the
+   * same value here). When `true`, the main ray march's `heavy` gate (`volume-raymarch.ts`) is forced
+   * off regardless of per-sample transmittance/opacity, so the expensive AO/shadow/multi-scatter terms
+   * inside `evaluateLighting()` cost nothing inline — they're computed once, at half-res, by the
+   * separate pass instead. Without this, "deferred" lighting was strictly more expensive than not
+   * deferring: full heavy cost paid inline every frame, plus a second half-res computation whose AO
+   * output was discarded and whose RGB output replaced (not reused) the inline result.
+   */
+  public setDeferLighting(defer: boolean): void {
+    this.deferLighting = defer;
+  }
+
+  /** Internal HDR size the volume pass renders into (for tile compaction). */
+  public setInternalSize(width: number, height: number): void {
+    this.internalWidth = Math.max(1, width);
+    this.internalHeight = Math.max(1, height);
+  }
+
+  /** Far-plane distance used to normalize the depth-centroid output for TAAU reprojection. */
+  public setReprojectFar(far: number): void {
+    this.reprojectFar = Math.max(1e-6, far);
+  }
+
+  /**
+   * Camera basis + FOV for building the primary ray direction in the shader (see marchColor). Supplying
+   * the unit right/up/forward axes and FOV lets the ray-march reconstruct directions without invViewProj,
+   * which degrades in float32 at large zoom-out (volume vanishing / inverting). `right`/`up`/`forward`
+   * must be unit and orthonormal; `fovYRadians` is the vertical FOV and `aspect` = width/height.
+   */
+  public setCameraBasis(
+    right: [number, number, number],
+    up: [number, number, number],
+    forward: [number, number, number],
+    fovYRadians: number,
+    aspect: number,
+  ): void {
+    this.camRight = right;
+    this.camUp = up;
+    this.tanHalfFovY = Math.tan(Math.max(1e-3, fovYRadians) * 0.5);
+    this.camAspect = Math.max(1e-3, aspect);
+    // The shader reads the camera forward from the measureFwd slot (also what the measure plane needs);
+    // keep it in sync so the ray forward is fresh every frame even if setMeasurePlane isn't called.
+    this.measureForward = forward;
+  }
+
+  /**
+   * Occupancy rebuild + tile classify + vis-bin copy. Call on the same encoder, before the volume
+   * render pass, when the current shader config uses those structures.
+   */
+  public recordPrePasses(
+    encoder: GPUCommandEncoder,
+    viewProj: Mat4,
+    eye: { x: number; y: number; z: number },
+  ): void {
+    const spec = specializationFor(this.shaderConfig);
+    this.pipelineMgr.ensure(this.shaderConfig, this.colorFormat);
+    this.writeUniforms(viewProj, eye, { clear: true });
+    const bindGroupDirty = this.acceleration.runPrePasses(encoder, {
+      viewProj,
+      spec,
+      volumeTex: this.volumeTex,
+      lastLut: this.lastLut,
+      lastLutSize: this.lastLutSize,
+      frameUniformGpu: this.pipelineMgr.uniformBuffer.gpu,
+      internalWidth: this.internalWidth,
+      internalHeight: this.internalHeight,
+      boxHalf: this.boxHalf,
+      tfTex: this.tfTex,
+      tfSampler: this.pipelineMgr.tfSamplerHandle,
+      shadowEnable: this.shadowEnable,
+      densityScale: this.densityScale,
+      cropMin: this.cropMin,
+      cropMax: this.cropMax,
+    });
+    if (bindGroupDirty) this.bindings.invalidate();
+  }
+
+  /** Map pending vis-bin readback. Must run after the encoder that copied it has been submitted. */
+  public afterSubmit(): void {
+    this.acceleration.afterSubmit();
+  }
+
+  /**
+   * Provenance block for PNG export / screenshot stamping. `taauFrames` must be supplied by the
+   * caller — this renderer doesn't own the TAAU accumulator (it lives in the viewer, rebuilt per
+   * frame from the camera).
+   */
+  public provenance(
+    renderScale: number,
+    taauFrames: number,
+    extras?: Partial<RenderProvenance>,
+  ): RenderProvenance {
+    return computeProvenance(
+      this.shaderConfig,
+      this.tfHash,
+      renderScale,
+      taauFrames,
+      this.shadowEnable,
+      extras,
+    );
+  }
+
+  public setViewMode(mode: VolumeViewMode): void {
+    this.viewMode = mode;
+  }
+
+  /** Crop region in normalized volume UVW `[0,1]^3`. */
+  public setCrop(min: readonly [number, number, number], max: readonly [number, number, number]): void {
+    const nmin: [number, number, number] = [
+      Math.min(min[0], max[0]),
+      Math.min(min[1], max[1]),
+      Math.min(min[2], max[2]),
+    ];
+    const nmax: [number, number, number] = [
+      Math.max(min[0], max[0]),
+      Math.max(min[1], max[1]),
+      Math.max(min[2], max[2]),
+    ];
+    // The shadow map excludes cropped-away material, so a crop change invalidates it (only when it
+    // actually changed — setCrop is re-called every applyRender).
+    if (nmin.some((v, i) => v !== this.cropMin[i]) || nmax.some((v, i) => v !== this.cropMax[i])) {
+      this.acceleration.markShadowDirty();
+    }
+    this.cropMin = nmin;
+    this.cropMax = nmax;
+  }
+
+  public resetCrop(): void {
+    if (this.cropMin[0] !== 0 || this.cropMin[1] !== 0 || this.cropMin[2] !== 0) {
+      this.acceleration.markShadowDirty();
+    }
+    this.cropMin = [0, 0, 0];
+    this.cropMax = [1, 1, 1];
+  }
+
+  /** Slice positions in normalized UVW `[0,1]`. */
+  public setSlices(x: number, y: number, z: number): void {
+    this.sliceX = clamp01(x);
+    this.sliceY = clamp01(y);
+    this.sliceZ = clamp01(z);
+  }
+
+  public setSliceEnabled(axis: "x" | "y" | "z", enabled: boolean): void {
+    if (axis === "x") this.sliceEnableX = enabled;
+    else if (axis === "y") this.sliceEnableY = enabled;
+    else this.sliceEnableZ = enabled;
+  }
+
+  /** Enable/disable the oblique-plane overlay (independent of `viewMode`, matching `setSliceEnabled`'s
+   * per-axis toggles — can be on even in `"volume"` mode). */
+  public setSliceEnabledOblique(enabled: boolean): void {
+    this.sliceEnableOblique = enabled;
+  }
+
+  /**
+   * Set the oblique cut plane: `normal` (world-space, need not be pre-normalized) and a `point` the
+   * plane passes through — the offset the shader actually uses (`dot(worldPos, normal) === offset`) is
+   * derived here so callers can think in terms of "this point, this direction" rather than the raw
+   * plane-equation form.
+   */
+  public setObliquePlane(normal: readonly [number, number, number], point: readonly [number, number, number]): void {
+    const len = Math.hypot(normal[0], normal[1], normal[2]) || 1;
+    const n: [number, number, number] = [normal[0] / len, normal[1] / len, normal[2] / len];
+    this.obliqueNormal = n;
+    this.obliqueOffset = n[0] * point[0] + n[1] * point[1] + n[2] * point[2];
+  }
+
+  /** Same as {@link setObliquePlane} but takes the raw plane-equation form (`normal` assumed already
+   * unit length, `offset` such that `dot(worldPos, normal) === offset` defines the plane) directly —
+   * for a caller (like `WebGpuCroppingState`) that already stores the plane that way, avoiding a
+   * needless point round-trip through `setObliquePlane`. */
+  public setObliquePlaneRaw(normal: readonly [number, number, number], offset: number): void {
+    this.obliqueNormal = [normal[0], normal[1], normal[2]];
+    this.obliqueOffset = offset;
+  }
+
+  /** Draw axis planes as highlights in volume mode (itk-vtk `s` toggle). */
+  public setSlicePlanesVisible(visible: boolean): void {
+    this.showSlicePlanes = visible;
+  }
+
+  /**
+   * Green wireframe-box indicator: highlights an arbitrary axis-aligned uvw `[0,1]^3` box, independent
+   * of the crop/slice system entirely — e.g. so a "context" pane can show exactly what region a linked
+   * "detail" pane is cropped to, without cropping this pane's own rendering (`cropMin`/`cropMax` stay
+   * whatever they already are). `min`/`max` are in the same uvw `[0,1]` convention as `cropMin`/
+   * `cropMax`.
+   */
+  public setOverlayBox(
+    enabled: boolean,
+    min: readonly [number, number, number],
+    max: readonly [number, number, number],
+  ): void {
+    this.overlayBoxEnabled = enabled;
+    this.overlayBoxMin = [min[0], min[1], min[2]];
+    this.overlayBoxMax = [max[0], max[1], max[2]];
+  }
+
+  public setParams(
+    params: Partial<
+      Pick<
+        VolumeRendererOptions,
+        | "stepSize"
+        | "densityScale"
+        | "maxSteps"
+        | "exposure"
+        | "ambient"
+        | "specularPower"
+        | "lightDirection"
+        | "lightColor"
+        | "blendMode"
+        | "gradientOpacity"
+        | "gradientOpacityScale"
+        | "lightingStrength"
+      >
+    >,
+  ): void {
+    if (params.stepSize !== undefined) this.stepSize = params.stepSize;
+    if (params.densityScale !== undefined && params.densityScale !== this.densityScale) {
+      this.densityScale = params.densityScale;
+      this.acceleration.markShadowDirty(); // τ scales with density → the shadow map must rebuild
+    }
+    if (params.maxSteps !== undefined) this.maxSteps = params.maxSteps;
+    if (params.exposure !== undefined) this.exposure = params.exposure;
+    const nextLight = applyLegacyLight(
+      {
+        ambient: this.ambient,
+        specularPower: this.specularPower,
+        lightDirection: this.lightDirection,
+        lightColor: this.lightColor,
+      },
+      params,
+    );
+    this.ambient = nextLight.ambient;
+    this.specularPower = nextLight.specularPower;
+    this.lightDirection = nextLight.lightDirection;
+    this.lightColor = nextLight.lightColor;
+    if (params.blendMode) this.blendMode = params.blendMode;
+    if (params.gradientOpacity !== undefined) this.gradientOpacity = params.gradientOpacity;
+    if (params.gradientOpacityScale !== undefined) {
+      this.gradientOpacityScale = params.gradientOpacityScale;
+    }
+    if (params.lightingStrength !== undefined) this.lightingStrength = params.lightingStrength;
+  }
+
+  /**
+   * Ray-march the volume.
+   * @param options.clear - When `false`, preserve the current swapchain color and composite with
+   *   alpha (empty rays transparent) so acrylic tanks / caustic floors drawn underneath show through.
+   */
+  public render(
+    viewProj: Mat4,
+    eye: { x: number; y: number; z: number },
+    options: { clear?: boolean } = {},
+  ): void {
+    const { device, canvasContext } = this.ctx;
+    const encoder = device.createCommandEncoder({ label: "volume-frame" });
+    const pass = encoder.beginRenderPass({
+      label: "volume-raymarch",
+      colorAttachments: [
+        {
+          view: canvasContext.getCurrentTexture().createView(),
+          clearValue: this.clearColor,
+          loadOp: options.clear === false ? "load" : "clear",
+          storeOp: "store",
+        },
+      ],
+    });
+    this.recordInto(pass, viewProj, eye, options);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  }
+
+  /**
+   * Record the ray-march draw into an already-begun render pass (no encoder/submit ownership), for
+   * driving the volume renderer from a {@link RenderGraph}. Writes per-frame uniforms then issues the
+   * single fullscreen draw. Requires {@link setVolume} and {@link setTransferFunction} first.
+   */
+  public recordInto(
+    pass: GPURenderPassEncoder,
+    viewProj: Mat4,
+    eye: { x: number; y: number; z: number },
+    options: { clear?: boolean } = {},
+  ): void {
+    const volumeTex = this.volumeTex;
+    const tfTex = this.tfTex;
+    if (!volumeTex || !tfTex) {
+      // Not ready yet (volume/TF still uploading) — skip this frame instead of throwing every tick.
+      return;
+    }
+    this.pipelineMgr.ensure(this.shaderConfig, this.colorFormat);
+    this.frameIndex++;
+    this.writeUniforms(viewProj, eye, options);
+
+    const spec = specializationFor(this.shaderConfig);
+    const bindGroup = this.bindings.ensure({
+      layout: this.pipelineMgr.layout,
+      frameUniform: this.pipelineMgr.uniformBuffer,
+      volumeTex,
+      volumeSampler: this.pipelineMgr.sampler,
+      tfTex,
+      tfSampler: this.pipelineMgr.tfSamplerHandle,
+      brickTex: this.brickAtlasTex,
+      preintTex: this.tPreintTex ?? this.dummyPreint,
+      spec,
+      acceleration: this.acceleration,
+      maskTex: [
+        this.masks[0].tex ?? this.dummyMaskTex,
+        this.masks[1].tex ?? this.dummyMaskTex,
+      ],
+      maskPaletteTex: [
+        this.masks[0].paletteTex ?? this.dummyMaskPalette,
+        this.masks[1].paletteTex ?? this.dummyMaskPalette,
+      ],
+    });
+
+    const background = this.pipelineMgr.background;
+    if (spec.tiles && background) {
+      pass.setPipeline(background.pipeline);
+      pass.setBindGroup(0, background.bindGroup);
+      pass.draw(3);
+    }
+    pass.setPipeline(this.pipelineMgr.renderPipeline);
+    pass.setBindGroup(0, bindGroup);
+    if (spec.tiles) {
+      pass.drawIndirect(this.acceleration.tileDrawIndirectBuffer, 0);
+    } else {
+      pass.draw(3);
+    }
+  }
+
+  private writeUniforms(
+    viewProj: Mat4,
+    eye: { x: number; y: number; z: number },
+    options: { clear?: boolean } = {},
+  ): void {
+    this.invViewProj.copy(viewProj);
+    if (!this.invViewProj.invert()) {
+      // Skips the whole uniform upload, leaving the GPU-side frame uniform at whatever it was last
+      // frame - harmless on its own (the next frame retries), but was previously silent, and `Mat4.
+      // invert()`'s own singularity threshold used to false-reject ordinary large-camera-distance
+      // transforms (fixed - see that method's doc comment), so this should now be exceedingly rare.
+      // Logged so a genuine recurrence (rather than a one-off) is visible instead of a silently stale
+      // frame.
+      console.error("[zarr-viewer] viewProj is not invertible this frame - skipping uniform upload");
+      return;
+    }
+
+    // The box's own projected depth along the CURRENT view direction (`measureForward`, kept fresh by
+    // `setCameraBasis` every frame) — see `VolumeFrameParams.viewDepth`'s own doc comment for why this
+    // is used instead of the box's fixed 3D diagonal as the iteration budget's worst-case distance.
+    const [fx, fy, fz] = this.measureForward;
+    const viewDepth =
+      2 * (this.boxHalf[0] * Math.abs(fx) + this.boxHalf[1] * Math.abs(fy) + this.boxHalf[2] * Math.abs(fz));
+
+    writeVolumeFrameUniform(this.frameData, this.invViewProj, this.acceleration, {
+      eye,
+      clear: options.clear !== false,
+      frameIndex: this.frameIndex,
+      boxHalf: this.boxHalf,
+      viewDepth,
+      maxSteps: this.maxSteps,
+      stepSize: this.stepSize,
+      densityScale: this.densityScale,
+      exposure: this.exposure,
+      masterAmbient: this.masterAmbient,
+      specularPower: this.specularPower,
+      blendMode: this.blendMode,
+      gradientOpacity: this.gradientOpacity,
+      gradientOpacityScale: this.gradientOpacityScale,
+      lightingStrength: this.lightingStrength,
+      liquidEnabled: this.liquidEnabled,
+      liquidIor: this.liquidIor,
+      liquidRoughness: this.liquidRoughness,
+      liquidEnvIntensity: this.liquidEnvIntensity,
+      liquidAbsorptionScale: this.liquidAbsorptionScale,
+      cropMin: this.cropMin,
+      cropMax: this.cropMax,
+      sliceX: this.sliceX,
+      sliceY: this.sliceY,
+      sliceZ: this.sliceZ,
+      sliceEnableX: this.sliceEnableX,
+      sliceEnableY: this.sliceEnableY,
+      sliceEnableZ: this.sliceEnableZ,
+      sliceEnableOblique: this.sliceEnableOblique,
+      obliqueNormal: this.obliqueNormal,
+      obliqueOffset: this.obliqueOffset,
+      overlayBoxEnabled: this.overlayBoxEnabled,
+      overlayBoxMin: this.overlayBoxMin,
+      overlayBoxMax: this.overlayBoxMax,
+      showSlicePlanes: this.showSlicePlanes,
+      viewMode: this.viewMode,
+      linearOutput: this.linearOutput,
+      earlyRayTermination: this.earlyRayTermination,
+      deferLighting: this.deferLighting,
+      specStrength: this.specStrength,
+      roughnessL: this.roughnessL,
+      shadowEnable: this.shadowEnable,
+      shadowSteps: this.shadowSteps,
+      shadowStrength: this.shadowStrength,
+      shadowSoftness: this.shadowSoftness,
+      aoEnable: this.aoEnable,
+      aoRadius: this.aoRadius,
+      aoIntensity: this.aoIntensity,
+      aoSamples: this.aoSamples,
+      measurePlaneEnabled: this.measurePlaneEnabled,
+      measurePlaneDepth: this.measurePlaneDepth,
+      measurePlaneGray: this.measurePlaneGray,
+      measurePlaneAlpha: this.measurePlaneAlpha,
+      measureForward: this.measureForward,
+      bricks: this.brickSlots,
+      brickSlotSize: this.brickSlotSizeValue,
+      visEnabled: this.visEnabled,
+      internalWidth: this.internalWidth,
+      internalHeight: this.internalHeight,
+      reprojectFar: this.reprojectFar,
+      camRight: this.camRight,
+      camUp: this.camUp,
+      camAspect: this.camAspect,
+      tanHalfFovY: this.tanHalfFovY,
+      masks: [
+        { enabled: this.masks[0].enabled, dims: this.masks[0].tex?.desc.size ?? [1, 1, 1] },
+        { enabled: this.masks[1].enabled, dims: this.masks[1].tex?.desc.size ?? [1, 1, 1] },
+      ],
+      lowDensitySkipThreshold: this.lowDensitySkipThreshold,
+    });
+    this.pipelineMgr.uniformBuffer.write(this.frameData);
+  }
+
+  /**
+   * Add the half-res `LightingPass` to `graph`, reading `gbuffer` (the just-recorded volume pass's
+   * `surfacePos`/`surfaceNormal`/`surfaceAlbedo` targets), and return the `lightAdd` handle. Called
+   * from the production render path whenever `setDeferLighting(true)` was also called this frame
+   * ({@link "../post/fx-pipeline".FxPipeline.render} either composites the result onto `colorUnlit`,
+   * or — for the `KeyL` diagnostic toggle — blits it straight to the swapchain). `undefined` before the
+   * volume/TF are loaded.
+   */
+  public recordLighting(
+    graph: RenderGraph,
+    gbuffer: LightingPassGbuffer,
+    width: number,
+    height: number,
+  ): ResourceHandle | undefined {
+    const volumeTex = this.volumeTex;
+    const tfTex = this.tfTex;
+    if (!volumeTex || !tfTex) return undefined;
+    return this.lightingPass.resolve(graph, {
+      frameUniform: this.pipelineMgr.uniformBuffer.gpu,
+      volumeTex: volumeTex.gpu,
+      volumeSampler: this.pipelineMgr.sampler,
+      tfTex: tfTex.gpu,
+      tfSampler: this.pipelineMgr.tfSamplerHandle,
+      lightsBuffer: this.acceleration.lightBuffer,
+      brickTex: (this.brickAtlasTex ?? volumeTex).gpu,
+      shadowTex: this.acceleration.shadowMapTexture.gpu,
+      surfacePos: gbuffer.surfacePos,
+      surfaceNormal: gbuffer.surfaceNormal,
+      surfaceAlbedo: gbuffer.surfaceAlbedo,
+      fullWidth: width,
+      fullHeight: height,
+    });
+  }
+
+  public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.pipelineMgr.dispose();
+    this.tfTex?.dispose();
+    this.acceleration.dispose();
+    this.lightingPass.dispose();
+    this.tPreintTex?.dispose();
+    this.dummyPreint.dispose();
+    this.dummyMaskTex.dispose();
+    this.dummyMaskPalette.dispose();
+    this.tfTex = undefined;
+    this.volumeTex = undefined;
+    this.bindings.invalidate();
+  }
+
+}
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}

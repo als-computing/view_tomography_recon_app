@@ -4,14 +4,38 @@
 
 This web application allows users to load their reconstructed volumes using `Bluesky Tiled Browser` into the `itk-vtk-viewer` widget, all within the same `React` web application.
 
+📖 **Full documentation (getting started + every feature) is available as an mkdocs site**, and is also
+built into the app itself — a **📖 Docs** button in the header opens it in an in-app iframe.
+
+- **Via `docker compose up`**: a `docs` service serves it automatically, proxied through the app at
+  `/tomo_viewer/docs/` — the Docs button just works, no setup needed.
+- **Via a published/deployed image** (`:local`/`:als-prod`/`:als-staging`): the docs are built into the
+  same image and served same-origin, at `<base path>docs/` (e.g. `/bl832/tomo_viewer/docs/`) — the Docs
+  button resolves this as a relative path, so it works regardless of which domain fronts the
+  deployment, with no docs URL/FQDN ever hardcoded into the app.
+- **Standalone**, outside the app (e.g. while writing docs):
+  ```bash
+  pip install -r requirements-docs.txt
+  mkdocs serve
+  ```
+  Then open http://127.0.0.1:8000/.
+
+To point the Docs button at a genuinely separate, externally-hosted docs site instead (or to hide it
+entirely), set `VITE_DOCS_URL` when building from source (`VITE_DOCS_URL=https://docs.example.com npm
+run build`, or `VITE_DOCS_URL= npm run build` to hide it) — see `src/config.ts`. This isn't exposed as
+a `Dockerfile` build arg, since the built-in same-origin docs already work correctly for every
+published image without needing a per-deployment override.
+
 ---
 
 # Installation via Docker (Recommended)
 
 ## Install Docker
-Before you begin, make sure you have Docker installed on your machine.
+Before you begin, make sure you have Docker (the `docker` CLI + a running daemon, plus the `docker compose` plugin) installed on your machine. Any of the following work — this repo doesn't depend on Docker Desktop specifically:
 
-- [Download Docker Desktop](https://www.docker.com/)
+- [Docker Desktop](https://www.docker.com/) — official, free for personal/small-business use, available for macOS/Windows/Linux.
+- [Colima](https://github.com/abiosoft/colima) — open-source, macOS/Linux, a lightweight Docker Desktop alternative (`brew install docker docker-compose colima`, then `colima start`).
+- [Podman Desktop](https://podman-desktop.io/) or [OrbStack](https://orbstack.dev/) — other common alternatives; either works as long as `docker`/`docker compose` resolve on your `PATH`.
 
 ## Clone repository
 Next, clone this repository.
@@ -22,24 +46,24 @@ Once it is downloaded, cd into it:
 
 `cd view_tomography_recon_app`
 
-## Add Tiled
-
-Now let's also add a version of `Bluesky Tiled` that supports the `Zarr` format. In the root of `view_tomography_recon_app/`, run the following command to clone Tiled:
-
-`git clone -b add-zarr-forked https://github.com/davramov/tiled.git`
-
-Confirm that Tiled is saved in the correct location: `view_tomography_recon_app/tiled/`
-
 ## Set environment variables
 
-Create a new file `.env` in `view_tomography_recon_app/` (or rename `.env.example` ) and add the following lines (make sure to update the path to a real location):  
- 
+Create a new file `.env` in `view_tomography_recon_app/` (or rename `.env.example`) and set `DATA_PATH` to the parent directory of your reconstructed datasets:
+
 ```
 DATA_PATH=/absolute/path/to/your/reconstructions/wherever/they/are
-VITE_API_TILED_URL=http://localhost:8787/
-TILED_SINGLE_USER_API_KEY=<make a strong password>
 ```
-For the `TILED_SINGLE_USER_API_KEY`, you can use a command like `openssl rand -hex 12` to generate a strong key.
+
+`docker-compose.yml`'s `tiled` service serves that directory directly (`tiled serve directory ... --public`) - no registration step, no API key, no separate Tiled checkout. Subfolders show up as datasets by name. Tiled server URL/paths/default-dataset are configured in the repo root's `config.yml` (`tiledServers`), not via env vars - edit that file if you need to point at a different local port or Tiled server.
+
+If your reconstructions have awkward on-disk names and you want friendlier dataset names in the catalog without renaming/copying the actual files, create a `docker-compose.override.yml` (gitignored, machine-specific - Docker Compose merges it automatically) that adds per-dataset bind mounts to the `tiled` service, e.g.:
+
+```yaml
+services:
+  tiled:
+    volumes:
+      - /absolute/path/to/rec2026..._petiole22.zarr:/storage/data/scans/petiole22.zarr:ro
+```
 
 ## Build and start the application
 
@@ -56,23 +80,18 @@ and you should see an output like this:
 ```
 (base) you@your-computer view_tomography_recon_app % docker compose ps
 NAME                                 IMAGE                              COMMAND                   SERVICE   CREATED      STATUS      PORTS
-view_tomography_recon_app-nginx-1    nginx:stable                       "/docker-entrypoint.…"    nginx     5 days ago   Up 2 days   0.0.0.0:8787->80/tcp
+view_tomography_recon_app-nginx-1    nginx:stable                       "/docker-entrypoint.…"    nginx     5 days ago   Up 2 days   0.0.0.0:5174->80/tcp
 view_tomography_recon_app-react-1    view_tomography_recon_app-react    "npm run dev -- --ho…"    react     4 days ago   Up 2 days   5174/tcp
-view_tomography_recon_app-tiled-1    view_tomography_recon_app-tiled    "sh -c '\n  # 1) Laun…"   tiled     4 days ago   Up 2 days   8000/tcp
-view_tomography_recon_app-viewer-1   view_tomography_recon_app-viewer   "npx itk-vtk-viewer …"    viewer    2 days ago   Up 2 days   8082/tcp
+view_tomography_recon_app-tiled-1    ghcr.io/bluesky/tiled:0.2.16       "tiled serve directo…"    tiled     4 days ago   Up 2 days   0.0.0.0:8001->8000/tcp
 ```
-
-## Authenticate
-
-Before we can use the app, we need to authenticate with Bluesky Tiled.
-
-In your browser, navigate to: http://localhost:8787/?api_key=TILED_SINGLE_USER_API_KEY (and make sure that you add your actual `TILED_SINGLE_USER_API_KEY`).
 
 ## Start the viewer
 
-To use the visualization app in your browser, go to: http://localhost:8787/react/
+Tiled runs in public/anonymous mode for reading, so no separate authentication step is needed. Open the app directly: http://localhost:5174/tomo_viewer/ — select "Local" in the header's server dropdown and your datasets (from `DATA_PATH`) should list in the Tiled browser widget.
 
-Note: you can access tiled and the viewer application from other computers by noting your [WAN IP address](http://wanip.info/) and using that instead of `localhost`.
+If you ever need the write-capable API key (e.g. to modify data through Tiled directly), it's printed at startup — `docker compose logs tiled`.
+
+Note: you can access the app from other computers by noting your [WAN IP address](http://wanip.info/) and using that instead of `localhost`.
 
 Voila!
 
@@ -86,6 +105,55 @@ If you update the `.env` file, you can restart the whole application by running 
 
 ---
 
+# Building the deployment images
+
+The docker-compose flow above runs the Vite **dev server** — good for local development, not for
+deployment. For deployment, the app instead builds three separate, purpose-built production images
+from the same root-level `Dockerfile` (`target: prod`), differing only in build args. See
+[`docs/admin/deployment.md`](docs/admin/deployment.md) for the full picture (why three images, HTTPS
+requirements, the server-locking mechanism, etc.) — this section is just the commands.
+
+| Tag | Build command |
+|---|---|
+| `:local` | `docker build --target prod --build-arg BASE_PATH=/tomo_viewer/ -t view_tomography_recon_app:local .` |
+| `:als-prod` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=tiled.als.lbl.gov -t view_tomography_recon_app:als-prod .` |
+| `:als-staging` | `docker build --target prod --build-arg BASE_PATH=/bl832/tomo_viewer/ --build-arg FIXED_TILED_SERVER=tiled-staging.als.lbl.gov -t view_tomography_recon_app:als-staging .` |
+
+- `:local` shows the full Local/Remote/Production server dropdown (same as the dev-server flow above) —
+  useful for testing against any of the three Tiled servers from one image.
+- `:als-prod`/`:als-staging` are each locked to one Tiled server (dropdown hidden) — these are exactly
+  what gets published to `ghcr.io` on merge (see below).
+
+Run any of them the same way:
+
+```bash
+docker run -d -p 5174:80 view_tomography_recon_app:local
+```
+
+Then open `http://localhost:5174/tomo_viewer/` (adjust the path to match whichever `BASE_PATH` you built with).
+
+## Pulling the published images
+
+Once `remote-tiled` merges to `main`, [`.github/workflows/publish-image.yml`](.github/workflows/publish-image.yml)
+automatically builds and pushes all three images to `ghcr.io` on every push to `main` (and any `v*` tag)
+— no manual build needed after that point:
+
+```bash
+docker pull ghcr.io/als-computing/view_tomography_recon_app:local
+docker pull ghcr.io/als-computing/view_tomography_recon_app:als-prod
+docker pull ghcr.io/als-computing/view_tomography_recon_app:als-staging
+```
+
+```bash
+docker run -d -p 8080:80 ghcr.io/als-computing/view_tomography_recon_app:als-prod
+```
+
+Note: depending on the GHCR package's visibility setting (public vs. private, configured separately in
+GitHub's package settings after the first push), pulling may require `docker login ghcr.io` first even
+though pushing always does.
+
+---
+
 # Installation from Scratch (Not recommended)
 
 ## `Bluesky Tiled`
@@ -94,26 +162,12 @@ Host your reconstructed data using `Tiled`, which we use to connect data servers
 
 #### Prepare environment
 
-`Tiled` support for `Zarr` is a work in progress, but there is a specific branch you can use for this application:
-
-*   `add-zarr-forked` branch: https://github.com/davramov/tiled/tree/add-zarr-forked
-*   This was a small addition to this PR on the source repo: https://github.com/bluesky/tiled/pull/774
-
-To install this version of Tiled, I recommend creating a new Conda environment and following the "[Install Tiled from Source](https://blueskyproject.io/tiled/tutorials/installation.html#source)" instructions:
+Zarr support is native in Tiled as of `bluesky/tiled` [PR #774](https://github.com/bluesky/tiled/pull/774) — install the regular published package (0.2.15+), no fork needed:
 
 ```
-conda create env -n "tiled_zarr_env python=3.12" 
+conda create -n tiled_zarr_env python=3.12
 conda activate tiled_zarr_env
-```
-
-#### Clone and install repository
-
-Instead of installing the main version, use this fork with Zarr support:
-
-```
-git clone -b add-zarr-forked https://github.com/davramov/tiled.git`
-cd tiled
-pip install -e ".[all]"
+pip install "tiled[all]"
 ```
 
 #### Start Tiled

@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import './header.css';
 import { Tiled, TiledItemLinks } from '@blueskyproject/tiled';
 import '@blueskyproject/tiled/style.css';
@@ -6,46 +7,92 @@ import {
   createZarrFileUrlFromTiledItem,
   fetchTiledContainerChildren,
   getTiledBaseUrl,
-  TILED_PROCESSED_PATH,
+  getProcessedPath,
 } from './utils';
+import type { RendererKind } from './stores/useTabsStore';
+import { webGpuAvailability } from './WebGpuNative/WebGpuNative';
+import { TILED_SERVERS, getActiveServer, type TiledServerId } from './tiledServers';
 
 export interface HeaderProps {
   logoUrl: string;
   title: string;
-  fileName: string;
   /**
    * Callback that receives the selected file URL.
    */
   onSelect?: (file_url: string) => void;
+  /**
+   * Copy a shareable link for the current reconstruction/view to the clipboard. Resolves true when
+   * the link was copied (drives the transient "Copied!" confirmation).
+   */
+  onShare?: () => Promise<boolean> | boolean;
+  /** Whether there's an active reconstruction to share (disables the button when false). */
+  canShare?: boolean;
+  /** The app-wide volume renderer currently in use. */
+  renderer?: RendererKind;
+  /** Flip the app-wide volume renderer between itk and webgpu. */
+  onToggleRenderer?: () => void;
+  /** The active Tiled server (Local/Remote). */
+  serverId?: TiledServerId;
+  /** Switch the active Tiled server. */
+  onSelectServer?: (id: TiledServerId) => void;
+  /** URL of the user documentation site. When unset, the Docs button is hidden entirely. */
+  docsUrl?: string;
+  /** Open the documentation site in an in-app iframe modal. */
+  onOpenDocs?: () => void;
 }
 
-type FolderStatus = 'loading' | 'ready' | 'error';
-
-export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
-  const [folders, setFolders] = useState<string[]>([]);
+export const Header = ({
+  logoUrl,
+  title,
+  onSelect,
+  onShare,
+  canShare = false,
+  renderer = 'itk',
+  onToggleRenderer,
+  serverId,
+  onSelectServer,
+  docsUrl,
+  onOpenDocs,
+}: HeaderProps) => {
   const [selectedFolder, setSelectedFolder] = useState<string>('');
-  const [status, setStatus] = useState<FolderStatus>('loading');
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Load the subfolders under the processed path once, to populate the folder dropdown.
-  useEffect(() => {
-    const controller = new AbortController();
-    setStatus('loading');
-    fetchTiledContainerChildren(TILED_PROCESSED_PATH, controller.signal)
-      .then((names) => {
-        setFolders(names);
-        // Preserve the app's previous default of opening into 'dabramov' when it exists.
-        setSelectedFolder(names.includes('dabramov') ? 'dabramov' : names[0] ?? '');
-        setStatus('ready');
-      })
-      .catch((error) => {
-        if (error?.name === 'AbortError') {
-          return;
-        }
-        console.error('Header: failed to load Tiled folders:', error);
-        setStatus('error');
-      });
-    return () => controller.abort();
+  useEffect(() => () => {
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
   }, []);
+
+  const handleShareClick = async () => {
+    if (!onShare) return;
+    const ok = await onShare();
+    if (!ok) return;
+    setCopied(true);
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopied(false), 1500);
+  };
+
+  // Server state: the subfolders under the processed path that populate the folder dropdown.
+  // TanStack Query handles caching, retries, and refetch-on-focus (so it recovers once the user
+  // logs in on an auth-required server).
+  const processedPath = getProcessedPath();
+  const { data: folders = [], isLoading, isError } = useQuery({
+    // Keyed by server so switching Local/Remote refetches the new server's folders.
+    queryKey: ['tiled-children', serverId, processedPath],
+    queryFn: ({ signal }) => fetchTiledContainerChildren(processedPath, signal),
+  });
+  const status: 'loading' | 'ready' | 'error' = isLoading ? 'loading' : isError ? 'error' : 'ready';
+
+  // Reset the folder selection when the server switches (the old folder doesn't exist on the new one).
+  useEffect(() => {
+    setSelectedFolder('');
+  }, [serverId]);
+
+  // Default the selection once folders load (preserve the app's previous default of 'dabramov').
+  useEffect(() => {
+    if (!selectedFolder && folders.length > 0) {
+      setSelectedFolder(folders.includes('dabramov') ? 'dabramov' : folders[0]);
+    }
+  }, [folders, selectedFolder]);
 
   // Full catalog path passed to the Tiled browser as its starting location. When no folder is
   // selected yet (e.g. the folder list hasn't loaded, or failed because the user isn't logged in
@@ -53,9 +100,9 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
   // needs it visible to open the browser and log in, which is what lets the dropdown load.
   // Join parent + folder, dropping empty segments so a root parent ('') doesn't yield a leading '/'.
   const selectedPath = selectedFolder
-    ? [TILED_PROCESSED_PATH, selectedFolder].filter(Boolean).join('/')
+    ? [processedPath, selectedFolder].filter(Boolean).join('/')
     : '';
-  const tiledInitialPath = selectedPath || TILED_PROCESSED_PATH;
+  const tiledInitialPath = selectedPath || processedPath;
 
   const handleTiledWidgetSelect = (tiledSelectedItemData: TiledItemLinks) => {
     const file_url = createZarrFileUrlFromTiledItem(tiledSelectedItemData);
@@ -75,9 +122,23 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
         <div>
           <img src={logoUrl} className="header-logo" alt="Logo" />
           <h1>{title}</h1>
-          <div className="header-file-name">{fileName}</div>
         </div>
         <div className="header-tiled-controls">
+          {onSelectServer && (
+            <label className="header-folder-picker">
+              Server:{' '}
+              <select
+                value={serverId ?? getActiveServer().id}
+                onChange={(event) => onSelectServer(event.target.value as TiledServerId)}
+              >
+                {TILED_SERVERS.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <label className="header-folder-picker">
             Folder:{' '}
             <select
@@ -99,8 +160,8 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
             </select>
           </label>
           <Tiled
-            key={tiledInitialPath}
-            oidcRedirectUrl="http://tiled-test:5174/react/"
+            key={`${serverId ?? getActiveServer().id}:${tiledInitialPath}`}
+            oidcRedirectUrl={getActiveServer().oidcRedirectUrl}
             isButtonMode={true}
             onSelectCallback={handleTiledWidgetSelect}
             tiledBaseUrl={getTiledBaseUrl()}
@@ -108,6 +169,42 @@ export const Header = ({ logoUrl, title, fileName, onSelect }: HeaderProps) => {
             includeAuthTokensInSelectCallback={true}
             initialPath={tiledInitialPath}
           />
+          {onShare && (
+            <button
+              type="button"
+              className="header-share-button"
+              onClick={handleShareClick}
+              disabled={!canShare}
+              title="Copy a link that reopens this scan at the current view"
+            >
+              {copied ? 'Copied!' : 'Share'}
+            </button>
+          )}
+          {onToggleRenderer && (
+            <button
+              type="button"
+              className="header-renderer-toggle"
+              onClick={onToggleRenderer}
+              disabled={!webGpuAvailability().ok}
+              title={
+                webGpuAvailability().ok
+                  ? 'Switch the volume renderer between ITK (itk-vtk) and WebGPU'
+                  : webGpuAvailability().reason
+              }
+            >
+              Renderer: {renderer === 'webgpu' ? 'WebGPU' : 'ITK'} ⇄
+            </button>
+          )}
+          {docsUrl && onOpenDocs && (
+            <button
+              type="button"
+              className="header-docs-button"
+              onClick={onOpenDocs}
+              title="Open documentation"
+            >
+              📖 Docs
+            </button>
+          )}
         </div>
       </div>
     </header>

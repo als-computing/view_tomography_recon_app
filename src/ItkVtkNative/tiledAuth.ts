@@ -118,7 +118,7 @@ export const installTiledFetchInterceptor = (dataUrl: string): (() => void) => {
   const originalSend = XMLHttpRequest.prototype.send;
   const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
-  XMLHttpRequest.prototype.open = function (this: TiledXHR, method: string, url: string, ...args: any[]) {
+  XMLHttpRequest.prototype.open = function (this: TiledXHR, method: string, url: string, ...args: unknown[]) {
     this._tiledUrl = url;
     this._tiledHasAuth = false;
     // @ts-expect-error - forwarding the original variadic signature

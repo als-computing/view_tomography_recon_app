@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -40,11 +40,40 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
-      - name: Build and push Docker image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
+
+      - name: Build and push local image
         uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
         with:
           context: .
-          file: Dockerfile
+          target: prod
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            BASE_PATH=/tomo_viewer/
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:local
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Build and push ALS production image
+        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        with:
+          context: .
+          target: prod
+          push: true
+          build-args: |
+            BASE_PATH=/bl832/tomo_viewer/
+            FIXED_TILED_SERVER=tiled.als.lbl.gov
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:als-prod
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Build and push ALS staging image
+        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        with:
+          context: .
+          target: prod
+          push: true
+          build-args: |
+            BASE_PATH=/bl832/tomo_viewer/
+            FIXED_TILED_SERVER=tiled-staging.als.lbl.gov
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:als-staging
           labels: ${{ steps.meta.outputs.labels }}

@@ -1,9 +1,29 @@
+import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { yamlPlugin } from './vite-yaml-plugin.js';
+
+// The WebGPU renderer under src/zarr-viewer/ is a self-contained app that imports its own source
+// through these path aliases. Mirror them here (pointing at the same source) so the main app can
+// import its `run()` entry directly. See src/zarr-viewer/vite.config.ts.
+const zarrViewerSrc = resolve(import.meta.dirname, 'src/zarr-viewer/src');
 
 export default defineConfig({
-  // This should match how your Vite server is running
-  base: '/react/',
+  // BASE_PATH is a build-time-only Node env var (read via process.env, not import.meta.env — it's
+  // consumed here in Vite's own Node config context, not by client code). Falls back to today's
+  // value so local `npm run dev`/`vite build` behavior is unchanged when unset.
+  base: process.env.BASE_PATH || '/tomo_viewer/',
+  resolve: {
+    alias: {
+      '@zarr-viewer/core': resolve(zarrViewerSrc, 'core/index.ts'),
+      '@zarr-viewer/math': resolve(zarrViewerSrc, 'math/index.ts'),
+      '@zarr-viewer/scene': resolve(zarrViewerSrc, 'scene/index.ts'),
+      '@zarr-viewer/controls': resolve(zarrViewerSrc, 'controls/index.ts'),
+      '@zarr-viewer/io': resolve(zarrViewerSrc, 'io/index.ts'),
+      '@zarr-viewer/render': resolve(zarrViewerSrc, 'render/index.ts'),
+      '@zarr-viewer/fx': resolve(zarrViewerSrc, 'fx/src/index.ts'),
+    },
+  },
   server: {
     host: '0.0.0.0',
     port: 5174,
@@ -18,10 +38,18 @@ export default defineConfig({
         target: 'http://tiled:8000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/tiled/, '')
+      },
+      // Local-dev-only: proxies the Docs button (src/config.ts's DOCS_URL, relative to `base` — see
+      // there for why it's never a hardcoded host) to the `docs` compose service (`mkdocs serve`).
+      // Hardcoded to the default base path since the `dev` Docker stage never sets BASE_PATH.
+      '/tomo_viewer/docs': {
+        target: 'http://docs:8000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/tomo_viewer\/docs/, '')
       }
     }
   },
-  plugins: [react()]
+  plugins: [react(), yamlPlugin()]
 });
 
 

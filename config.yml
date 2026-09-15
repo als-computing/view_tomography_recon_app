@@ -1,0 +1,41 @@
+# Tiled server definitions for the header's server dropdown (see src/tiledServers.ts, which reads
+# this file at build time — editing it requires a rebuild, same as the TS array it replaced).
+#
+# Every entry listed here is a real, addressable field:
+#   label           - Human label in the header dropdown.
+#   apiUrl          - Tiled REST base, ending in /api/v1. Drives getTiledBaseUrl + zarr URL derivation.
+#   processedPath   - Parent catalog path whose subfolders populate the folder dropdown ("" = catalog root).
+#   defaultFileId   - Scan auto-opened when this server becomes active ("" = open nothing, browse to pick).
+#   oidcRedirectUrl - OIDC redirect back to this app after login. Must be an absolute URL (OAuth spec
+#                     requirement) matching both this app's real served base path AND whatever redirect
+#                     URI is allow-listed server-side on that Tiled server's identity provider.
+#   supportsStream  - Whether this server exposes the live-notification WebSocket (/api/v1/stream/...).
+#
+# `local`, `staging`, and `production` are the only valid ids (src/tiledServers.ts's TiledServerId
+# type) — all three must be present here, or the app fails to build with a clear error.
+tiledServers:
+  local:
+    label: Local
+    apiUrl: http://localhost:8001/api/v1
+    processedPath: ""
+    defaultFileId: scans/petiole22
+    oidcRedirectUrl: http://tiled-test:5174/tomo_viewer/
+    supportsStream: false
+  staging:
+    label: Remote
+    apiUrl: https://tiled-staging.als.lbl.gov/api/v1
+    processedPath: beamlines/bl832/processed
+    defaultFileId: ""
+    oidcRedirectUrl: http://tiled-test:5174/tomo_viewer/
+    supportsStream: true
+  production:
+    label: Production
+    apiUrl: https://tiled.als.lbl.gov/api/v1
+    processedPath: beamlines/bl832/processed
+    defaultFileId: ""
+    oidcRedirectUrl: https://hub.als.lbl.gov/bl832/tomo_viewer/
+    supportsStream: true
+
+# Which server is active when nothing is persisted in localStorage and the build isn't locked via
+# FIXED_TILED_SERVER (see src/tiledServers.ts / Dockerfile).
+defaultServerId: local
